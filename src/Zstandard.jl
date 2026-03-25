@@ -1,0 +1,1596 @@
+# Pure Julia implementation of Zstandard (Zstd) decompression,
+# as specified by RFC 8878.
+#
+# Reference: https://www.rfc-editor.org/rfc/rfc8878
+
+"""
+    Zstandard
+
+Pure Julia implementation of decompression of the Zstandard format.
+
+In-memory decompression:
+
+| function | decompresses |
+| -------- | ------------ |
+| `zstd_decompress(data::Vector{UInt8})` | Zstandard frame |
+| `zstd_decompress(filename::AbstractString)` | Zstandard file |
+
+Streaming decompression:
+
+| stream | decompresses |
+| ------ | ------------ |
+| `ZstandardStream(stream::IO)` | Zstandard stream |
+
+Reference: [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)
+"""
+module Zstandard
+
+export zstd_decompress, ZstandardStream, ZstdDict, parse_dictionary
+
+# ============================================================
+# Section 1: Constants
+# ============================================================
+
+const ZSTD_MAGIC = 0xFD2FB528
+const ZSTD_DICT_MAGIC = 0xEC30A437
+
+# Maximum Huffman table log (RFC 8878 §4.2.1, reference HUF_TABLELOG_ABSOLUTEMAX)
+const HUF_TABLELOG_MAX = 12
+const FSE_MAX_SYMBOL_LL = 35   # RFC 8878 Table 1
+const FSE_MAX_SYMBOL_OF = 28   # RFC 8878 Table 3
+const FSE_MAX_SYMBOL_ML = 52   # RFC 8878 Table 2
+
+# Initial repeat offsets (RFC 8878 §3.1.1.3.3)
+const INIT_REP = (1, 4, 8)
+
+# Predefined FSE distributions (RFC 8878 Appendix B)
+
+const LL_DEFAULT_DIST = Int16[
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1
+]
+const LL_DEFAULT_LOG = 6
+
+const ML_DEFAULT_DIST = Int16[
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
+    -1, -1, -1, -1, -1
+]
+const ML_DEFAULT_LOG = 6
+
+const OF_DEFAULT_DIST = Int16[
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1
+]
+const OF_DEFAULT_LOG = 5
+
+# Literals Length code tables (RFC 8878 §3.1.1.3.2.3)
+const LL_EXTRA_BITS = UInt8[
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12,
+    13, 14, 15, 16
+]
+const LL_BASE = UInt32[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096,
+    8192, 16384, 32768, 65536
+]
+
+# Match Length code tables (RFC 8878 §3.1.1.3.2.2)
+const ML_EXTRA_BITS = UInt8[
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16
+]
+const ML_BASE = UInt32[
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+    35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051,
+    4099, 8195, 16387, 32771, 65539
+]
+
+# ============================================================
+# Section 2: xxHash-64  (RFC 8878 §3.1.5 — content checksum)
+#   Reference algorithm: https://cyan4973.github.io/xxHash/
+# ============================================================
+
+const XXH_P1 = 0x9E3779B185EBCA87
+const XXH_P2 = 0xC2B2AE3D27D4EB4F
+const XXH_P3 = 0x165667B19E3779F9
+const XXH_P4 = 0x85EBCA77C2B2AE63
+const XXH_P5 = 0x27D4EB2F165667C5
+
+@inline xxh_rotl64(x::UInt64, r) = (x << r) | (x >>> (64 - r))
+
+@inline function xxh_round(acc::UInt64, lane::UInt64)
+    acc += lane * XXH_P2
+    acc  = xxh_rotl64(acc, 31)
+    acc *= XXH_P1
+    return acc
+end
+
+@inline function xxh_merge(acc::UInt64, val::UInt64)
+    acc ⊻= xxh_round(UInt64(0), val)
+    acc  = acc * XXH_P1 + XXH_P4
+    return acc
+end
+
+# Little-endian loads
+@inline function _le64(d, i)
+    UInt64(d[i])       | (UInt64(d[i+1]) << 8)  | (UInt64(d[i+2]) << 16) |
+    (UInt64(d[i+3]) << 24) | (UInt64(d[i+4]) << 32) | (UInt64(d[i+5]) << 40) |
+    (UInt64(d[i+6]) << 48) | (UInt64(d[i+7]) << 56)
+end
+@inline function _le32(d, i)
+    UInt32(d[i]) | (UInt32(d[i+1]) << 8) | (UInt32(d[i+2]) << 16) | (UInt32(d[i+3]) << 24)
+end
+@inline _le16(d, i) = UInt16(d[i]) | (UInt16(d[i+1]) << 8)
+
+function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
+    len = length(data)
+    pos = 1
+    local h64::UInt64
+
+    if len >= 32
+        v1 = seed + XXH_P1 + XXH_P2
+        v2 = seed + XXH_P2
+        v3 = seed
+        v4 = seed - XXH_P1
+        while pos + 31 <= len
+            v1 = xxh_round(v1, _le64(data, pos));     pos += 8
+            v2 = xxh_round(v2, _le64(data, pos));     pos += 8
+            v3 = xxh_round(v3, _le64(data, pos));     pos += 8
+            v4 = xxh_round(v4, _le64(data, pos));     pos += 8
+        end
+        h64  = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) + xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18)
+        h64  = xxh_merge(h64, v1)
+        h64  = xxh_merge(h64, v2)
+        h64  = xxh_merge(h64, v3)
+        h64  = xxh_merge(h64, v4)
+    else
+        h64 = seed + XXH_P5
+    end
+
+    h64 += UInt64(len)
+
+    while pos + 7 <= len
+        h64 ⊻= xxh_round(UInt64(0), _le64(data, pos));  pos += 8
+        h64  = xxh_rotl64(h64, 27) * XXH_P1 + XXH_P4
+    end
+    if pos + 3 <= len
+        h64 ⊻= UInt64(_le32(data, pos)) * XXH_P1
+        h64  = xxh_rotl64(h64, 23) * XXH_P2 + XXH_P3;  pos += 4
+    end
+    while pos <= len
+        h64 ⊻= UInt64(data[pos]) * XXH_P5
+        h64  = xxh_rotl64(h64, 11) * XXH_P1;            pos += 1
+    end
+
+    h64 ⊻= h64 >>> 33;  h64 *= XXH_P2
+    h64 ⊻= h64 >>> 29;  h64 *= XXH_P3
+    h64 ⊻= h64 >>> 32
+    return h64
+end
+
+# ============================================================
+# Section 3a: Forward bit reader  (LSB-first)
+#   Used for: frame/block headers, literals headers, FSE table
+#   descriptions, and sequences section header.
+# ============================================================
+
+mutable struct ForwardBitReader
+    data::Vector{UInt8}
+    pos::Int       # next byte to load into the buffer (1-indexed)
+    limit::Int     # one past the last valid byte (exclusive, 1-indexed)
+    bits::UInt64   # bit buffer; bit 0 is the next bit to deliver
+    nbits::Int     # number of valid bits currently in buffer
+end
+
+function ForwardBitReader(data::Vector{UInt8}, byte_offset::Int, byte_limit::Int)
+    ForwardBitReader(data, byte_offset, byte_limit, UInt64(0), 0)
+end
+
+function _fbr_refill!(br::ForwardBitReader)
+    while br.nbits <= 56 && br.pos < br.limit
+        br.bits  |= UInt64(br.data[br.pos]) << br.nbits
+        br.nbits += 8
+        br.pos   += 1
+    end
+end
+
+@inline function read_bits!(br::ForwardBitReader, n::Int)
+    n == 0 && return UInt64(0)
+    br.nbits < n && _fbr_refill!(br)
+    br.nbits >= n || throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
+    mask = (n < 64) ? ((UInt64(1) << n) - UInt64(1)) : typemax(UInt64)
+    val      = br.bits & mask
+    br.bits  = (n < 64) ? (br.bits >>> n) : UInt64(0)
+    br.nbits -= n
+    return val
+end
+
+# Discard any sub-byte leftover so the reader is byte-aligned.
+function align_to_byte!(br::ForwardBitReader)
+    discard  = br.nbits & 7
+    discard > 0 && (br.bits >>>= discard)
+    br.nbits -= discard
+end
+
+# Byte position of the next unread byte (after draining the bit buffer).
+byte_pos(br::ForwardBitReader) = br.pos - (br.nbits >> 3)
+
+# ============================================================
+# Section 3b: Reverse bit reader  (MSB-first, reads backward)
+#   Used for: FSE sequences bitstream, Huffman literal streams.
+#   The stream ends with a sentinel byte whose highest set bit
+#   marks the start of valid data.
+# ============================================================
+
+mutable struct ReverseBitReader
+    data::Vector{UInt8}
+    start::Int     # first valid byte of this slice (1-indexed)
+    pos::Int       # next byte to load (decreasing, 1-indexed)
+    bits::UInt64   # bit buffer; bit 63 is the next bit to deliver
+    nbits::Int     # number of valid bits currently in buffer
+end
+
+function ReverseBitReader(data::Vector{UInt8}, byte_offset::Int, byte_len::Int)
+    byte_len  > 0 || throw(ArgumentError("zstd: empty reverse bitstream"))
+    last       = data[byte_offset + byte_len - 1]
+    last != 0  || throw(ArgumentError("zstd: reverse bitstream sentinel byte is zero"))
+
+    # Position of the sentinel bit (0 = LSB, 7 = MSB)
+    sentinel   = 63 - leading_zeros(UInt64(last))   # highest set bit of last byte
+
+    # Valid data bits sit below the sentinel: bits [0, sentinel-1]
+    valid_n    = sentinel                            # may be 0 if last == 1
+    valid_bits = UInt64(last) & ((valid_n > 0) ? ((UInt64(1) << valid_n) - UInt64(1)) : UInt64(0))
+
+    # Pack into the MSB region of the 64-bit container
+    bits  = (valid_n > 0) ? (valid_bits << (64 - valid_n)) : UInt64(0)
+    nbits = valid_n
+
+    rb = ReverseBitReader(data, byte_offset, byte_offset + byte_len - 2, bits, nbits)
+    _rbr_refill!(rb)
+    return rb
+end
+
+function _rbr_refill!(rb::ReverseBitReader)
+    while rb.nbits <= 56 && rb.pos >= rb.start
+        # Each byte goes into the region just below the currently loaded bits
+        rb.bits  |= UInt64(rb.data[rb.pos]) << (56 - rb.nbits)
+        rb.nbits += 8
+        rb.pos   -= 1
+    end
+end
+
+@inline function read_bits_r!(rb::ReverseBitReader, n::Int)
+    n == 0 && return UInt64(0)
+    rb.nbits < n && _rbr_refill!(rb)
+    rb.nbits >= n || throw(ArgumentError("zstd: unexpected end of reverse bitstream"))
+    val      = rb.bits >>> (64 - n)
+    rb.bits  = (n < 64) ? (rb.bits << n) : UInt64(0)
+    rb.nbits -= n
+    return val
+end
+
+# Peek without consuming.
+@inline function peek_bits_r!(rb::ReverseBitReader, n::Int)
+    rb.nbits < n && _rbr_refill!(rb)
+    rb.nbits >= n || throw(ArgumentError("zstd: unexpected end of reverse bitstream (peek)"))
+    return rb.bits >>> (64 - n)
+end
+
+@inline function consume_bits_r!(rb::ReverseBitReader, n::Int)
+    # RFC 8878: Huffman code lengths are bounded by HUF_TABLELOG_MAX (12),
+    # so n is always in [1, 12] — never >= 64.  Catch bugs if that ever changes.
+    n < 64 || throw(ArgumentError("zstd: consume_bits_r! shift $n >= 64"))
+    rb.bits  = rb.bits << n
+    rb.nbits -= n
+end
+
+# Read n bits without checking for underflow (allows nbits to go negative).
+# Used by the interleaved FSE weight decoder tail loop where overflow is
+# detected after the read rather than before.
+@inline function _read_bits_r_unchecked!(rb::ReverseBitReader, n::Int)
+    n == 0 && return UInt64(0)
+    _rbr_refill!(rb)
+    val      = rb.bits >>> (64 - n)
+    rb.bits  = (n < 64) ? (rb.bits << n) : UInt64(0)
+    rb.nbits -= n
+    return val
+end
+
+# Check whether previous unchecked reads consumed more bits than available.
+@inline _rbr_overflowed(rb::ReverseBitReader) = rb.nbits < 0
+
+# ============================================================
+# Section 4: FSE decode table
+#   Reference: RFC 8878 §4.1
+# ============================================================
+
+struct FSETable
+    accuracy_log::Int
+    symbols  ::Vector{UInt8}
+    nb_bits  ::Vector{UInt8}
+    baselines::Vector{UInt32}
+end
+
+# Trivial FSE table for RLE mode: every state emits the same symbol with
+# zero extra bits.  Stored as a single byte — no heap allocation.
+struct RLEFSETable
+    symbol::UInt8
+end
+
+# floor(log2(n)) for n ≥ 1
+@inline _flog2(n::Int) = 63 - leading_zeros(UInt64(n))
+
+# Build an FSE decode table from a normalized probability distribution.
+# norm[i+1] is the probability of symbol i; -1 means "probability 1/tableSize".
+# Hot-path: caller supplies pre-allocated backing arrays; they are resized and filled in-place.
+function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
+                          syms::Vector{UInt8}, nb::Vector{UInt8},
+                          base::Vector{UInt32}, occ::Vector{Int})
+    table_size = 1 << accuracy_log
+    resize!(syms, table_size)
+    resize!(nb,   table_size)
+    resize!(base, table_size)
+    resize!(occ,  length(norm))
+    fill!(occ, 0)
+
+    # --- Spread: place -1 symbols at the end, others via step pattern ---
+    high = table_size - 1
+    for s in 0:length(norm)-1
+        norm[s+1] == -1 || continue
+        syms[high+1] = UInt8(s)
+        high -= 1
+    end
+
+    step = (table_size >> 1) + (table_size >> 3) + 3
+    mask = table_size - 1
+    pos  = 0
+    for s in 0:length(norm)-1
+        c = Int(norm[s+1])
+        c > 0 || continue
+        for _ in 1:c
+            syms[pos+1] = UInt8(s)
+            pos = (pos + step) & mask
+            while pos > high
+                pos = (pos + step) & mask
+            end
+        end
+    end
+
+    # --- Build per-state decode entries ---
+    for x in 0:table_size-1
+        s  = Int(syms[x+1])
+        c  = Int(norm[s+1]);  c == -1 && (c = 1)
+        i  = occ[s+1];        occ[s+1] += 1
+        ci = c + i
+        n  = accuracy_log - _flog2(ci)
+        nb[x+1]   = UInt8(n)
+        base[x+1] = UInt32((ci << n) - table_size)
+    end
+
+    return FSETable(accuracy_log, syms, nb, base)
+end
+
+# Cold-path: allocates its own backing arrays (used by __init__, parse_dictionary, etc.)
+function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int)
+    table_size = 1 << accuracy_log
+    return build_fse_table(norm, accuracy_log,
+                           Vector{UInt8}(undef, table_size),
+                           Vector{UInt8}(undef, table_size),
+                           Vector{UInt32}(undef, table_size),
+                           Vector{Int}(undef, length(norm)))
+end
+
+# Read an FSE normalized distribution from the forward bitstream.
+# Returns (accuracy_log, norm_counts).
+# Implements the exact reference zstd sliding-threshold algorithm.
+# Hot-path: caller supplies a reusable norm buffer (emptied on entry).
+function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
+    accuracy_log = Int(read_bits!(br, 4)) + 5
+    table_size   = 1 << accuracy_log
+
+    empty!(norm)
+    remaining = table_size + 1   # reference zstd initialises to tableSize+1
+    threshold = table_size
+    nbits     = accuracy_log + 1
+
+    while remaining > 1
+        br.nbits < nbits && _fbr_refill!(br)
+
+        # max = number of values encodable in the short (nbits-1 bit) path
+        max_val = (2 * threshold - 1) - remaining
+        low     = Int(br.bits & UInt64(threshold - 1))   # peek lower nbits-1 bits
+
+        local count::Int
+        if low < max_val
+            # Short path: value from nbits-1 bits
+            count = low
+            br.bits  >>>= (nbits - 1)
+            br.nbits  -= (nbits - 1)
+        else
+            # Long path: value from nbits bits
+            count = Int(br.bits & UInt64(2 * threshold - 1))
+            if count >= threshold
+                count -= max_val
+            end
+            br.bits  >>>= nbits
+            br.nbits  -= nbits
+        end
+
+        count -= 1   # "extra accuracy" offset: value 0 → count -1 (low-prob)
+
+        push!(norm, Int16(count))
+
+        if count == 0
+            # Zero-run: chained 2-bit repeat count (RFC 8878 §4.1.1)
+            while true
+                br.nbits < 2 && _fbr_refill!(br)
+                r = Int(br.bits & 3)
+                br.bits  >>>= 2
+                br.nbits  -= 2
+                for _ in 1:r
+                    push!(norm, Int16(0))
+                end
+                r < 3 && break
+            end
+        else
+            remaining -= count < 0 ? -count : count
+        end
+
+        # Shrink threshold/nbits as remaining decreases.
+        while remaining < threshold
+            nbits     -= 1
+            threshold >>= 1
+        end
+    end
+
+    align_to_byte!(br)
+    return accuracy_log, norm
+end
+
+# Cold-path: allocates its own norm buffer (used by parse_dictionary, _decode_fse_weights, etc.)
+function read_fse_dist!(br::ForwardBitReader, max_sym::Int)
+    norm = Int16[]
+    sizehint!(norm, max_sym + 1)
+    return read_fse_dist!(br, max_sym, norm)
+end
+
+# ------- Predefined tables (built once at module init) -------
+
+const _LL_TABLE = Ref{FSETable}()
+const _ML_TABLE = Ref{FSETable}()
+const _OF_TABLE = Ref{FSETable}()
+
+function __init__()
+    _LL_TABLE[] = build_fse_table(LL_DEFAULT_DIST, LL_DEFAULT_LOG)
+    _ML_TABLE[] = build_fse_table(ML_DEFAULT_DIST, ML_DEFAULT_LOG)
+    _OF_TABLE[] = build_fse_table(OF_DEFAULT_DIST, OF_DEFAULT_LOG)
+end
+
+# ------- FSE state machine helpers -------
+
+@inline fse_init!(rb::ReverseBitReader, t::FSETable) =
+    Int(read_bits_r!(rb, t.accuracy_log))
+
+@inline fse_peek(t::FSETable, state::Int) = Int(t.symbols[state+1])
+
+@inline function fse_update!(rb::ReverseBitReader, t::FSETable, state::Int)
+    nb   = Int(t.nb_bits[state+1])
+    bits = Int(read_bits_r!(rb, nb))
+    return Int(t.baselines[state+1]) + bits
+end
+
+# RLE variants — accuracy_log is always 1, both states emit the same symbol,
+# and transitions consume 0 bits.
+@inline fse_init!(rb::ReverseBitReader, t::RLEFSETable) =
+    (read_bits_r!(rb, 1); 0)   # consume the 1-bit state init, state is always 0
+
+@inline fse_peek(t::RLEFSETable, state::Int) = Int(t.symbol)
+
+@inline fse_update!(rb::ReverseBitReader, t::RLEFSETable, state::Int) = 0
+
+# Update without checking for underflow (allows overflow detection after).
+@inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSETable, state::Int)
+    nb   = Int(t.nb_bits[state+1])
+    bits = Int(_read_bits_r_unchecked!(rb, nb))
+    return Int(t.baselines[state+1]) + bits
+end
+
+# Read an FSE table according to the given mode byte bits.
+# mode: 0=predefined, 1=RLE, 2=FSE_Compressed, 3=Repeat
+# Returns the FSETable and advances br.
+function read_fse_table!(br::ForwardBitReader, default::FSETable,
+                         prev::Union{FSETable,RLEFSETable,Nothing},
+                         mode::Int, max_sym::Int, max_al::Int,
+                         syms::Vector{UInt8}, nb::Vector{UInt8},
+                         base::Vector{UInt32}, occ::Vector{Int},
+                         norm::Vector{Int16})
+    if mode == 0
+        return default
+    elseif mode == 1
+        sym = read_bits!(br, 8)   # RLE: single symbol
+        return RLEFSETable(UInt8(sym))
+    elseif mode == 2
+        al, dist = read_fse_dist!(br, max_sym, norm)
+        al <= max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
+        length(dist) <= max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
+        return build_fse_table(dist, al, syms, nb, base, occ)
+    else   # mode == 3: repeat previous table (RFC 8878 §3.1.1.3.3.2)
+        prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous FSE table"))
+        return prev
+    end
+end
+
+# ============================================================
+# Section 5: Huffman decode table
+#   Reference: RFC 8878 §4.2
+# ============================================================
+
+struct HuffmanTable
+    max_bits::Int
+    # Packed decode table indexed by the top max_bits of the peeked code word.
+    # Each entry = (symbol << 8) | nb_bits  (UInt16).
+    decode_table::Vector{UInt16}
+end
+
+# Build a Huffman decode table from a weight array.
+# weights[i+1] = weight for symbol i (0 = absent; weight w ≥ 1 means code length
+# max_bits - w + 1, probability 2^(w-1)).
+function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
+    nsyms = length(weights)
+    max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
+    max_bits <= HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+
+    table_size = 1 << max_bits
+    # Fill with a safe default (symbol 0, consuming max_bits) so that any
+    # unoccupied entries don't cause undefined behavior or infinite loops.
+    dtable     = fill(UInt16(max_bits), table_size)
+
+    # Rank-based direct table filling (matches reference zstd implementation).
+    # Weight w means code length = max_bits - w + 1, and each symbol with weight w
+    # occupies 2^(w-1) entries in the table.
+    # We compute starting table positions per weight by accumulating from highest
+    # weight (fewest entries per symbol but most symbols typically) downward.
+    rank_count = zeros(Int, max_bits + 1)
+    for sym in 0:nsyms-1
+        w = Int(weights[sym+1])
+        w > 0 && (rank_count[w] += 1)
+    end
+
+    next_rank_start = zeros(Int, max_bits + 1)
+    pos = 0
+    for w in 1:max_bits
+        next_rank_start[w] = pos
+        pos += rank_count[w] * (1 << (w - 1))
+    end
+
+    for sym in 0:nsyms-1
+        w = Int(weights[sym+1])
+        w == 0 && continue
+        code_len    = max_bits - w + 1
+        num_entries = 1 << (w - 1)
+        entry       = UInt16((sym << 8) | code_len)
+        start       = next_rank_start[w]
+        for j in 0:num_entries-1
+            dtable[start + j + 1] = entry
+        end
+        next_rank_start[w] += num_entries
+    end
+
+    return HuffmanTable(max_bits, dtable)
+end
+
+# Decode one Huffman symbol from the reverse bit reader.
+@inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable)
+    rb.nbits < ht.max_bits && _rbr_refill!(rb)
+    # Peek max_bits from the MSB; spare high bits are zero (zero-padding at end of stream).
+    idx = Int(rb.bits >>> (64 - ht.max_bits))
+    e   = ht.decode_table[idx + 1]
+    nb  = Int(e & 0xFF)
+    # nb <= max_bits <= 12 < 64; safe to drop the old min(nb, rb.nbits) guard because
+    # we always decode exactly regen_size symbols and discard rb immediately after.
+    consume_bits_r!(rb, nb)
+    return Int(e >> 8)
+end
+
+
+# ============================================================
+# Section 6: Huffman tree description
+#   Reference: RFC 8878 §4.2.1
+# ============================================================
+
+# Infer the weight of the last symbol given the weight array so far.
+# Returns the (last_sym, last_weight) pair, where last_sym is the index
+# of the symbol whose weight we must fill in.
+function _infer_last_weight(weights::Vector{UInt8})
+    # RFC 8878 §4.2.1: sum of 2^(w-1) for all present symbols must be a
+    # power of two (call it P). The last (highest) symbol gets w = log2(P - sum) + 1.
+    # Returns (last_sym_index, last_weight, table_log).
+    total = UInt64(0)
+    for w in weights
+        w == 0 && continue
+        total += UInt64(1) << (Int(w) - 1)
+    end
+    total == 0 && return (length(weights), 1, 1)  # single symbol edge case
+    # tableLog = floor(log2(total)) + 1  (reference: BIT_highbit32(weightTotal) + 1)
+    table_log = _flog2(Int(total)) + 1
+    p = UInt64(1) << table_log
+    p > total || (table_log += 1; p <<= 1)   # ensure p > total
+    rest = Int(p - total)
+    rest > 0 && (rest & (rest - 1)) == 0 || throw(ArgumentError("zstd: invalid Huffman weight sum"))
+    last_w = _flog2(rest) + 1
+    return (length(weights) + 1, last_w, table_log)
+end
+
+# Decode FSE-compressed Huffman weights.
+# Uses two interleaved FSE states that are updated alternately.
+# RFC 8878 §4.2.1.1
+function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
+    # Read the FSE table for weights
+    al, dist  = read_fse_dist!(br, HUF_TABLELOG_MAX)
+    t         = build_fse_table(dist, al)
+
+    # The remainder of the weight description is a reverse bitstream
+    pos_after = byte_pos(br)
+    n_remain  = byte_limit - pos_after + 1
+    n_remain > 0 || throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
+
+    rb = ReverseBitReader(br.data, pos_after, n_remain)
+
+    # Init two interleaved states
+    state1 = fse_init!(rb, t)
+    state2 = fse_init!(rb, t)
+
+    weights = UInt8[]
+    sizehint!(weights, 256)
+    # Interleaved FSE decode matching the reference zstd tail loop.
+    # Each iteration: decode symbol (peek + update), emit it, then
+    # check if the stream overflowed.  After overflow, emit the OTHER
+    # state's pending symbol and break.
+    while true
+        sym1 = fse_peek(t, state1)
+        state1 = _fse_update_unchecked(rb, t, state1)
+        push!(weights, UInt8(sym1))
+        if _rbr_overflowed(rb) || length(weights) >= 255
+            push!(weights, UInt8(fse_peek(t, state2)))
+            break
+        end
+
+        sym2 = fse_peek(t, state2)
+        state2 = _fse_update_unchecked(rb, t, state2)
+        push!(weights, UInt8(sym2))
+        if _rbr_overflowed(rb) || length(weights) >= 255
+            push!(weights, UInt8(fse_peek(t, state1)))
+            break
+        end
+    end
+
+    # Advance the forward reader past the weight data
+    br.pos   = byte_limit + 1
+    br.nbits = 0
+    br.bits  = UInt64(0)
+
+    return weights
+end
+
+# Read the Huffman tree description and return a HuffmanTable.
+# data[pos] is the first byte of the description.
+# Returns (HuffmanTable, bytes_consumed).
+function read_huffman_description(data::Vector{UInt8}, pos::Int)
+    header = Int(data[pos])
+    if header < 128
+        # FSE-compressed weights: header = compressed_size
+        compressed_size = header
+        # Forward bit reader over the compressed bytes
+        br = ForwardBitReader(data, pos + 1, pos + compressed_size + 1)
+        weights = _decode_fse_weights(br, pos + compressed_size)
+        last_sym, last_w, table_log = _infer_last_weight(weights)
+        push!(weights, UInt8(last_w))
+        ht = build_huffman_table(weights, table_log)
+        return ht, compressed_size + 1
+    else
+        # Direct representation: (header - 127) weight nibbles follow
+        nsyms = header - 127
+        # Each byte holds two nibbles; ceil(nsyms/2) bytes
+        nbytes = (nsyms + 1) >> 1
+        weights = Vector{UInt8}(undef, nsyms)
+        for i in 1:nbytes
+            b = data[pos + i]
+            lo = b & 0x0f
+            hi = (b >> 4) & 0x0f
+            idx = (i-1)*2
+            if idx + 1 <= nsyms
+                weights[idx + 1] = hi    # high nibble = first weight
+            end
+            if idx + 2 <= nsyms
+                weights[idx + 2] = lo    # low nibble = second weight
+            end
+        end
+        last_sym, last_w, table_log = _infer_last_weight(weights)
+        if last_sym <= nsyms
+            weights[last_sym] = UInt8(last_w)
+        else
+            push!(weights, UInt8(last_w))
+        end
+        ht = build_huffman_table(weights, table_log)
+        return ht, nbytes + 1
+    end
+end
+
+
+# ============================================================
+# Section 7: Dictionary support
+#   Reference: RFC 8878 §5
+# ============================================================
+
+struct ZstdDict
+    id      ::UInt32
+    huffman ::Union{HuffmanTable,Nothing}
+    of_tab  ::Union{FSETable,Nothing}
+    ml_tab  ::Union{FSETable,Nothing}
+    ll_tab  ::Union{FSETable,Nothing}
+    rep     ::NTuple{3,Int}
+    content ::Vector{UInt8}
+end
+
+"""
+    parse_dictionary(raw::Vector{UInt8}) -> ZstdDict
+
+Parse a Zstandard dictionary (RFC 8878 §5).  Accepts both structured
+dictionaries (magic `0xEC30A437`) and raw content dictionaries.
+"""
+function parse_dictionary(raw::Vector{UInt8})
+    length(raw) >= 8 || throw(ArgumentError("zstd: dictionary too short"))
+    magic = UInt32(raw[1]) | (UInt32(raw[2]) << 8) |
+            (UInt32(raw[3]) << 16) | (UInt32(raw[4]) << 24)
+    if magic != ZSTD_DICT_MAGIC
+        # Raw content dictionary: no entropy tables, default repeat offsets
+        return ZstdDict(UInt32(0), nothing, nothing, nothing, nothing, INIT_REP, raw)
+    end
+
+    # Structured dictionary
+    dict_id = UInt32(raw[5]) | (UInt32(raw[6]) << 8) |
+              (UInt32(raw[7]) << 16) | (UInt32(raw[8]) << 24)
+    pos = 9
+
+    # 1. Huffman table for literals
+    ht, hdr_len = read_huffman_description(raw, pos)
+    pos += hdr_len
+
+    # 2. FSE table for offsets
+    br = ForwardBitReader(raw, pos, length(raw) + 1)
+    of_al, of_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_OF)
+    of_tab = build_fse_table(of_dist, of_al)
+
+    # 3. FSE table for match lengths
+    ml_al, ml_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_ML)
+    ml_tab = build_fse_table(ml_dist, ml_al)
+
+    # 4. FSE table for literals lengths
+    ll_al, ll_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_LL)
+    ll_tab = build_fse_table(ll_dist, ll_al)
+
+    pos = byte_pos(br)
+
+    # 5. Three repeat offsets, 4 bytes LE each
+    length(raw) >= pos + 11 || throw(ArgumentError("zstd: dictionary truncated (repeat offsets)"))
+    rep1 = Int(_le32(raw, pos));     pos += 4
+    rep2 = Int(_le32(raw, pos));     pos += 4
+    rep3 = Int(_le32(raw, pos));     pos += 4
+
+    content = raw[pos:end]
+    return ZstdDict(dict_id, ht, of_tab, ml_tab, ll_tab, (rep1, rep2, rep3), content)
+end
+
+# ============================================================
+# Section 8: Decompression state + literals section
+#   Reference: RFC 8878 §3.1.1.3
+# ============================================================
+
+# Groups the three backing arrays for one FSE decode table (LL, OF, or ML).
+# Having all three in one object lets callers pass a single slot instead of
+# three separate vectors, and keeps DecompressState compact.
+mutable struct FSETableSlot
+    syms ::Vector{UInt8}
+    nb   ::Vector{UInt8}
+    base ::Vector{UInt32}
+end
+
+FSETableSlot(n::Int) = FSETableSlot(Vector{UInt8}(undef, n),
+                                     Vector{UInt8}(undef, n),
+                                     Vector{UInt32}(undef, n))
+
+mutable struct DecompressState
+    rep         ::NTuple{3,Int}
+    huffman     ::Union{HuffmanTable,Nothing}
+    ll_tab      ::Union{FSETable,RLEFSETable,Nothing}
+    ml_tab      ::Union{FSETable,RLEFSETable,Nothing}
+    of_tab      ::Union{FSETable,RLEFSETable,Nothing}
+    dict_content::Vector{UInt8}   # dictionary content prefix for match references
+    # Reusable sequence buffers — grown on demand, never shrunk
+    ll_vals        ::Vector{Int}
+    ml_vals        ::Vector{Int}
+    of_vals        ::Vector{Int}
+    # Reusable literals buffer — holds decoded literals for the current block
+    literals_buf   ::Vector{UInt8}
+    # Reusable Huffman build scratch — pre-sized to maximum, never shrunk
+    huf_dtable     ::Vector{UInt16}
+    huf_rank_count ::Vector{Int}
+    huf_rank_start ::Vector{Int}
+    huf_weights    ::Vector{UInt8}
+    # Reusable FSE table backing arrays — one slot per table (LL, ML, OF).
+    # Slots cannot be shared because all three tables are live simultaneously
+    # during sequence decoding.
+    ll_slot ::FSETableSlot
+    ml_slot ::FSETableSlot
+    of_slot ::FSETableSlot
+    # Shared FSE build scratch — safe to share because LL/ML/OF are built sequentially
+    fse_occ  ::Vector{Int}
+    fse_norm ::Vector{Int16}
+end
+
+const _FSE_MAX_TABLE = 512  # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
+
+DecompressState() = DecompressState(
+    INIT_REP, nothing, nothing, nothing, nothing, UInt8[],
+    Int[], Int[], Int[],
+    UInt8[],
+    Vector{UInt16}(undef, 1 << HUF_TABLELOG_MAX),
+    zeros(Int, HUF_TABLELOG_MAX + 1),
+    zeros(Int, HUF_TABLELOG_MAX + 1),
+    UInt8[],
+    FSETableSlot(_FSE_MAX_TABLE),
+    FSETableSlot(_FSE_MAX_TABLE),
+    FSETableSlot(_FSE_MAX_TABLE),
+    Int[], Int16[])
+
+function DecompressState(dict::ZstdDict)
+    DecompressState(
+        dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
+        Int[], Int[], Int[],
+        UInt8[],
+        Vector{UInt16}(undef, 1 << HUF_TABLELOG_MAX),
+        zeros(Int, HUF_TABLELOG_MAX + 1),
+        zeros(Int, HUF_TABLELOG_MAX + 1),
+        UInt8[],
+        FSETableSlot(_FSE_MAX_TABLE),
+        FSETableSlot(_FSE_MAX_TABLE),
+        FSETableSlot(_FSE_MAX_TABLE),
+        Int[], Int16[])
+end
+
+# State-aware overload: routes FSE table backing storage through a slot and state.
+# Defined here (after FSETableSlot and DecompressState) to avoid forward references.
+function read_fse_table!(br::ForwardBitReader, default::FSETable,
+                         prev::Union{FSETable,RLEFSETable,Nothing},
+                         mode::Int, max_sym::Int, max_al::Int,
+                         slot::FSETableSlot, state::DecompressState)
+    return read_fse_table!(br, default, prev, mode, max_sym, max_al,
+                           slot.syms, slot.nb, slot.base,
+                           state.fse_occ, state.fse_norm)
+end
+
+# Hot-path variant of build_huffman_table: reuses scratch buffers from DecompressState.
+# huf_dtable is pre-sized to 1 << HUF_TABLELOG_MAX; only the first table_size
+# entries are filled and accessed, so sharing the full buffer across calls is safe.
+function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
+    nsyms = length(weights)
+    max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
+    max_bits <= HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+
+    table_size      = 1 << max_bits
+    dtable          = state.huf_dtable
+    rank_count      = state.huf_rank_count
+    next_rank_start = state.huf_rank_start
+
+    fill!(view(dtable,          1:table_size), UInt16(max_bits))
+    fill!(view(rank_count,      1:max_bits+1), 0)
+    fill!(view(next_rank_start, 1:max_bits+1), 0)
+
+    for sym in 0:nsyms-1
+        w = Int(weights[sym+1])
+        w > 0 && (rank_count[w] += 1)
+    end
+
+    pos = 0
+    for w in 1:max_bits
+        next_rank_start[w] = pos
+        pos += rank_count[w] * (1 << (w - 1))
+    end
+
+    for sym in 0:nsyms-1
+        w = Int(weights[sym+1])
+        w == 0 && continue
+        code_len    = max_bits - w + 1
+        num_entries = 1 << (w - 1)
+        entry       = UInt16((sym << 8) | code_len)
+        start       = next_rank_start[w]
+        for j in 0:num_entries-1
+            dtable[start + j + 1] = entry
+        end
+        next_rank_start[w] += num_entries
+    end
+
+    return HuffmanTable(max_bits, dtable)
+end
+
+# Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
+function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vector{UInt8})
+    al, dist  = read_fse_dist!(br, HUF_TABLELOG_MAX)
+    t         = build_fse_table(dist, al)
+
+    pos_after = byte_pos(br)
+    n_remain  = byte_limit - pos_after + 1
+    n_remain > 0 || throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
+
+    rb = ReverseBitReader(br.data, pos_after, n_remain)
+
+    state1 = fse_init!(rb, t)
+    state2 = fse_init!(rb, t)
+
+    empty!(weights)
+    while true
+        sym1 = fse_peek(t, state1)
+        state1 = _fse_update_unchecked(rb, t, state1)
+        push!(weights, UInt8(sym1))
+        if _rbr_overflowed(rb) || length(weights) >= 255
+            push!(weights, UInt8(fse_peek(t, state2)))
+            break
+        end
+
+        sym2 = fse_peek(t, state2)
+        state2 = _fse_update_unchecked(rb, t, state2)
+        push!(weights, UInt8(sym2))
+        if _rbr_overflowed(rb) || length(weights) >= 255
+            push!(weights, UInt8(fse_peek(t, state1)))
+            break
+        end
+    end
+
+    br.pos   = byte_limit + 1
+    br.nbits = 0
+    br.bits  = UInt64(0)
+
+    return weights
+end
+
+# Hot-path variant of read_huffman_description: reuses state scratch buffers.
+function read_huffman_description(data::Vector{UInt8}, pos::Int, state::DecompressState)
+    header = Int(data[pos])
+    if header < 128
+        compressed_size = header
+        br = ForwardBitReader(data, pos + 1, pos + compressed_size + 1)
+        weights = _decode_fse_weights(br, pos + compressed_size, state.huf_weights)
+        last_sym, last_w, table_log = _infer_last_weight(weights)
+        push!(weights, UInt8(last_w))
+        ht = build_huffman_table(weights, table_log, state)
+        return ht, compressed_size + 1
+    else
+        nsyms  = header - 127
+        nbytes = (nsyms + 1) >> 1
+        weights = state.huf_weights
+        resize!(weights, nsyms)
+        for i in 1:nbytes
+            b = data[pos + i]
+            lo = b & 0x0f
+            hi = (b >> 4) & 0x0f
+            idx = (i-1)*2
+            if idx + 1 <= nsyms;  weights[idx + 1] = hi;  end
+            if idx + 2 <= nsyms;  weights[idx + 2] = lo;  end
+        end
+        last_sym, last_w, table_log = _infer_last_weight(weights)
+        if last_sym <= nsyms
+            weights[last_sym] = UInt8(last_w)
+        else
+            push!(weights, UInt8(last_w))
+        end
+        ht = build_huffman_table(weights, table_log, state)
+        return ht, nbytes + 1
+    end
+end
+
+# Read the literals section starting at data[pos].
+# Returns (literals::Vector{UInt8}, bytes_consumed::Int).
+function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
+    b0 = Int(data[pos])
+    lit_type = b0 & 0x03
+    size_format = (b0 >> 2) & 0x03
+
+    if lit_type == 0 || lit_type == 1   # Raw or RLE
+        # Sizes:
+        #   size_format == 00 → 5-bit size in bits [7:3] of b0
+        #   size_format == 01 → 12-bit size in (b0>>4) | (b1<<4)
+        #   size_format == 10 → 20-bit size in (b0>>4) | (b1<<4) | (b2<<12)  (actually 14-bit? no, 20)
+        #   size_format == 11 → reserved
+        if size_format == 0 || size_format == 2
+            regen_size = (b0 >> 3) & 0x1f
+            header_size = 1
+        elseif size_format == 1
+            regen_size = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4)
+            header_size = 2
+        else  # size_format == 3
+            regen_size = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | (Int(data[pos+2]) << 12)
+            header_size = 3
+        end
+
+        if lit_type == 0   # Raw
+            literals = state.literals_buf
+            resize!(literals, regen_size)
+            copyto!(literals, 1, data, pos + header_size, regen_size)
+            return literals, header_size + regen_size
+        else               # RLE
+            byte_val = data[pos+header_size]
+            literals = state.literals_buf
+            resize!(literals, regen_size)
+            fill!(literals, byte_val)
+            return literals, header_size + 1
+        end
+    else   # Compressed (2) or Treeless (3)
+        # Header sizes (RFC 8878 §3.1.1.3.2.2):
+        #   size_format == 00 → 10-bit sizes, 3 streams NOT used (1 stream), 3-byte header
+        #   size_format == 01 → 10-bit sizes, 4-stream, 3-byte header (actually: 10+10 bits = 2.5 bytes → 3 bytes)
+        #   size_format == 10 → 14-bit sizes, 4-stream, 4-byte header
+        #   size_format == 11 → 18-bit sizes, 4-stream, 5-byte header
+        local compressed_size::Int, regen_size::Int, header_size::Int, num_streams::Int
+        if size_format == 0
+            # 1-stream, header: b0 b1 b2
+            # regen_size  = bits [7:2] of b0 combined with b1 [3:0]: 10 bits
+            # compressed_size = b1[7:4] | b2: 10 bits
+            regen_size      = ((b0 >> 4) & 0x0f) | ((Int(data[pos+1]) & 0x3f) << 4)
+            compressed_size = ((Int(data[pos+1]) >> 6) & 0x03) | (Int(data[pos+2]) << 2)
+            header_size     = 3
+            num_streams     = 1
+        elseif size_format == 1
+            regen_size      = ((b0 >> 4) & 0x0f) | ((Int(data[pos+1]) & 0x3f) << 4)
+            compressed_size = ((Int(data[pos+1]) >> 6) & 0x03) | (Int(data[pos+2]) << 2)
+            header_size     = 3
+            num_streams     = 4
+        elseif size_format == 2
+            regen_size      = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | ((Int(data[pos+2]) & 0x03) << 12)
+            compressed_size = ((Int(data[pos+2]) >> 2) & 0x3f) | (Int(data[pos+3]) << 6)
+            header_size     = 4
+            num_streams     = 4
+        else  # size_format == 3
+            regen_size      = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | ((Int(data[pos+2]) & 0x3f) << 12)
+            compressed_size = ((Int(data[pos+2]) >> 6) & 0x03) | (Int(data[pos+3]) << 2) | (Int(data[pos+4]) << 10)
+            header_size     = 5
+            num_streams     = 4
+        end
+
+        payload_start = pos + header_size
+        payload_end   = payload_start + compressed_size - 1
+
+        if lit_type == 2   # Compressed: Huffman description included
+            ht, hdr_len = read_huffman_description(data, payload_start, state)
+            state.huffman = ht
+            huf_start = payload_start + hdr_len
+        else               # Treeless: reuse previous Huffman table
+            state.huffman !== nothing || throw(ArgumentError("zstd: treeless literals but no prior Huffman table"))
+            ht = state.huffman
+            huf_start = payload_start
+        end
+
+        literals = state.literals_buf
+        resize!(literals, regen_size)
+
+        if num_streams == 1
+            stream_len = payload_end - huf_start + 1
+            rb = ReverseBitReader(data, huf_start, stream_len)
+            for i in 1:regen_size
+                @inbounds literals[i] = UInt8(huffman_decode!(rb, ht))
+            end
+        else
+            # 4 streams with a 6-byte jump table
+            j1 = Int(_le16(data, huf_start))
+            j2 = Int(_le16(data, huf_start + 2))
+            j3 = Int(_le16(data, huf_start + 4))
+            s1_start = huf_start + 6
+            s2_start = s1_start + j1
+            s3_start = s2_start + j2
+            s4_start = s3_start + j3
+            s4_end   = payload_end
+
+            # Each of the first 3 streams decodes ceil(regen_size/4) symbols; the last gets the remainder.
+            seg_n   = (regen_size + 3) >> 2
+            n1 = seg_n; n2 = seg_n; n3 = seg_n; n4 = regen_size - 3*seg_n
+
+            rb1 = ReverseBitReader(data, s1_start, j1)
+            rb2 = ReverseBitReader(data, s2_start, j2)
+            rb3 = ReverseBitReader(data, s3_start, j3)
+            rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
+
+            o = 1
+            for _ in 1:n1;  @inbounds literals[o] = UInt8(huffman_decode!(rb1, ht));  o += 1;  end
+            for _ in 1:n2;  @inbounds literals[o] = UInt8(huffman_decode!(rb2, ht));  o += 1;  end
+            for _ in 1:n3;  @inbounds literals[o] = UInt8(huffman_decode!(rb3, ht));  o += 1;  end
+            for _ in 1:n4;  @inbounds literals[o] = UInt8(huffman_decode!(rb4, ht));  o += 1;  end
+        end
+
+        return literals, header_size + compressed_size
+    end
+end
+
+# ============================================================
+# Section 8: Sequences section
+#   Reference: RFC 8878 §3.1.1.3.3
+# ============================================================
+
+# Execute decoded sequences to produce output bytes.
+# Appends to out.
+function execute_sequences!(
+        ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
+        literals::Vector{UInt8}, state::DecompressState, out::Vector{UInt8})
+
+    n = length(ll_vals)
+
+    # Pre-size output: every literal byte + every match byte will be written exactly once.
+    total = length(literals)
+    @inbounds for i in 1:n
+        total += ml_vals[i]
+    end
+    base = length(out)
+    resize!(out, base + total)
+    wpos = base + 1   # next write index; logical length of out = wpos - 1
+
+    lit_pos = 1
+
+    @inbounds for i in 1:n
+        ll = ll_vals[i]
+        ml = ml_vals[i]
+        of = of_vals[i]
+
+        # Copy ll literal bytes
+        if ll > 0
+            copyto!(out, wpos, literals, lit_pos, ll)
+            wpos    += ll
+            lit_pos += ll
+        end
+
+        # Determine actual offset from repeat-offset table (RFC 8878 §3.1.1.3.3.5).
+        # of is the raw Offset_Value; 1/2/3 are repeat codes, ≥4 is a new offset.
+        rep = state.rep
+        local offset::Int
+        if of > 3
+            offset = of - 3
+            state.rep = (offset, rep[1], rep[2])
+        elseif ll > 0
+            # Normal repeat-offset rules
+            if of == 1
+                offset = rep[1]
+                # no rep update
+            elseif of == 2
+                offset = rep[2]
+                state.rep = (rep[2], rep[1], rep[3])
+            else  # of == 3
+                offset = rep[3]
+                state.rep = (rep[3], rep[1], rep[2])
+            end
+        else
+            # LL==0: repeat-offset references shift up by 1
+            if of == 1
+                offset = rep[2]
+                state.rep = (rep[2], rep[1], rep[3])
+            elseif of == 2
+                offset = rep[3]
+                state.rep = (rep[3], rep[1], rep[2])
+            else  # of == 3
+                offset = rep[1] - 1
+                offset > 0 || throw(ArgumentError("zstd: repeat offset - 1 is zero"))
+                state.rep = (offset, rep[1], rep[2])
+            end
+        end
+
+        # Copy match of length ml from offset back in output.
+        # The match may reach into the dictionary content prefix.
+        # wpos - 1 is the logical end of written output; match_pos is 1-indexed into out.
+        dict     = state.dict_content
+        dict_len = length(dict)
+        match_pos = wpos - offset   # = (wpos - 1) - offset + 1
+        if match_pos < 1
+            # Offset reaches into dictionary content
+            dict_pos = dict_len + match_pos      # 1-indexed into dict
+            dict_pos >= 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
+            for _ in 1:ml
+                if dict_pos <= dict_len
+                    out[wpos] = dict[dict_pos]
+                    wpos     += 1
+                    dict_pos += 1
+                else
+                    out[wpos]  = out[match_pos]
+                    wpos      += 1
+                    match_pos += 1
+                end
+            end
+        else
+            if offset >= ml
+                # Non-overlapping: single bulk copy
+                @inbounds copyto!(out, wpos, out, match_pos, ml)
+            elseif offset == 1
+                # Single-byte repeat: fill
+                @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
+            else
+                # Overlapping repeat pattern: copy base pattern once, then
+                # keep doubling by copying already-written output.  Each
+                # copyto! is non-overlapping (filled bytes precede dest).
+                @inbounds copyto!(out, wpos, out, match_pos, offset)
+                filled = offset
+                @inbounds while filled < ml
+                    to_copy = min(filled, ml - filled)
+                    copyto!(out, wpos + filled, out, wpos, to_copy)
+                    filled += to_copy
+                end
+            end
+            wpos += ml
+        end
+    end
+
+    # Remaining literals after last sequence
+    rem = length(literals) - lit_pos + 1
+    if rem > 0
+        copyto!(out, wpos, literals, lit_pos, rem)
+    end
+end
+
+# Read and decode the sequences section.
+# data[pos:limit] is the sequences payload.
+# Appends decompressed bytes to out.
+function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
+                         state::DecompressState, literals::Vector{UInt8},
+                         out::Vector{UInt8})
+    # Read sequence count (RFC 8878 §3.1.1.3.3.1)
+    b0 = Int(data[pos]);  pos += 1
+    local num_seqs::Int
+    if b0 < 128
+        num_seqs = b0
+    elseif b0 < 255
+        num_seqs = ((b0 - 128) << 8) | Int(data[pos]);  pos += 1
+    else
+        num_seqs = Int(data[pos]) + (Int(data[pos+1]) << 8) + 0x7F00;  pos += 2
+    end
+
+    if num_seqs == 0
+        # No sequences: all literals
+        append!(out, literals)
+        return
+    end
+
+    # Symbol Compression Modes byte (RFC 8878 §3.1.1.3.3.2)
+    modes_byte = Int(data[pos]);  pos += 1
+    modes_byte & 0x03 == 0 || throw(ArgumentError("zstd: reserved bits set in Symbol_Compression_Modes"))
+    ll_mode = (modes_byte >> 6) & 0x03
+    of_mode = (modes_byte >> 4) & 0x03
+    ml_mode = (modes_byte >> 2) & 0x03
+
+    br = ForwardBitReader(data, pos, limit + 1)
+    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, FSE_MAX_SYMBOL_LL, 9,
+                             state.ll_slot, state)
+    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, FSE_MAX_SYMBOL_OF, 8,
+                             state.of_slot, state)
+    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, FSE_MAX_SYMBOL_ML, 9,
+                             state.ml_slot, state)
+    state.ll_tab = ll_tab
+    state.of_tab = of_tab
+    state.ml_tab = ml_tab
+
+    # The bitstream for sequences is a reverse bitstream starting right after
+    # the FSE table descriptions.
+    seq_start = byte_pos(br)
+    seq_len   = limit - seq_start + 1
+    seq_len > 0 || throw(ArgumentError("zstd: no data for sequences bitstream"))
+
+    rb = ReverseBitReader(data, seq_start, seq_len)
+
+    # Init FSE states: order is LL, OF, ML (RFC 8878 §3.1.1.3.3.4)
+    ll_state = fse_init!(rb, ll_tab)
+    of_state = fse_init!(rb, of_tab)
+    ml_state = fse_init!(rb, ml_tab)
+
+    resize!(state.ll_vals, num_seqs)
+    resize!(state.ml_vals, num_seqs)
+    resize!(state.of_vals, num_seqs)
+    ll_vals = state.ll_vals
+    ml_vals = state.ml_vals
+    of_vals = state.of_vals
+
+    for i in 1:num_seqs
+        # 1. Peek symbols from all three states (no bits consumed)
+        ll_code = fse_peek(ll_tab, ll_state)
+        ml_code = fse_peek(ml_tab, ml_state)
+        of_code = fse_peek(of_tab, of_state)
+
+        # 2. Read extra bits: order is OF, ML, LL (RFC 8878 §3.1.1.3.3.4)
+        of_extra   = (of_code > 0) ? Int(read_bits_r!(rb, of_code)) : 0
+        of_val64   = (Int64(1) << of_code) + of_extra   # raw Offset_Value (1..2^31)
+        of_val64 <= typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
+        of_vals[i] = Int(of_val64)
+
+        ml_extra = Int(read_bits_r!(rb, Int(ML_EXTRA_BITS[ml_code+1])))
+        ml_vals[i] = Int(ML_BASE[ml_code+1]) + ml_extra
+
+        ll_extra = Int(read_bits_r!(rb, Int(LL_EXTRA_BITS[ll_code+1])))
+        ll_vals[i] = Int(LL_BASE[ll_code+1]) + ll_extra
+
+        # 3. Update states: order is LL, ML, OF (RFC 8878 §3.1.1.3.3.4)
+        if i < num_seqs
+            ll_state = fse_update!(rb, ll_tab, ll_state)
+            ml_state = fse_update!(rb, ml_tab, ml_state)
+            of_state = fse_update!(rb, of_tab, of_state)
+        end
+    end
+
+    execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out)
+end
+
+# ============================================================
+# Section 9: Block decompression
+#   Reference: RFC 8878 §3.1.1
+# ============================================================
+
+function decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int,
+                           block_type::Int, state::DecompressState, out::Vector{UInt8})
+    if block_type == 0   # Raw block
+        append!(out, @view data[pos : pos+block_size-1])
+    elseif block_type == 1   # RLE block
+        # block_size == regen_size; compressed payload is always 1 byte
+        byte_val = data[pos]
+        n = length(out)
+        resize!(out, n + block_size)
+        fill!(@view(out[n+1:end]), byte_val)
+    elseif block_type == 2   # Compressed block
+        limit = pos + block_size - 1
+        literals, lit_consumed = read_literals(data, pos, state)
+        seq_pos = pos + lit_consumed
+        if seq_pos <= limit
+            read_sequences!(data, seq_pos, limit, state, literals, out)
+        else
+            append!(out, literals)
+        end
+    else
+        throw(ArgumentError("zstd: reserved block type 3"))
+    end
+end
+
+# ============================================================
+# Section 10: Frame decompression
+#   Reference: RFC 8878 §3.1
+# ============================================================
+
+@inline function _read_magic(data::Vector{UInt8}, pos::Int)
+    length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated frame (magic)"))
+    UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
+    (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
+end
+
+# Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
+function _skip_frame(data::Vector{UInt8}, pos::Int)
+    pos += 4   # past magic
+    length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated skippable frame (size)"))
+    frame_size = Int64(_read_magic(data, pos))   # 4-byte LE size field (may exceed Int32)
+    pos += 4
+    pos + frame_size - 1 <= length(data) || throw(ArgumentError("zstd: truncated skippable frame (data)"))
+    return pos + Int(frame_size)
+end
+
+function _decompress_frame!(data::Vector{UInt8}, pos::Int,
+                            dict::Union{ZstdDict,Nothing}=nothing)
+    # Magic number (4 bytes, little-endian)
+    magic = _read_magic(data, pos)
+    magic == ZSTD_MAGIC || throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
+    pos += 4
+
+    # Frame Header Descriptor (FHD)
+    length(data) >= pos || throw(ArgumentError("zstd: truncated frame (FHD)"))
+    fhd = Int(data[pos]);  pos += 1
+
+    fcs_flag       = (fhd >> 6) & 0x03
+    single_segment = (fhd >> 5) & 0x01
+    content_checksum = (fhd >> 2) & 0x01
+    dict_id_flag   = fhd & 0x03
+    (fhd >> 3) & 0x01 == 0 || throw(ArgumentError("zstd: reserved bit set in frame header descriptor"))
+
+    # Dictionary ID (RFC 8878 §3.1.1.1.3)
+    dict_id_size = (dict_id_flag == 0) ? 0 :
+                   (dict_id_flag == 1) ? 1 :
+                   (dict_id_flag == 2) ? 2 : 4
+    if dict_id_flag != 0 && dict === nothing
+        throw(ArgumentError("zstd: frame requires a dictionary but none was provided"))
+    end
+    if dict_id_size > 0 && dict !== nothing && dict.id != 0
+        frame_dict_id = (dict_id_size == 1) ? UInt32(data[pos]) :
+                        (dict_id_size == 2) ? UInt32(_le16(data, pos)) :
+                        _le32(data, pos)
+        frame_dict_id == dict.id || throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id,base=16)), dict=0x$(string(dict.id,base=16)))"))
+    end
+    pos += dict_id_size
+
+    # Window Descriptor (RFC 8878 §3.1.1.1.2, omitted when Single_Segment_Flag is set)
+    local window_size::Int
+    if single_segment == 0
+        wd = Int(data[pos]);  pos += 1
+        exponent = wd >> 4
+        mantissa = wd & 0x0f
+        window_base = 1 << (10 + exponent)
+        window_size = window_base + (window_base >> 3) * mantissa
+    else
+        window_size = -1   # determined by FCS below
+    end
+
+    # Frame Content Size (RFC 8878 §3.1.1.1.4)
+    fcs_size = (fcs_flag == 0) ? (single_segment != 0 ? 1 : 0) :
+               (fcs_flag == 1) ? 2 :
+               (fcs_flag == 2) ? 4 : 8
+    local frame_content_size::Int
+    if fcs_size == 0
+        frame_content_size = -1   # unknown
+    elseif fcs_size == 1
+        frame_content_size = Int(data[pos])
+    elseif fcs_size == 2
+        frame_content_size = Int(_le16(data, pos)) + 256
+    else
+        fcs64 = (fcs_size == 4) ? Int64(_le32(data, pos)) : Int64(_le64(data, pos))
+        fcs64 <= typemax(Int) || throw(ArgumentError("zstd: frame content size $fcs64 exceeds addressable range"))
+        frame_content_size = Int(fcs64)
+    end
+    pos += fcs_size
+
+    if single_segment != 0 && frame_content_size >= 0
+        window_size = frame_content_size
+    end
+
+    # Enforce a maximum window size to prevent memory exhaustion (2 GiB)
+    if window_size > 0
+        window_size <= Int64(1) << 31 || throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
+    end
+
+    state = dict !== nothing ? DecompressState(dict) : DecompressState()
+    out   = UInt8[]
+    # Prefer the exact FCS; fall back to length(data) when FCS is unknown
+    # (e.g. frames produced by the streaming API, which set fcs_flag=0).
+    # For incompressible data the compressed size ≈ decompressed size, so
+    # length(data) is an accurate hint.  For compressible data it
+    # under-allocates but those frames decode quickly anyway.
+    sizehint!(out, frame_content_size >= 0 ? frame_content_size : length(data))
+
+    # Decode blocks
+    while true
+        length(data) >= pos + 2 || throw(ArgumentError("zstd: truncated block header"))
+        # Block header is 3 bytes
+        bh0 = Int(data[pos]);  bh1 = Int(data[pos+1]);  bh2 = Int(data[pos+2])
+        pos += 3
+
+        last_block  = bh0 & 0x01
+        block_type  = (bh0 >> 1) & 0x03
+        # block_size for compressed/raw/RLE: 21-bit field in remaining 21 bits
+        block_size  = (bh0 >> 3) | (bh1 << 5) | (bh2 << 13)
+        block_size <= 131072 || throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
+
+        if block_type == 1   # RLE: 1 compressed byte; block_size = regen size
+            decompress_block!(data, pos, block_size, block_type, state, out)
+            pos += 1
+        else
+            decompress_block!(data, pos, block_size, block_type, state, out)
+            pos += block_size
+        end
+
+        last_block != 0 && break
+    end
+
+    # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
+    if frame_content_size >= 0
+        length(out) == frame_content_size || throw(ArgumentError("zstd: decompressed size $(length(out)) does not match frame content size $frame_content_size"))
+    end
+
+    # Content checksum (optional 4 bytes)
+    if content_checksum != 0
+        length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated content checksum"))
+        stored = UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
+                 (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
+        pos += 4
+        computed = UInt32(xxhash64(out) & 0xFFFFFFFF)
+        stored == computed || throw(ArgumentError("zstd: content checksum mismatch (stored=0x$(string(stored,base=16)), computed=0x$(string(computed,base=16)))"))
+    end
+
+    return out, pos
+end
+
+# ============================================================
+# Section 11: Public API
+#   Mirrors Inflate.jl interface.
+# ============================================================
+
+@inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == 0x184D2A50
+
+"""
+    zstd_decompress(data::Vector{UInt8}; dict=nothing) -> Vector{UInt8}
+
+Decompress one or more concatenated Zstandard frames from `data` and return
+the raw bytes.  Skippable frames (RFC 8878 §3.1.2) are silently ignored.
+
+If the frame was compressed with a dictionary, pass it as `dict` — either
+a `ZstdDict` returned by [`parse_dictionary`](@ref), or the raw dictionary
+bytes (`Vector{UInt8}`).
+"""
+function zstd_decompress(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+    isempty(data) && throw(ArgumentError("zstd: empty input"))
+    d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
+    pos = 1
+    out = UInt8[]
+    while pos <= length(data)
+        magic = _read_magic(data, pos)
+        if _is_skippable(magic)
+            pos = _skip_frame(data, pos)
+        elseif magic == ZSTD_MAGIC
+            result, pos = _decompress_frame!(data, pos, d)
+            append!(out, result)
+        else
+            throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
+        end
+    end
+    return out
+end
+
+"""
+    zstd_decompress(filename::AbstractString; dict=nothing) -> String
+
+Read a `.zst` file and return the decompressed content as a `String`.
+"""
+function zstd_decompress(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+    data = read(filename)
+    String(zstd_decompress(data; dict=dict))
+end
+
+# ============================================================
+# Section 12: Streaming interface
+#   ZstandardStream wraps any IO and decompresses eagerly.
+# ============================================================
+
+"""
+    ZstandardStream(io::IO; dict=nothing)
+
+Create a readable stream that decompresses Zstandard data from `io`.
+The stream reads all compressed data at construction time; subsequent
+reads deliver decompressed bytes.
+
+If the data was compressed with a dictionary, pass it as `dict` — either
+a `ZstdDict` or raw dictionary bytes (`Vector{UInt8}`).
+"""
+mutable struct ZstandardStream <: IO
+    buf::Vector{UInt8}
+    pos::Int
+end
+
+function ZstandardStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+    compressed = read(io)
+    decompressed = zstd_decompress(compressed; dict=dict)
+    ZstandardStream(decompressed, 1)
+end
+
+Base.eof(s::ZstandardStream) = s.pos > length(s.buf)
+
+function Base.read(s::ZstandardStream, ::Type{UInt8})
+    s.pos <= length(s.buf) || throw(EOFError())
+    b = s.buf[s.pos]
+    s.pos += 1
+    return b
+end
+
+function Base.readbytes!(s::ZstandardStream, b::AbstractVector{UInt8}, nb=length(b))
+    available = length(s.buf) - s.pos + 1
+    n = min(nb, available)
+    n <= 0 && return 0
+    length(b) < n && resize!(b, n)
+    copyto!(b, 1, s.buf, s.pos, n)
+    s.pos += n
+    return n
+end
+
+Base.bytesavailable(s::ZstandardStream) = max(0, length(s.buf) - s.pos + 1)
+
+end  # module Zstandard
