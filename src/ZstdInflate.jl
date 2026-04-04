@@ -1100,19 +1100,28 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             s4_end   = payload_end
 
             # Each of the first 3 streams decodes ceil(regen_size/4) symbols; the last gets the remainder.
-            seg_n   = (regen_size + 3) >> 2
-            n1 = seg_n; n2 = seg_n; n3 = seg_n; n4 = regen_size - 3*seg_n
+            seg_n = (regen_size + 3) >> 2
 
             rb1 = ReverseBitReader(data, s1_start, j1)
             rb2 = ReverseBitReader(data, s2_start, j2)
             rb3 = ReverseBitReader(data, s3_start, j3)
             rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
 
-            o = 1
-            for _ in 1:n1;  @inbounds literals[o] = UInt8(huffman_decode!(rb1, ht));  o += 1;  end
-            for _ in 1:n2;  @inbounds literals[o] = UInt8(huffman_decode!(rb2, ht));  o += 1;  end
-            for _ in 1:n3;  @inbounds literals[o] = UInt8(huffman_decode!(rb3, ht));  o += 1;  end
-            for _ in 1:n4;  @inbounds literals[o] = UInt8(huffman_decode!(rb4, ht));  o += 1;  end
+            # Stream 4 may be shorter: n4 = regen_size - 3*seg_n ≤ seg_n.
+            # Interleave all 4 streams for n4 iterations, then drain streams 1-3.
+            n4 = regen_size - 3 * seg_n
+            for i in 0:n4 - 1
+                @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
+                @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
+                @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
+                @inbounds literals[1 + i + 3seg_n] = huffman_decode!(rb4, ht)
+            end
+            for i in n4:seg_n - 1
+                @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
+                @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
+                @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
+            end
+
         end
 
         return literals, header_size + compressed_size
