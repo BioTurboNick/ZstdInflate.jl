@@ -52,7 +52,7 @@ This package was inspired by [Inflate.jl](https://github.com/GunnarFarneback/Inf
 - Pure Julia — no binary dependencies, works anywhere Julia does.
 - Competitive performance for text and other compressible data.
 
-## Why choose ZstdInflate.jl over Zstandard.jl
+## Why choose CodecZstd.jl over ZstdInflate.jl
 
 - Need compression (ZstdInflate.jl is decompression only).
 - Want a TranscodingStreams-compatible interface.
