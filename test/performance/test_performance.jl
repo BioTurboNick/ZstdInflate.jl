@@ -3,7 +3,7 @@ Pkg.activate(@__DIR__)
 Pkg.develop(PackageSpec(path = joinpath(@__DIR__, "..", "..")))
 Pkg.instantiate()
 
-using Zstandard
+using ZstdInflate
 using Chairmarks
 using CodecZstd
 using CodecZstd: ZstdDecompressor, ZstdDecompressorStream, ZstdCompressorStream
@@ -35,9 +35,9 @@ function repetitive(n)
     return x
 end
 
-# Source text: the Zstandard.jl source file repeated to fill n bytes.
+# Source text: the ZstdInflate.jl source file repeated to fill n bytes.
 function text(n)
-    src = read(pathof(Zstandard))
+    src = read(pathof(ZstdInflate))
     reps = cld(n, length(src))
     return Vector{UInt8}(repeat(String(src), reps)[1:n])
 end
@@ -72,13 +72,13 @@ function run_benchmarks()
                 (@b transcode(ZstdDecompressor, $compressed) seconds=2).time
             GC.gc()
             results[(size_name, data_name, :zstandard, :in_memory)] =
-                (@b zstd_decompress($compressed) seconds=2).time
+                (@b inflate_zstd($compressed) seconds=2).time
             GC.gc()
             results[(size_name, data_name, :codec_zstd, :streaming)] =
                 (@b IOBuffer($compressed) read(ZstdDecompressorStream(_)) evals=1 samples=30).time
             GC.gc()
             results[(size_name, data_name, :zstandard, :streaming)] =
-                (@b IOBuffer($compressed) read(ZstandardStream(_)) evals=1 samples=30).time
+                (@b IOBuffer($compressed) read(InflateZstdStream(_)) evals=1 samples=30).time
         end
     end
     return results
@@ -90,9 +90,9 @@ end
 
 function print_results(results, mode)
     mode_str = mode == :in_memory ? "In-memory" : "Streaming"
-    println("\n$(mode_str) decompression  (ratio = Zstandard.jl / CodecZstd, times in μs):")
+    println("\n$(mode_str) decompression  (ratio = ZstdInflate.jl / CodecZstd, times in μs):")
     @printf("  %-10s  %-15s  %6s  %10s  %10s\n",
-            "size", "data type", "ratio", "CodecZstd", "Zstandard.jl")
+            "size", "data type", "ratio", "CodecZstd", "ZstdInflate.jl")
     println("  ", "-"^57)
     for size_name in [:small, :medium, :large]
         for data_name in [:incompressible, :huffman, :repetitive, :text]
@@ -108,11 +108,11 @@ end
 function print_markdown_table(results, mode)
     mode_str = mode == :in_memory ? "In-memory" : "Streaming"
     deps = Pkg.API.Context().env.manifest.deps
-    version = only(filter(x -> x.name == "Zstandard",
+    version = only(filter(x -> x.name == "ZstdInflate",
                           collect(values(deps)))).version
     data_names = [:incompressible, :huffman, :repetitive, :text]
 
-    println("\n| Zstandard.jl v$(version) — $(mode_str) | incompressible | huffman | repetitive | text |")
+    println("\n| ZstdInflate.jl v$(version) — $(mode_str) | incompressible | huffman | repetitive | text |")
     println("| --- | --- | --- | --- | --- |")
     for size_name in [:small, :medium, :large]
         row = "| $(size_name)"

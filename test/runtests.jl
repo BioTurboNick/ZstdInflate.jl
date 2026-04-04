@@ -3,7 +3,7 @@
 
 using Test
 using Random
-using Zstandard
+using ZstdInflate
 using CodecZstd: ZstdCompressorStream
 using CodecZstd.LibZstd
 
@@ -33,14 +33,14 @@ end
 # ------------------------------------------------------------------
 empty_string  = ""
 short_string  = "This is a short string."
-medium_string = read(pathof(Zstandard), String)
+medium_string = read(pathof(ZstdInflate), String)
 long_string   = join(fill(medium_string, 100), short_string)
 
 @testset "Text strings" begin
     for s in [empty_string, short_string, medium_string, long_string]
         data = Vector{UInt8}(s)
-        @test zstd_decompress(compress(data)) == data
-        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test inflate_zstd(compress(data)) == data
+        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
     end
 end
 
@@ -51,8 +51,8 @@ end
     Random.seed!(1)
     for n in [0, 1, 10, 100, 1_000, 10_000, 100_000]
         data = rand(UInt8, n)
-        @test zstd_decompress(compress(data)) == data
-        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test inflate_zstd(compress(data)) == data
+        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
     end
 end
 
@@ -63,8 +63,8 @@ end
     Random.seed!(2)
     for n in [0, 1, 10, 100, 1_000, 10_000, 100_000]
         data = rand(UInt8, n) .& 0x0f
-        @test zstd_decompress(compress(data)) == data
-        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test inflate_zstd(compress(data)) == data
+        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
     end
 end
 
@@ -74,12 +74,12 @@ end
 @testset "Repetitive data" begin
     for n in [0, 1, 100, 10_000, 100_000]
         data = fill(UInt8(0x42), n)
-        @test zstd_decompress(compress(data)) == data
+        @test inflate_zstd(compress(data)) == data
     end
     # Periodic pattern
     pattern = UInt8[1, 2, 3, 4, 5, 6, 7, 8]
     data = repeat(pattern, 10_000)
-    @test zstd_decompress(compress(data)) == data
+    @test inflate_zstd(compress(data)) == data
 end
 
 # ------------------------------------------------------------------
@@ -88,12 +88,12 @@ end
 @testset "Multi-block frames" begin
     # long_string produces 31 blocks (1 Compressed + 30 Compressed with raw literals)
     data = Vector{UInt8}(long_string)
-    @test zstd_decompress(compress(data)) == data
+    @test inflate_zstd(compress(data)) == data
 
     # Large Huffman data → multi-block with treeless literals in later blocks
     Random.seed!(42)
     data = rand(UInt8, 200_000) .& 0x1f
-    @test zstd_decompress(compress(data)) == data
+    @test inflate_zstd(compress(data)) == data
 end
 
 # ------------------------------------------------------------------
@@ -104,14 +104,14 @@ end
     for data in [UInt8[], UInt8[0x42], Vector{UInt8}("Hello with checksum!"),
                  rand(UInt8, 10_000)]
         compressed = compress_opts(data; checksum=true)
-        @test zstd_decompress(compressed) == data
+        @test inflate_zstd(compressed) == data
     end
 
     # Corrupted checksum: flip a bit in the last (checksum) byte
     compressed = compress_opts(Vector{UInt8}("checksum test"); checksum=true)
     corrupted = copy(compressed)
     corrupted[end] ⊻= 0x01
-    @test_throws Exception zstd_decompress(corrupted)
+    @test_throws Exception inflate_zstd(corrupted)
 end
 
 # ------------------------------------------------------------------
@@ -122,7 +122,7 @@ end
     data = rand(UInt8, 50_000) .& 0x3f
     for level in [1, 3, 10, 19]
         compressed = compress_opts(data; level=level)
-        @test zstd_decompress(compressed) == data
+        @test inflate_zstd(compressed) == data
     end
 end
 
@@ -134,7 +134,7 @@ end
         path = joinpath(dir, "test.zst")
         data = Vector{UInt8}("Hello from file!")
         write(path, compress(data))
-        @test Vector{UInt8}(zstd_decompress(path)) == data
+        @test Vector{UInt8}(inflate_zstd(path)) == data
     end
 end
 
@@ -144,7 +144,7 @@ end
 @testset "Streaming readline" begin
     s = "first line\nsecond line\n"
     data = Vector{UInt8}(s)
-    stream = ZstandardStream(ZstdCompressorStream(IOBuffer(data)))
+    stream = InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))
     @test readline(stream; keep=true) == "first line\n"
     @test readline(stream; keep=true) == "second line\n"
     @test eof(stream)
@@ -163,17 +163,17 @@ end
         skip_payload)
 
     # Skippable before a real frame
-    @test zstd_decompress(vcat(skip_frame, frame_a)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(skip_frame, frame_a)) == UInt8[1, 2, 3]
 
     # Skippable after a real frame
-    @test zstd_decompress(vcat(frame_a, skip_frame)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(frame_a, skip_frame)) == UInt8[1, 2, 3]
 
     # Empty skippable frame (size = 0)
     empty_skip = UInt8[0x51, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00]
-    @test zstd_decompress(vcat(empty_skip, frame_a)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(empty_skip, frame_a)) == UInt8[1, 2, 3]
 
     # Multiple skippable frames around a real frame
-    @test zstd_decompress(vcat(skip_frame, empty_skip, frame_a, skip_frame)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(skip_frame, empty_skip, frame_a, skip_frame)) == UInt8[1, 2, 3]
 end
 
 # ------------------------------------------------------------------
@@ -184,20 +184,20 @@ end
     frame_b = compress(UInt8[4, 5, 6])
 
     # Two frames concatenated
-    @test zstd_decompress(vcat(frame_a, frame_b)) == UInt8[1, 2, 3, 4, 5, 6]
+    @test inflate_zstd(vcat(frame_a, frame_b)) == UInt8[1, 2, 3, 4, 5, 6]
 
     # Three frames
     frame_c = compress(UInt8[7])
-    @test zstd_decompress(vcat(frame_a, frame_b, frame_c)) == UInt8[1, 2, 3, 4, 5, 6, 7]
+    @test inflate_zstd(vcat(frame_a, frame_b, frame_c)) == UInt8[1, 2, 3, 4, 5, 6, 7]
 
     # Concatenation with skippable frame in between
     skip = UInt8[0x50, 0x2A, 0x4D, 0x18, 0x01, 0x00, 0x00, 0x00, 0xFF]
-    @test zstd_decompress(vcat(frame_a, skip, frame_b)) == UInt8[1, 2, 3, 4, 5, 6]
+    @test inflate_zstd(vcat(frame_a, skip, frame_b)) == UInt8[1, 2, 3, 4, 5, 6]
 
     # Empty frame concatenated with non-empty
     frame_empty = compress(UInt8[])
-    @test zstd_decompress(vcat(frame_empty, frame_a)) == UInt8[1, 2, 3]
-    @test zstd_decompress(vcat(frame_a, frame_empty)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(frame_empty, frame_a)) == UInt8[1, 2, 3]
+    @test inflate_zstd(vcat(frame_a, frame_empty)) == UInt8[1, 2, 3]
 end
 
 # ------------------------------------------------------------------
@@ -231,24 +231,24 @@ end
 
     # Basic roundtrip
     data = Vector{UInt8}("The quick brown fox jumps over the lazy dog. Sample #501.")
-    @test zstd_decompress(compress_with_dict(data, dict_buf); dict=d) == data
+    @test inflate_zstd(compress_with_dict(data, dict_buf); dict=d) == data
 
     # Passing raw dict bytes (auto-parsed)
-    @test zstd_decompress(compress_with_dict(data, dict_buf); dict=dict_buf) == data
+    @test inflate_zstd(compress_with_dict(data, dict_buf); dict=dict_buf) == data
 
     # Multiple test strings
     for i in 501:510
         data = Vector{UInt8}("Sample #$i has value=$(i*17 % 100). The quick brown fox.")
-        @test zstd_decompress(compress_with_dict(data, dict_buf); dict=d) == data
+        @test inflate_zstd(compress_with_dict(data, dict_buf); dict=d) == data
     end
 
     # Larger data with dictionary
     big_data = repeat(Vector{UInt8}("The quick brown fox. "), 5000)
-    @test zstd_decompress(compress_with_dict(big_data, dict_buf); dict=d) == big_data
+    @test inflate_zstd(compress_with_dict(big_data, dict_buf); dict=d) == big_data
 
     # Error: dict required but not provided
     compressed = compress_with_dict(data, dict_buf)
-    @test_throws Exception zstd_decompress(compressed)
+    @test_throws Exception inflate_zstd(compressed)
 end
 
 # ------------------------------------------------------------------
@@ -256,27 +256,27 @@ end
 # ------------------------------------------------------------------
 @testset "Error cases" begin
     # Empty input
-    @test_throws Exception zstd_decompress(UInt8[])
+    @test_throws Exception inflate_zstd(UInt8[])
 
     # Wrong magic number
-    @test_throws Exception zstd_decompress(UInt8[0x28, 0xB5, 0x2F, 0xFF, 0x00])
+    @test_throws Exception inflate_zstd(UInt8[0x28, 0xB5, 0x2F, 0xFF, 0x00])
 
     # Truncated frame (valid magic, then truncated)
     valid_frame = compress(UInt8[1, 2, 3])
-    @test_throws Exception zstd_decompress(valid_frame[1:end-2])
+    @test_throws Exception inflate_zstd(valid_frame[1:end-2])
 
     # Truncated magic only
-    @test_throws Exception zstd_decompress(UInt8[0x28, 0xB5, 0x2F, 0xFD])
+    @test_throws Exception inflate_zstd(UInt8[0x28, 0xB5, 0x2F, 0xFD])
 
     # Reserved bit in Frame Header Descriptor (bit 3 must be zero)
     bad_reserved = copy(valid_frame)
     bad_reserved[5] |= 0x08
-    @test_throws Exception zstd_decompress(bad_reserved)
+    @test_throws Exception inflate_zstd(bad_reserved)
 
     # Frame compressed with a dictionary (not supported)
     bad_dict = copy(valid_frame)
     bad_dict[5] = (bad_dict[5] & 0xFC) | 0x01   # set dict_id_flag = 1
-    @test_throws Exception zstd_decompress(bad_dict)
+    @test_throws Exception inflate_zstd(bad_dict)
 
     # Reserved bits in Symbol_Compression_Modes byte (bits 1-0 must be zero).
     # We need a frame with a compressed block that has sequences.
@@ -286,13 +286,13 @@ end
     # Easier: just set both low bits on every byte after the block header start —
     # the decoder will hit the modes byte and reject it.
     # Instead, just verify the valid frame works, then corrupt it.
-    @test zstd_decompress(seq_frame) == repeat(UInt8[1, 2, 3, 4, 5, 6, 7, 8], 100)
+    @test inflate_zstd(seq_frame) == repeat(UInt8[1, 2, 3, 4, 5, 6, 7, 8], 100)
 
     # Corrupted content checksum
     checksum_frame = compress_opts(UInt8[1, 2, 3]; checksum=true)
     bad_checksum = copy(checksum_frame)
     bad_checksum[end] ⊻= 0xFF
-    @test_throws Exception zstd_decompress(bad_checksum)
+    @test_throws Exception inflate_zstd(bad_checksum)
 
     # --- 32-bit safety: values that exceed Int32 range ---
     # These craft minimal frame headers with large size fields.
@@ -308,7 +308,7 @@ end
         0xA0,                               # FHD
         0x00, 0x00, 0x00, 0x80,            # FCS = 2^31
         0x01, 0x00, 0x00]                   # empty raw last block
-    @test_throws Exception zstd_decompress(fcs32_frame)
+    @test_throws Exception inflate_zstd(fcs32_frame)
 
     # FCS = 2^33 via 8-byte field (fcs_flag=3, single_segment=1)
     # FHD: fcs_flag=11, single_segment=1 → 0xE0
@@ -318,13 +318,13 @@ end
         0x00, 0x00, 0x00, 0x00,            # FCS low 4 bytes
         0x02, 0x00, 0x00, 0x00,            # FCS high 4 bytes → 2^33
         0x01, 0x00, 0x00]                   # empty raw last block
-    @test_throws Exception zstd_decompress(fcs64_frame)
+    @test_throws Exception inflate_zstd(fcs64_frame)
 
     # Skippable frame with size field = 0x80000000 (>= 2^31), truncated payload.
     skip_big = UInt8[
         0x50, 0x2A, 0x4D, 0x18,           # skippable magic
         0x00, 0x00, 0x00, 0x80]            # size = 2^31 (no payload → truncated)
-    @test_throws Exception zstd_decompress(skip_big)
+    @test_throws Exception inflate_zstd(skip_big)
 end
 
 # ------------------------------------------------------------------
@@ -338,8 +338,8 @@ end
         "café résumé naïve Ångström Σ≠Ω",
     ]
         data = Vector{UInt8}(s)
-        @test zstd_decompress(compress(data)) == data
-        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test inflate_zstd(compress(data)) == data
+        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
     end
 end
 
@@ -350,8 +350,8 @@ end
     Random.seed!(200)
     for T in [Int32, Float32, Float64]
         data = collect(reinterpret(UInt8, rand(T, 500)))
-        @test zstd_decompress(compress(data)) == data
-        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test inflate_zstd(compress(data)) == data
+        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
     end
 end
 
@@ -361,8 +361,8 @@ end
 @testset "Trailing garbage" begin
     frame = compress(UInt8[1, 2, 3])
     # 0xAA does not match any frame magic; whole stream must be rejected.
-    @test_throws Exception zstd_decompress(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD]))
-    @test_throws Exception zstd_decompress(vcat(frame, UInt8[0x00]))
+    @test_throws Exception inflate_zstd(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD]))
+    @test_throws Exception inflate_zstd(vcat(frame, UInt8[0x00]))
 end
 
 # ------------------------------------------------------------------
@@ -373,9 +373,9 @@ end
     fb = compress(UInt8[4, 5, 6])
     # Flip the magic of the second frame.
     bad_magic = copy(fb); bad_magic[1] ⊻= 0xFF
-    @test_throws Exception zstd_decompress(vcat(fa, bad_magic))
+    @test_throws Exception inflate_zstd(vcat(fa, bad_magic))
     # Truncate the second frame by two bytes.
-    @test_throws Exception zstd_decompress(vcat(fa, fb[1:end-2]))
+    @test_throws Exception inflate_zstd(vcat(fa, fb[1:end-2]))
 end
 
 # ------------------------------------------------------------------
@@ -385,7 +385,7 @@ end
     frame = compress(UInt8[99])
     for nibble in UInt8[0x52, 0x57, 0x5A, 0x5F]
         skip = vcat(UInt8[nibble, 0x2A, 0x4D, 0x18, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB])
-        @test zstd_decompress(vcat(skip, frame)) == UInt8[99]
-        @test read(ZstandardStream(IOBuffer(vcat(skip, frame)))) == UInt8[99]
+        @test inflate_zstd(vcat(skip, frame)) == UInt8[99]
+        @test read(InflateZstdStream(IOBuffer(vcat(skip, frame)))) == UInt8[99]
     end
 end

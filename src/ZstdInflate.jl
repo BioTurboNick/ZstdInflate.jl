@@ -4,7 +4,7 @@
 # Reference: https://www.rfc-editor.org/rfc/rfc8878
 
 """
-    Zstandard
+    ZstdInflate
 
 Pure Julia implementation of decompression of the Zstandard format.
 
@@ -12,22 +12,22 @@ In-memory decompression:
 
 | function | decompresses |
 | -------- | ------------ |
-| `zstd_decompress(data::Vector{UInt8})` | Zstandard frame |
-| `zstd_decompress(filename::AbstractString)` | Zstandard file |
+| `inflate_zstd(data::Vector{UInt8})` | Zstandard frame |
+| `inflate_zstd(filename::AbstractString)` | Zstandard file |
 
 Streaming decompression:
 
 | stream | decompresses |
 | ------ | ------------ |
-| `ZstandardStream(stream::IO)` | Zstandard stream |
+| `InflateZstdStream(stream::IO)` | Zstandard stream |
 
 Reference: [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)
 """
-module Zstandard
+module ZstdInflate
 
 using SIMD
 
-export zstd_decompress, ZstandardStream, ZstdDict, parse_dictionary
+export inflate_zstd, InflateZstdStream, ZstdDict, parse_dictionary
 
 # ============================================================
 # Section 1: Constants
@@ -1510,7 +1510,7 @@ end
 @inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == 0x184D2A50
 
 """
-    zstd_decompress(data::Vector{UInt8}; dict=nothing) -> Vector{UInt8}
+    inflate_zstd(data::Vector{UInt8}; dict=nothing) -> Vector{UInt8}
 
 Decompress one or more concatenated Zstandard frames from `data` and return
 the raw bytes.  Skippable frames (RFC 8878 §3.1.2) are silently ignored.
@@ -1519,7 +1519,7 @@ If the frame was compressed with a dictionary, pass it as `dict` — either
 a `ZstdDict` returned by [`parse_dictionary`](@ref), or the raw dictionary
 bytes (`Vector{UInt8}`).
 """
-function zstd_decompress(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
     isempty(data) && throw(ArgumentError("zstd: empty input"))
     d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
     pos = 1
@@ -1539,22 +1539,22 @@ function zstd_decompress(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8}
 end
 
 """
-    zstd_decompress(filename::AbstractString; dict=nothing) -> String
+    inflate_zstd(filename::AbstractString; dict=nothing) -> String
 
 Read a `.zst` file and return the decompressed content as a `String`.
 """
-function zstd_decompress(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
     data = read(filename)
-    String(zstd_decompress(data; dict=dict))
+    String(inflate_zstd(data; dict=dict))
 end
 
 # ============================================================
 # Section 12: Streaming interface
-#   ZstandardStream wraps any IO and decompresses eagerly.
+#   InflateZstdStream wraps any IO and decompresses eagerly.
 # ============================================================
 
 """
-    ZstandardStream(io::IO; dict=nothing)
+    InflateZstdStream(io::IO; dict=nothing)
 
 Create a readable stream that decompresses Zstandard data from `io`.
 The stream reads all compressed data at construction time; subsequent
@@ -1563,27 +1563,27 @@ reads deliver decompressed bytes.
 If the data was compressed with a dictionary, pass it as `dict` — either
 a `ZstdDict` or raw dictionary bytes (`Vector{UInt8}`).
 """
-mutable struct ZstandardStream <: IO
+mutable struct InflateZstdStream <: IO
     buf::Vector{UInt8}
     pos::Int
 end
 
-function ZstandardStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function InflateZstdStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
     compressed = read(io)
-    decompressed = zstd_decompress(compressed; dict=dict)
-    ZstandardStream(decompressed, 1)
+    decompressed = inflate_zstd(compressed; dict=dict)
+    InflateZstdStream(decompressed, 1)
 end
 
-Base.eof(s::ZstandardStream) = s.pos > length(s.buf)
+Base.eof(s::InflateZstdStream) = s.pos > length(s.buf)
 
-function Base.read(s::ZstandardStream, ::Type{UInt8})
+function Base.read(s::InflateZstdStream, ::Type{UInt8})
     s.pos ≤ length(s.buf) || throw(EOFError())
     b = s.buf[s.pos]
     s.pos += 1
     return b
 end
 
-function Base.readbytes!(s::ZstandardStream, b::AbstractVector{UInt8}, nb=length(b))
+function Base.readbytes!(s::InflateZstdStream, b::AbstractVector{UInt8}, nb=length(b))
     available = length(s.buf) - s.pos + 1
     n = min(nb, available)
     n ≤ 0 && return 0
@@ -1593,6 +1593,6 @@ function Base.readbytes!(s::ZstandardStream, b::AbstractVector{UInt8}, nb=length
     return n
 end
 
-Base.bytesavailable(s::ZstandardStream) = max(0, length(s.buf) - s.pos + 1)
+Base.bytesavailable(s::InflateZstdStream) = max(0, length(s.buf) - s.pos + 1)
 
-end  # module Zstandard
+end  # module ZstdInflate
