@@ -1365,91 +1365,139 @@ end
 # ============================================================
 
 @inline function _read_magic(data::Vector{UInt8}, pos::Int)
-    length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated frame (magic)"))
-    UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
-    (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
+    length(data) ≥ pos + 3 ||
+        throw(ArgumentError("zstd: truncated frame (magic)"))
+    _le32(data, pos)
 end
 
 # Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
 function _skip_frame(data::Vector{UInt8}, pos::Int)
-    pos += 4   # past magic
-    length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated skippable frame (size)"))
-    frame_size = Int64(_read_magic(data, pos))   # 4-byte LE size field (may exceed Int32)
+    pos += 4 # past magic
+
+    length(data) ≥ pos + 3 ||
+        throw(ArgumentError("zstd: truncated skippable frame (size)"))
+
+    frame_size = Int64(_le32(data, pos)) # 4-byte LE size field (may exceed Int32)
     pos += 4
-    pos + frame_size - 1 ≤ length(data) || throw(ArgumentError("zstd: truncated skippable frame (data)"))
-    return pos + Int(frame_size)
+
+    pos + frame_size - 1 ≤ length(data) ||
+        throw(ArgumentError("zstd: truncated skippable frame (data)"))
+
+    pos += Int(frame_size)
+    return pos
 end
 
-function _decompress_frame!(data::Vector{UInt8}, pos::Int,
-                            dict::Union{ZstdDict,Nothing}=nothing)
-    # Magic number (4 bytes, little-endian)
-    magic = _read_magic(data, pos)
-    magic == ZSTD_MAGIC || throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
-    pos += 4
+function _read_frame_header_descriptor(data::Vector{UInt8}, pos::Int)
+    length(data) ≥ pos ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
 
-    # Frame Header Descriptor (FHD)
-    length(data) ≥ pos || throw(ArgumentError("zstd: truncated frame (FHD)"))
-    fhd = Int(data[pos]);  pos += 1
+    fhd = Int(data[pos])
+    fcs_flag = (fhd >> 6) & 0x03
+    single_segment_flag = Bool((fhd >> 5) & 0x01)
+    content_checksum_flag = Bool((fhd >> 2) & 0x01)
+    dict_id_flag = fhd & 0x03
+    (fhd >> 3) & 0x01 == 0 ||
+        throw(ArgumentError("zstd: reserved bit set in frame header descriptor"))
+    fcs_size = (fcs_flag == 0 && !single_segment_flag) ?
+        0 :
+        1 << fcs_flag
+    dict_id_size = (dict_id_flag == 0) ?
+        0 :
+        1 << (dict_id_flag - 1)
+    
+    pos += 1
 
-    fcs_flag       = (fhd >> 6) & 0x03
-    single_segment = (fhd >> 5) & 0x01
-    content_checksum = (fhd >> 2) & 0x01
-    dict_id_flag   = fhd & 0x03
-    (fhd >> 3) & 0x01 == 0 || throw(ArgumentError("zstd: reserved bit set in frame header descriptor"))
+    return fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos
+end
 
-    # Dictionary ID (RFC 8878 §3.1.1.1.3)
-    dict_id_size = (dict_id_flag == 0) ? 0 :
-                   (dict_id_flag == 1) ? 1 :
-                   (dict_id_flag == 2) ? 2 : 4
-    if dict_id_flag != 0 && dict === nothing
+function _read_and_validate_dict_id(data::Vector{UInt8}, pos::Int, dict_id_size::Int, dict::Union{ZstdDict, Nothing})
+    dict_id_size > 0 ||
+        return pos # no dictionary ID field
+    length(data) ≥ pos + dict_id_size - 1 ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
+
+    dict_id_size != 0 && dict === nothing &&
         throw(ArgumentError("zstd: frame requires a dictionary but none was provided"))
-    end
     if dict_id_size > 0 && dict !== nothing && dict.id != 0
         frame_dict_id = (dict_id_size == 1) ? UInt32(data[pos]) :
                         (dict_id_size == 2) ? UInt32(_le16(data, pos)) :
                         _le32(data, pos)
-        frame_dict_id == dict.id || throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id,base=16)), dict=0x$(string(dict.id,base=16)))"))
+        frame_dict_id == dict.id || throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id, base = 16)), dict=0x$(string(dict.id, base = 16)))"))
     end
+
     pos += dict_id_size
 
-    # Window Descriptor (RFC 8878 §3.1.1.1.2, omitted when Single_Segment_Flag is set)
-    local window_size::Int
-    if single_segment == 0
-        wd = Int(data[pos]);  pos += 1
-        exponent = wd >> 4
-        mantissa = wd & 0x0f
-        window_base = 1 << (10 + exponent)
-        window_size = window_base + (window_base >> 3) * mantissa
-    else
-        window_size = -1   # determined by FCS below
-    end
+    return pos
+end
 
-    # Frame Content Size (RFC 8878 §3.1.1.1.4)
-    fcs_size = (fcs_flag == 0) ? (single_segment != 0 ? 1 : 0) :
-               (fcs_flag == 1) ? 2 :
-               (fcs_flag == 2) ? 4 : 8
-    local frame_content_size::Int
-    if fcs_size == 0
-        frame_content_size = -1   # unknown
-    elseif fcs_size == 1
-        frame_content_size = Int(data[pos])
-    elseif fcs_size == 2
-        frame_content_size = Int(_le16(data, pos)) + 256
-    else
-        fcs64 = (fcs_size == 4) ? Int64(_le32(data, pos)) : Int64(_le64(data, pos))
-        fcs64 ≤ typemax(Int) || throw(ArgumentError("zstd: frame content size $fcs64 exceeds addressable range"))
-        frame_content_size = Int(fcs64)
-    end
+function _read_frame_content_size(data::Vector{UInt8}, pos::Int, fcs_size::Int)
+    fcs_size > 0 ||
+        return -1, pos # unknown content size
+    length(data) ≥ pos + fcs_size - 1 ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
+    
+    fcs_u64 =
+        fcs_size == 0 ? UInt64(0) : # unknown
+        fcs_size == 1 ? UInt64(data[pos]) :
+        fcs_size == 2 ? UInt64(_le16(data, pos)) + 256 :
+        fcs_size == 4 ? UInt64(_le32(data, pos)) :
+                        _le64(data, pos)
+    fcs_u64 ≤ typemax(Int) ||
+        throw(ArgumentError("zstd: frame content size $fcs_u64 exceeds addressable range"))
+
     pos += fcs_size
 
-    if single_segment != 0 && frame_content_size ≥ 0
+    return Int(fcs_u64), pos
+end
+
+function _read_window_descriptor(data::Vector{UInt8}, pos::Int, single_segment_flag::Bool)
+    single_segment_flag && return 0, pos
+    length(data) ≥ pos ||
+        throw(ArgumentError("zstd: truncated frame (WD)"))
+    return Int(data[pos]), pos + 1
+end
+
+function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing})
+    # Frame Header Descriptor (RFC 8878 §3.1.1.1.1)
+    fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos = _read_frame_header_descriptor(data, pos)
+
+    # Dictionary ID (RFC 8878 §3.1.1.1.3)
+    pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
+
+    # Window Descriptor (RFC 8878 §3.1.1.1.2, omitted when Single_Segment_Flag is set)
+    window_descriptor, pos = _read_window_descriptor(data, pos, single_segment_flag)
+
+    # Frame Content Size (RFC 8878 §3.1.1.1.4)
+    frame_content_size, pos = _read_frame_content_size(data, pos, fcs_size)
+
+    # Set Window Size
+    if single_segment_flag
+        frame_content_size ≥ 0 ||
+            throw(ArgumentError("zstd: single-segment frame with unknown content size"))
         window_size = frame_content_size
+    else
+        exponent = window_descriptor >> 4
+        mantissa = window_descriptor & 0x0f
+        window_base = 1 << (10 + exponent)
+        window_size = window_base + (window_base >> 3) * mantissa
     end
 
-    # Enforce a maximum window size to prevent memory exhaustion (2 GiB)
-    if window_size > 0
-        window_size ≤ Int64(1) << 31 || throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
-    end
+    return window_size, frame_content_size, content_checksum_flag, pos
+end
+
+function _decompress_frame(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing} = nothing)
+    # Magic number (4 bytes, little-endian)
+    magic = _read_magic(data, pos)
+    magic == ZSTD_MAGIC ||
+        throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base = 16))"))
+    pos += 4
+
+    # Frame Header Descriptor (FHD)
+    window_size, frame_content_size, content_checksum_flag, pos = _read_frame_header(data, pos, dict)
+
+    # Enforce a maximum window size to prevent memory exhaustion (2 GiB); spec maximum is (1 << 41) + 7 * (1 << 38)
+    window_size ≤ Int64(1) << 31 ||
+        throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
 
     state = dict !== nothing ? DecompressState(dict) : DecompressState()
     out   = UInt8[]
@@ -1462,16 +1510,18 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
 
     # Decode blocks
     while true
-        length(data) ≥ pos + 2 || throw(ArgumentError("zstd: truncated block header"))
+        length(data) ≥ pos + 2 ||
+            throw(ArgumentError("zstd: truncated block header"))
         # Block header is 3 bytes
-        bh0 = Int(data[pos]);  bh1 = Int(data[pos+1]);  bh2 = Int(data[pos+2])
+        bh1, bh2, bh3 = Int(data[pos]), Int(data[pos+1]), Int(data[pos+2])
         pos += 3
 
-        last_block  = bh0 & 0x01
-        block_type  = (bh0 >> 1) & 0x03
+        last_block  = bh1 & 0x01
+        block_type  = (bh1 >> 1) & 0x03
         # block_size for compressed/raw/RLE: 21-bit field in remaining 21 bits
-        block_size  = (bh0 >> 3) | (bh1 << 5) | (bh2 << 13)
-        block_size ≤ 131072 || throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
+        block_size  = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
+        block_size ≤ 131072 ||
+            throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
 
         if block_type == 1   # RLE: 1 compressed byte; block_size = regen size
             decompress_block!(data, pos, block_size, block_type, state, out)
@@ -1485,18 +1535,18 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
     end
 
     # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
-    if frame_content_size ≥ 0
-        length(out) == frame_content_size || throw(ArgumentError("zstd: decompressed size $(length(out)) does not match frame content size $frame_content_size"))
-    end
+    frame_content_size < 0 || frame_content_size == length(out) ||
+        throw(ArgumentError("zstd: decompressed size $(length(out)) does not match frame content size $frame_content_size"))
 
     # Content checksum (optional 4 bytes)
-    if content_checksum != 0
-        length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated content checksum"))
-        stored = UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
-                 (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
+    if content_checksum_flag
+        length(data) ≥ pos + 3 ||
+            throw(ArgumentError("zstd: truncated content checksum"))
+        stored = _le32(data, pos)
         pos += 4
         computed = UInt32(xxhash64(out) & 0xFFFFFFFF)
-        stored == computed || throw(ArgumentError("zstd: content checksum mismatch (stored=0x$(string(stored,base=16)), computed=0x$(string(computed,base=16)))"))
+        stored == computed ||
+            throw(ArgumentError("zstd: content checksum mismatch (stored=0x$(string(stored,base=16)), computed=0x$(string(computed,base=16)))"))
     end
 
     return out, pos
@@ -1529,7 +1579,7 @@ function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},No
         if _is_skippable(magic)
             pos = _skip_frame(data, pos)
         elseif magic == ZSTD_MAGIC
-            result, pos = _decompress_frame!(data, pos, d)
+            result, pos = _decompress_frame(data, pos, d)
             append!(out, result)
         else
             throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
