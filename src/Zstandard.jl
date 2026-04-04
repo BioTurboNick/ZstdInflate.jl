@@ -25,6 +25,8 @@ Reference: [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)
 """
 module Zstandard
 
+using SIMD
+
 export zstd_decompress, ZstandardStream, ZstdDict, parse_dictionary
 
 # ============================================================
@@ -103,47 +105,43 @@ const XXH_P3 = 0x165667B19E3779F9
 const XXH_P4 = 0x85EBCA77C2B2AE63
 const XXH_P5 = 0x27D4EB2F165667C5
 
-@inline xxh_rotl64(x::UInt64, r) = (x << r) | (x >>> (64 - r))
+@inline xxh_rotl64(x::Union{UInt64, Vec{4, UInt64}}, r) = (x << r) | (x >>> (64 - r))
 
-@inline function xxh_round(acc::UInt64, lane::UInt64)
+@inline function xxh_round(acc::T, lane::T) where T <: Union{UInt64, Vec{4, UInt64}}
     acc += lane * XXH_P2
     acc  = xxh_rotl64(acc, 31)
     acc *= XXH_P1
     return acc
 end
 
-@inline function xxh_merge(acc::UInt64, val::UInt64)
-    acc ⊻= xxh_round(UInt64(0), val)
+@inline function xxh_merge(acc::T, val::T) where T <: Union{UInt64, Vec{4, UInt64}}
+    acc ⊻= xxh_round(T(0), val)
     acc  = acc * XXH_P1 + XXH_P4
     return acc
 end
 
 # Little-endian loads
-@inline function _le64(d, i)
-    UInt64(d[i])       | (UInt64(d[i+1]) << 8)  | (UInt64(d[i+2]) << 16) |
-    (UInt64(d[i+3]) << 24) | (UInt64(d[i+4]) << 32) | (UInt64(d[i+5]) << 40) |
-    (UInt64(d[i+6]) << 48) | (UInt64(d[i+7]) << 56)
-end
-@inline function _le32(d, i)
-    UInt32(d[i]) | (UInt32(d[i+1]) << 8) | (UInt32(d[i+2]) << 16) | (UInt32(d[i+3]) << 24)
-end
-@inline _le16(d, i) = UInt16(d[i]) | (UInt16(d[i+1]) << 8)
+@inline _le64(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt64}(pointer(d, i))))
+@inline _le32(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt32}(pointer(d, i))))
+@inline _le16(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt16}(pointer(d, i))))
 
 function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
     len = length(data)
     pos = 1
     local h64::UInt64
 
-    if len >= 32
+    if len ≥ 32
+        rdata64 = reinterpret(UInt64, @view data[1:end - (end % 8)])
         v1 = seed + XXH_P1 + XXH_P2
         v2 = seed + XXH_P2
         v3 = seed
         v4 = seed - XXH_P1
-        while pos + 31 <= len
-            v1 = xxh_round(v1, _le64(data, pos));     pos += 8
-            v2 = xxh_round(v2, _le64(data, pos));     pos += 8
-            v3 = xxh_round(v3, _le64(data, pos));     pos += 8
-            v4 = xxh_round(v4, _le64(data, pos));     pos += 8
+        while 8(pos - 1) + 32 ≤ len
+            vs = Vec{4, UInt64}((v1, v2, v3, v4))
+            vdata = vload(Vec{4, UInt64}, (@view rdata64[pos:pos + 3]), 1)
+            vs = xxh_round(vs, ltoh(vdata))
+            v1, v2, v3, v4 = NTuple{4, UInt64}(vs)
+            pos += 4
         end
         h64  = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) + xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18)
         h64  = xxh_merge(h64, v1)
@@ -156,17 +154,21 @@ function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
 
     h64 += UInt64(len)
 
-    while pos + 7 <= len
-        h64 ⊻= xxh_round(UInt64(0), _le64(data, pos));  pos += 8
+    while 8(pos - 1) + 8 ≤ len
+        rdata64 = reinterpret(UInt64, @view data[1:end - (end % 8)])
+        h64 ⊻= xxh_round(UInt64(0), ltoh(rdata64[pos])); pos += 1
         h64  = xxh_rotl64(h64, 27) * XXH_P1 + XXH_P4
     end
-    if pos + 3 <= len
-        h64 ⊻= UInt64(_le32(data, pos)) * XXH_P1
-        h64  = xxh_rotl64(h64, 23) * XXH_P2 + XXH_P3;  pos += 4
+    pos = 2 * (pos - 1) + 1
+    if 4(pos - 1) + 4 ≤ len
+        rdata32 = reinterpret(UInt32, @view data[1:end - (end % 4)])
+        h64 ⊻= UInt64(ltoh(rdata32[pos])) * XXH_P1; pos += 1
+        h64  = xxh_rotl64(h64, 23) * XXH_P2 + XXH_P3
     end
-    while pos <= len
+    pos = 4 * (pos - 1) + 1
+    while pos ≤ len
         h64 ⊻= UInt64(data[pos]) * XXH_P5
-        h64  = xxh_rotl64(h64, 11) * XXH_P1;            pos += 1
+        h64  = xxh_rotl64(h64, 11) * XXH_P1; pos += 1
     end
 
     h64 ⊻= h64 >>> 33;  h64 *= XXH_P2
@@ -194,7 +196,7 @@ function ForwardBitReader(data::Vector{UInt8}, byte_offset::Int, byte_limit::Int
 end
 
 function _fbr_refill!(br::ForwardBitReader)
-    while br.nbits <= 56 && br.pos < br.limit
+    while br.nbits ≤ 56 && br.pos < br.limit
         br.bits  |= UInt64(br.data[br.pos]) << br.nbits
         br.nbits += 8
         br.pos   += 1
@@ -204,7 +206,7 @@ end
 @inline function read_bits!(br::ForwardBitReader, n::Int)
     n == 0 && return UInt64(0)
     br.nbits < n && _fbr_refill!(br)
-    br.nbits >= n || throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
+    br.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
     mask = (n < 64) ? ((UInt64(1) << n) - UInt64(1)) : typemax(UInt64)
     val      = br.bits & mask
     br.bits  = (n < 64) ? (br.bits >>> n) : UInt64(0)
@@ -259,7 +261,7 @@ function ReverseBitReader(data::Vector{UInt8}, byte_offset::Int, byte_len::Int)
 end
 
 function _rbr_refill!(rb::ReverseBitReader)
-    while rb.nbits <= 56 && rb.pos >= rb.start
+    while rb.nbits ≤ 56 && rb.pos ≥ rb.start
         # Each byte goes into the region just below the currently loaded bits
         rb.bits  |= UInt64(rb.data[rb.pos]) << (56 - rb.nbits)
         rb.nbits += 8
@@ -270,7 +272,7 @@ end
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
     n == 0 && return UInt64(0)
     rb.nbits < n && _rbr_refill!(rb)
-    rb.nbits >= n || throw(ArgumentError("zstd: unexpected end of reverse bitstream"))
+    rb.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of reverse bitstream"))
     val      = rb.bits >>> (64 - n)
     rb.bits  = (n < 64) ? (rb.bits << n) : UInt64(0)
     rb.nbits -= n
@@ -280,14 +282,14 @@ end
 # Peek without consuming.
 @inline function peek_bits_r!(rb::ReverseBitReader, n::Int)
     rb.nbits < n && _rbr_refill!(rb)
-    rb.nbits >= n || throw(ArgumentError("zstd: unexpected end of reverse bitstream (peek)"))
+    rb.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of reverse bitstream (peek)"))
     return rb.bits >>> (64 - n)
 end
 
 @inline function consume_bits_r!(rb::ReverseBitReader, n::Int)
     # RFC 8878: Huffman code lengths are bounded by HUF_TABLELOG_MAX (12),
-    # so n is always in [1, 12] — never >= 64.  Catch bugs if that ever changes.
-    n < 64 || throw(ArgumentError("zstd: consume_bits_r! shift $n >= 64"))
+    # so n is always in [1, 12] — never ≥ 64.  Catch bugs if that ever changes.
+    n < 64 || throw(ArgumentError("zstd: consume_bits_r! shift $n ≥ 64"))
     rb.bits  = rb.bits << n
     rb.nbits -= n
 end
@@ -417,7 +419,7 @@ function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
         else
             # Long path: value from nbits bits
             count = Int(br.bits & UInt64(2 * threshold - 1))
-            if count >= threshold
+            if count ≥ threshold
                 count -= max_val
             end
             br.bits  >>>= nbits
@@ -519,8 +521,8 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
         return RLEFSETable(UInt8(sym))
     elseif mode == 2
         al, dist = read_fse_dist!(br, max_sym, norm)
-        al <= max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
-        length(dist) <= max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
+        al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
+        length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
         return build_fse_table(dist, al, syms, nb, base, occ)
     else   # mode == 3: repeat previous table (RFC 8878 §3.1.1.3.3.2)
         prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous FSE table"))
@@ -546,7 +548,7 @@ end
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
-    max_bits <= HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+    max_bits ≤ HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
 
     table_size = 1 << max_bits
     # Fill with a safe default (symbol 0, consuming max_bits) so that any
@@ -594,7 +596,7 @@ end
     idx = Int(rb.bits >>> (64 - ht.max_bits))
     e   = ht.decode_table[idx + 1]
     nb  = Int(e & 0xFF)
-    # nb <= max_bits <= 12 < 64; safe to drop the old min(nb, rb.nbits) guard because
+    # nb ≤ max_bits ≤ 12 < 64; safe to drop the old min(nb, rb.nbits) guard because
     # we always decode exactly regen_size symbols and discard rb immediately after.
     consume_bits_r!(rb, nb)
     return Int(e >> 8)
@@ -658,7 +660,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
         sym1 = fse_peek(t, state1)
         state1 = _fse_update_unchecked(rb, t, state1)
         push!(weights, UInt8(sym1))
-        if _rbr_overflowed(rb) || length(weights) >= 255
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(fse_peek(t, state2)))
             break
         end
@@ -666,7 +668,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
         sym2 = fse_peek(t, state2)
         state2 = _fse_update_unchecked(rb, t, state2)
         push!(weights, UInt8(sym2))
-        if _rbr_overflowed(rb) || length(weights) >= 255
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(fse_peek(t, state1)))
             break
         end
@@ -706,15 +708,15 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int)
             lo = b & 0x0f
             hi = (b >> 4) & 0x0f
             idx = (i-1)*2
-            if idx + 1 <= nsyms
+            if idx + 1 ≤ nsyms
                 weights[idx + 1] = hi    # high nibble = first weight
             end
-            if idx + 2 <= nsyms
+            if idx + 2 ≤ nsyms
                 weights[idx + 2] = lo    # low nibble = second weight
             end
         end
         last_sym, last_w, table_log = _infer_last_weight(weights)
-        if last_sym <= nsyms
+        if last_sym ≤ nsyms
             weights[last_sym] = UInt8(last_w)
         else
             push!(weights, UInt8(last_w))
@@ -747,7 +749,7 @@ Parse a Zstandard dictionary (RFC 8878 §5).  Accepts both structured
 dictionaries (magic `0xEC30A437`) and raw content dictionaries.
 """
 function parse_dictionary(raw::Vector{UInt8})
-    length(raw) >= 8 || throw(ArgumentError("zstd: dictionary too short"))
+    length(raw) ≥ 8 || throw(ArgumentError("zstd: dictionary too short"))
     magic = UInt32(raw[1]) | (UInt32(raw[2]) << 8) |
             (UInt32(raw[3]) << 16) | (UInt32(raw[4]) << 24)
     if magic != ZSTD_DICT_MAGIC
@@ -780,7 +782,7 @@ function parse_dictionary(raw::Vector{UInt8})
     pos = byte_pos(br)
 
     # 5. Three repeat offsets, 4 bytes LE each
-    length(raw) >= pos + 11 || throw(ArgumentError("zstd: dictionary truncated (repeat offsets)"))
+    length(raw) ≥ pos + 11 || throw(ArgumentError("zstd: dictionary truncated (repeat offsets)"))
     rep1 = Int(_le32(raw, pos));     pos += 4
     rep2 = Int(_le32(raw, pos));     pos += 4
     rep3 = Int(_le32(raw, pos));     pos += 4
@@ -883,7 +885,7 @@ end
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
-    max_bits <= HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+    max_bits ≤ HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
 
     table_size      = 1 << max_bits
     dtable          = state.huf_dtable
@@ -940,7 +942,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vec
         sym1 = fse_peek(t, state1)
         state1 = _fse_update_unchecked(rb, t, state1)
         push!(weights, UInt8(sym1))
-        if _rbr_overflowed(rb) || length(weights) >= 255
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(fse_peek(t, state2)))
             break
         end
@@ -948,7 +950,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vec
         sym2 = fse_peek(t, state2)
         state2 = _fse_update_unchecked(rb, t, state2)
         push!(weights, UInt8(sym2))
-        if _rbr_overflowed(rb) || length(weights) >= 255
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(fse_peek(t, state1)))
             break
         end
@@ -982,11 +984,11 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int, state::Decompre
             lo = b & 0x0f
             hi = (b >> 4) & 0x0f
             idx = (i-1)*2
-            if idx + 1 <= nsyms;  weights[idx + 1] = hi;  end
-            if idx + 2 <= nsyms;  weights[idx + 2] = lo;  end
+            if idx + 1 ≤ nsyms;  weights[idx + 1] = hi;  end
+            if idx + 2 ≤ nsyms;  weights[idx + 2] = lo;  end
         end
         last_sym, last_w, table_log = _infer_last_weight(weights)
-        if last_sym <= nsyms
+        if last_sym ≤ nsyms
             weights[last_sym] = UInt8(last_w)
         else
             push!(weights, UInt8(last_w))
@@ -1196,9 +1198,9 @@ function execute_sequences!(
         if match_pos < 1
             # Offset reaches into dictionary content
             dict_pos = dict_len + match_pos      # 1-indexed into dict
-            dict_pos >= 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
+            dict_pos ≥ 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
             for _ in 1:ml
-                if dict_pos <= dict_len
+                if dict_pos ≤ dict_len
                     out[wpos] = dict[dict_pos]
                     wpos     += 1
                     dict_pos += 1
@@ -1209,7 +1211,7 @@ function execute_sequences!(
                 end
             end
         else
-            if offset >= ml
+            if offset ≥ ml
                 # Non-overlapping: single bulk copy
                 @inbounds copyto!(out, wpos, out, match_pos, ml)
             elseif offset == 1
@@ -1308,7 +1310,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         # 2. Read extra bits: order is OF, ML, LL (RFC 8878 §3.1.1.3.3.4)
         of_extra   = (of_code > 0) ? Int(read_bits_r!(rb, of_code)) : 0
         of_val64   = (Int64(1) << of_code) + of_extra   # raw Offset_Value (1..2^31)
-        of_val64 <= typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
+        of_val64 ≤ typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
         of_vals[i] = Int(of_val64)
 
         ml_extra = Int(read_bits_r!(rb, Int(ML_EXTRA_BITS[ml_code+1])))
@@ -1347,7 +1349,7 @@ function decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int,
         limit = pos + block_size - 1
         literals, lit_consumed = read_literals(data, pos, state)
         seq_pos = pos + lit_consumed
-        if seq_pos <= limit
+        if seq_pos ≤ limit
             read_sequences!(data, seq_pos, limit, state, literals, out)
         else
             append!(out, literals)
@@ -1363,7 +1365,7 @@ end
 # ============================================================
 
 @inline function _read_magic(data::Vector{UInt8}, pos::Int)
-    length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated frame (magic)"))
+    length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated frame (magic)"))
     UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
     (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
 end
@@ -1371,10 +1373,10 @@ end
 # Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
 function _skip_frame(data::Vector{UInt8}, pos::Int)
     pos += 4   # past magic
-    length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated skippable frame (size)"))
+    length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated skippable frame (size)"))
     frame_size = Int64(_read_magic(data, pos))   # 4-byte LE size field (may exceed Int32)
     pos += 4
-    pos + frame_size - 1 <= length(data) || throw(ArgumentError("zstd: truncated skippable frame (data)"))
+    pos + frame_size - 1 ≤ length(data) || throw(ArgumentError("zstd: truncated skippable frame (data)"))
     return pos + Int(frame_size)
 end
 
@@ -1386,7 +1388,7 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
     pos += 4
 
     # Frame Header Descriptor (FHD)
-    length(data) >= pos || throw(ArgumentError("zstd: truncated frame (FHD)"))
+    length(data) ≥ pos || throw(ArgumentError("zstd: truncated frame (FHD)"))
     fhd = Int(data[pos]);  pos += 1
 
     fcs_flag       = (fhd >> 6) & 0x03
@@ -1435,18 +1437,18 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
         frame_content_size = Int(_le16(data, pos)) + 256
     else
         fcs64 = (fcs_size == 4) ? Int64(_le32(data, pos)) : Int64(_le64(data, pos))
-        fcs64 <= typemax(Int) || throw(ArgumentError("zstd: frame content size $fcs64 exceeds addressable range"))
+        fcs64 ≤ typemax(Int) || throw(ArgumentError("zstd: frame content size $fcs64 exceeds addressable range"))
         frame_content_size = Int(fcs64)
     end
     pos += fcs_size
 
-    if single_segment != 0 && frame_content_size >= 0
+    if single_segment != 0 && frame_content_size ≥ 0
         window_size = frame_content_size
     end
 
     # Enforce a maximum window size to prevent memory exhaustion (2 GiB)
     if window_size > 0
-        window_size <= Int64(1) << 31 || throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
+        window_size ≤ Int64(1) << 31 || throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
     end
 
     state = dict !== nothing ? DecompressState(dict) : DecompressState()
@@ -1456,11 +1458,11 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
     # For incompressible data the compressed size ≈ decompressed size, so
     # length(data) is an accurate hint.  For compressible data it
     # under-allocates but those frames decode quickly anyway.
-    sizehint!(out, frame_content_size >= 0 ? frame_content_size : length(data))
+    sizehint!(out, frame_content_size ≥ 0 ? frame_content_size : length(data))
 
     # Decode blocks
     while true
-        length(data) >= pos + 2 || throw(ArgumentError("zstd: truncated block header"))
+        length(data) ≥ pos + 2 || throw(ArgumentError("zstd: truncated block header"))
         # Block header is 3 bytes
         bh0 = Int(data[pos]);  bh1 = Int(data[pos+1]);  bh2 = Int(data[pos+2])
         pos += 3
@@ -1469,7 +1471,7 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
         block_type  = (bh0 >> 1) & 0x03
         # block_size for compressed/raw/RLE: 21-bit field in remaining 21 bits
         block_size  = (bh0 >> 3) | (bh1 << 5) | (bh2 << 13)
-        block_size <= 131072 || throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
+        block_size ≤ 131072 || throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
 
         if block_type == 1   # RLE: 1 compressed byte; block_size = regen size
             decompress_block!(data, pos, block_size, block_type, state, out)
@@ -1483,13 +1485,13 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int,
     end
 
     # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
-    if frame_content_size >= 0
+    if frame_content_size ≥ 0
         length(out) == frame_content_size || throw(ArgumentError("zstd: decompressed size $(length(out)) does not match frame content size $frame_content_size"))
     end
 
     # Content checksum (optional 4 bytes)
     if content_checksum != 0
-        length(data) >= pos + 3 || throw(ArgumentError("zstd: truncated content checksum"))
+        length(data) ≥ pos + 3 || throw(ArgumentError("zstd: truncated content checksum"))
         stored = UInt32(data[pos]) | (UInt32(data[pos+1]) << 8) |
                  (UInt32(data[pos+2]) << 16) | (UInt32(data[pos+3]) << 24)
         pos += 4
@@ -1522,7 +1524,7 @@ function zstd_decompress(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8}
     d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
     pos = 1
     out = UInt8[]
-    while pos <= length(data)
+    while pos ≤ length(data)
         magic = _read_magic(data, pos)
         if _is_skippable(magic)
             pos = _skip_frame(data, pos)
@@ -1575,7 +1577,7 @@ end
 Base.eof(s::ZstandardStream) = s.pos > length(s.buf)
 
 function Base.read(s::ZstandardStream, ::Type{UInt8})
-    s.pos <= length(s.buf) || throw(EOFError())
+    s.pos ≤ length(s.buf) || throw(EOFError())
     b = s.buf[s.pos]
     s.pos += 1
     return b
@@ -1584,7 +1586,7 @@ end
 function Base.readbytes!(s::ZstandardStream, b::AbstractVector{UInt8}, nb=length(b))
     available = length(s.buf) - s.pos + 1
     n = min(nb, available)
-    n <= 0 && return 0
+    n ≤ 0 && return 0
     length(b) < n && resize!(b, n)
     copyto!(b, 1, s.buf, s.pos, n)
     s.pos += n
