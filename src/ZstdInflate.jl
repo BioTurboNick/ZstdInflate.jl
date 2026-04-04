@@ -589,17 +589,21 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
     return HuffmanTable(max_bits, dtable)
 end
 
+# Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
+# Inlines bit consumption to avoid the n < 64 safety branch in consume_bits_r!.
+@inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable)
+    idx      = Int(rb.bits >>> (64 - ht.max_bits))
+    e        = @inbounds ht.decode_table[idx + 1]
+    nb       = Int(e & 0xFF)
+    rb.bits <<= nb
+    rb.nbits -= nb
+    return Int(e >> 8)
+end
+
 # Decode one Huffman symbol from the reverse bit reader.
 @inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable)
     rb.nbits < ht.max_bits && _rbr_refill!(rb)
-    # Peek max_bits from the MSB; spare high bits are zero (zero-padding at end of stream).
-    idx = Int(rb.bits >>> (64 - ht.max_bits))
-    e   = ht.decode_table[idx + 1]
-    nb  = Int(e & 0xFF)
-    # nb ≤ max_bits ≤ 12 < 64; safe to drop the old min(nb, rb.nbits) guard because
-    # we always decode exactly regen_size symbols and discard rb immediately after.
-    consume_bits_r!(rb, nb)
-    return Int(e >> 8)
+    _huffman_decode_nocheck!(rb, ht)
 end
 
 
@@ -1109,17 +1113,49 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
 
             # Stream 4 may be shorter: n4 = regen_size - 3*seg_n ≤ seg_n.
             # Interleave all 4 streams for n4 iterations, then drain streams 1-3.
-            n4 = regen_size - 3 * seg_n
-            for i in 0:n4 - 1
+            # Batch-refill every safe_n iterations: after one refill nbits ≥ 57,
+            # and each decode consumes ≤ max_bits, so safe_n = 57 ÷ max_bits
+            # symbols can be decoded without another refill check.
+            n4     = regen_size - 3 * seg_n
+            safe_n = 57 ÷ ht.max_bits
+
+            # Phase 1: all 4 streams (n4 iterations)
+            i = 0
+            while i + safe_n ≤ n4
+                _rbr_refill!(rb1); _rbr_refill!(rb2)
+                _rbr_refill!(rb3); _rbr_refill!(rb4)
+                for j in 0:safe_n - 1
+                    @inbounds literals[1 + i + j]          = _huffman_decode_nocheck!(rb1, ht)
+                    @inbounds literals[1 + i + j +  seg_n] = _huffman_decode_nocheck!(rb2, ht)
+                    @inbounds literals[1 + i + j + 2seg_n] = _huffman_decode_nocheck!(rb3, ht)
+                    @inbounds literals[1 + i + j + 3seg_n] = _huffman_decode_nocheck!(rb4, ht)
+                end
+                i += safe_n
+            end
+            while i < n4   # remainder < safe_n
                 @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
                 @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
                 @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
                 @inbounds literals[1 + i + 3seg_n] = huffman_decode!(rb4, ht)
+                i += 1
             end
-            for i in n4:seg_n - 1
+
+            # Phase 2: streams 1-3 only (remaining seg_n - n4 iterations)
+            i = n4
+            while i + safe_n ≤ seg_n
+                _rbr_refill!(rb1); _rbr_refill!(rb2); _rbr_refill!(rb3)
+                for j in 0:safe_n - 1
+                    @inbounds literals[1 + i + j]          = _huffman_decode_nocheck!(rb1, ht)
+                    @inbounds literals[1 + i + j +  seg_n] = _huffman_decode_nocheck!(rb2, ht)
+                    @inbounds literals[1 + i + j + 2seg_n] = _huffman_decode_nocheck!(rb3, ht)
+                end
+                i += safe_n
+            end
+            while i < seg_n   # remainder < safe_n
                 @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
                 @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
                 @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
+                i += 1
             end
 
         end
