@@ -326,3 +326,66 @@ end
         0x00, 0x00, 0x00, 0x80]            # size = 2^31 (no payload → truncated)
     @test_throws Exception zstd_decompress(skip_big)
 end
+
+# ------------------------------------------------------------------
+# UTF-8 content (non-ASCII multi-byte encodings)
+# ------------------------------------------------------------------
+@testset "UTF-8 content" begin
+    for s in [
+        "🦀 🐍 🎯 👾 ∑√π∞",
+        "日本語テスト — 中文测试",
+        "مرحبا بالعالم",
+        "café résumé naïve Ångström Σ≠Ω",
+    ]
+        data = Vector{UInt8}(s)
+        @test zstd_decompress(compress(data)) == data
+        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+    end
+end
+
+# ------------------------------------------------------------------
+# Typed binary arrays (Float32/Float64/Int32 serialised as raw bytes)
+# ------------------------------------------------------------------
+@testset "Typed binary arrays" begin
+    Random.seed!(200)
+    for T in [Int32, Float32, Float64]
+        data = collect(reinterpret(UInt8, rand(T, 500)))
+        @test zstd_decompress(compress(data)) == data
+        @test read(ZstandardStream(ZstdCompressorStream(IOBuffer(data)))) == data
+    end
+end
+
+# ------------------------------------------------------------------
+# Trailing garbage after a complete frame must be rejected
+# ------------------------------------------------------------------
+@testset "Trailing garbage" begin
+    frame = compress(UInt8[1, 2, 3])
+    # 0xAA does not match any frame magic; whole stream must be rejected.
+    @test_throws Exception zstd_decompress(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD]))
+    @test_throws Exception zstd_decompress(vcat(frame, UInt8[0x00]))
+end
+
+# ------------------------------------------------------------------
+# Corrupt second frame in a multi-frame stream
+# ------------------------------------------------------------------
+@testset "Corrupt second frame in concatenation" begin
+    fa = compress(UInt8[1, 2, 3])
+    fb = compress(UInt8[4, 5, 6])
+    # Flip the magic of the second frame.
+    bad_magic = copy(fb); bad_magic[1] ⊻= 0xFF
+    @test_throws Exception zstd_decompress(vcat(fa, bad_magic))
+    # Truncate the second frame by two bytes.
+    @test_throws Exception zstd_decompress(vcat(fa, fb[1:end-2]))
+end
+
+# ------------------------------------------------------------------
+# Skippable magic nibble variants (RFC 8878 §3.1.2: 0x184D2A50–0x184D2A5F)
+# ------------------------------------------------------------------
+@testset "Skippable magic variants" begin
+    frame = compress(UInt8[99])
+    for nibble in UInt8[0x52, 0x57, 0x5A, 0x5F]
+        skip = vcat(UInt8[nibble, 0x2A, 0x4D, 0x18, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB])
+        @test zstd_decompress(vcat(skip, frame)) == UInt8[99]
+        @test read(ZstandardStream(IOBuffer(vcat(skip, frame)))) == UInt8[99]
+    end
+end
