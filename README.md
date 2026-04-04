@@ -1,4 +1,4 @@
-# Zstandard.jl
+# ZstdInflate.jl
 
 A pure Julia implementation of [Zstandard](https://facebook.github.io/zstd/) decompression, with both in-memory and streaming interfaces, as specified in [RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878).
 
@@ -8,7 +8,7 @@ A pure Julia implementation of [Zstandard](https://facebook.github.io/zstd/) dec
 
 ```julia
 using Pkg
-Pkg.add("Zstandard")
+Pkg.add("ZstdInflate")
 ```
 
 ## Usage
@@ -16,17 +16,17 @@ Pkg.add("Zstandard")
 ### In-memory decompression
 
 ```julia
-using Zstandard
+using ZstdInflate
 
-data = zstd_decompress(compressed::Vector{UInt8})  # decompress bytes
-data = zstd_decompress(filename::AbstractString)   # decompress a file
+data = inflate_zstd(compressed::Vector{UInt8})  # decompress bytes
+data = inflate_zstd(filename::AbstractString)   # decompress a file
 ```
 
 ### Streaming decompression
 
 ```julia
 open(filename) do io
-    stream = ZstandardStream(io)
+    stream = InflateZstdStream(io)
     data = read(stream)
 end
 ```
@@ -40,20 +40,20 @@ dict = ZstdDict(dict_data::Vector{UInt8})
 # or
 dict = parse_dictionary(dict_data::Vector{UInt8})
 
-data = zstd_decompress(compressed, dict=dict)
+data = inflate_zstd(compressed, dict=dict)
 ```
 
 ## Acknowledgements
 
 This package was inspired by [Inflate.jl](https://github.com/GunnarFarneback/Inflate.jl), a pure Julia Deflate/zlib/gzip decompressor, which served as a model for the package structure and approach.
 
-## Why choose Zstandard.jl over CodecZstd.jl
+## Why choose ZstdInflate.jl over CodecZstd.jl
 
 - Pure Julia — no binary dependencies, works anywhere Julia does.
 - Competitive performance for text and other compressible data.
 
-## Why choose CodecZstd.jl over Zstandard.jl
+## Why choose ZstdInflate.jl over Zstandard.jl
 
-- Need compression (Zstandard.jl is decompression only).
+- Need compression (ZstdInflate.jl is decompression only).
 - Want a TranscodingStreams-compatible interface.
 - Want a battle-tested C library backing.
