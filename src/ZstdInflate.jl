@@ -1422,7 +1422,8 @@ function _read_and_validate_dict_id(data::Vector{UInt8}, pos::Int, dict_id_size:
         frame_dict_id = (dict_id_size == 1) ? UInt32(data[pos]) :
                         (dict_id_size == 2) ? UInt32(_le16(data, pos)) :
                         _le32(data, pos)
-        frame_dict_id == dict.id || throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id, base = 16)), dict=0x$(string(dict.id, base = 16)))"))
+        frame_dict_id == dict.id ||
+            throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id, base = 16)), dict=0x$(string(dict.id, base = 16)))"))
     end
 
     pos += dict_id_size
