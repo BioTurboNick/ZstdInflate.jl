@@ -602,6 +602,22 @@ struct HuffmanTable
     #   bits [ 7: 0]  sym1     — first symbol (always valid)
     # nb_total == nb1 indicates a single-symbol entry; nb_total > nb1 is a two-symbol entry.
     decode_table::Vector{UInt32}
+    #
+    # FUTURE OPTIMISATION — narrower primary table for better L1 cache utilisation:
+    #
+    # With max_bits = 12 the table is 4096 × 4 = 16 KB, which fills a typical
+    # 16 KB L1-D cache on its own.  Any simultaneous pressure from stream data,
+    # the output buffer, or the literals buffer causes cache misses on every
+    # table lookup, and this is likely the dominant cost at 3× behind libzstd.
+    #
+    # libzstd addresses this with its X1/X2 split-table scheme:
+    #   • A narrow primary table (e.g., 10-bit, 4 KB) handles all codes whose
+    #     length ≤ the primary log.
+    #   • Codes longer than the primary log fall back to a secondary table
+    #     indexed by the remaining bits.  Long codes are rare so the branch is
+    #     almost never taken in practice.
+    # The primary table stays L1-resident throughout the hot decode loop, trading
+    # an occasional secondary lookup for far fewer cache misses overall.
 end
 
 # Build a dual-symbol Huffman decode table from a weight array.
@@ -1354,6 +1370,25 @@ end
 # Writes starting at wpos in out; returns the next write position.
 # When preallocated=true the caller has already resize!'d out to the exact frame size,
 # so the total scan and per-block resize! can be skipped entirely.
+#
+# FUTURE OPTIMISATION — fuse sequence decode and execute:
+#
+# Currently read_sequences! decodes all sequences into three Int arrays
+# (ll_vals, ml_vals, of_vals) and then execute_sequences! replays them.
+# This is two passes: the sequence data is written to and read back from
+# memory.  Fusing the FSE decode loop directly into the execute loop would
+# halve that memory traffic and allow the compiler to interleave FSE state
+# updates with literal copy and match copy, improving ILP.
+#
+# FUTURE OPTIMISATION — wildcopy for short non-overlapping matches:
+#
+# The non-overlapping match path (offset ≥ ml) calls Base.memcpy (a C FFI
+# call) for every match.  For short matches (≤ ~32 bytes), the ccall overhead
+# dominates the actual data movement cost.  Replacing short non-overlapping
+# match copies with _wildcopy16! (same pattern as literal scatter) would
+# eliminate that overhead.  Requires extending the +15 slack on `out` to cover
+# over-writes at the match destination, and capping wildcopy to matches that
+# cannot overlap (offset ≥ 16 would be sufficient for a 16-byte chunk size).
 function execute_sequences!(
         ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
         literals::Vector{UInt8}, state::DecompressState,
