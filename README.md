@@ -57,3 +57,7 @@ This package was inspired by [Inflate.jl](https://github.com/GunnarFarneback/Inf
 - Need compression (ZstdInflate.jl is decompression only).
 - Want a TranscodingStreams-compatible interface.
 - Want a battle-tested C library backing.
+
+# Performance Comparison
+
+TODO

@@ -537,73 +537,113 @@ end
 
 struct HuffmanTable
     max_bits::Int
-    # Packed decode table indexed by the top max_bits of the peeked code word.
-    # Each entry = (symbol << 8) | nb_bits  (UInt16).
-    decode_table::Vector{UInt16}
+    # Packed dual-symbol decode table indexed by the top max_bits of the peeked code word.
+    # Each UInt32 entry encodes up to two symbols:
+    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; max 24)
+    #   bits [23:16]  nb1      — bits consumed by sym1 alone (needed for single-symbol path)
+    #   bits [15: 8]  sym2     — second symbol (valid only when nb_total > nb1)
+    #   bits [ 7: 0]  sym1     — first symbol (always valid)
+    # nb_total == nb1 indicates a single-symbol entry; nb_total > nb1 is a two-symbol entry.
+    decode_table::Vector{UInt32}
 end
 
-# Build a Huffman decode table from a weight array.
+# Build a dual-symbol Huffman decode table from a weight array.
 # weights[i+1] = weight for symbol i (0 = absent; weight w ≥ 1 means code length
 # max_bits - w + 1, probability 2^(w-1)).
+# Each entry is a UInt32: (nb_total<<24)|(nb1<<16)|(sym2<<8)|sym1.
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
     max_bits ≤ HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
 
     table_size = 1 << max_bits
-    # Fill with a safe default (symbol 0, consuming max_bits) so that any
-    # unoccupied entries don't cause undefined behavior or infinite loops.
-    dtable     = fill(UInt16(max_bits), table_size)
+    # Pass 1: build a temporary single-symbol table (sym, nb1) to use as input
+    # for the dual-symbol pass below.
+    tmp = fill(UInt16(max_bits), table_size)  # (sym<<8)|nb1
 
-    # Rank-based direct table filling (matches reference zstd implementation).
-    # Weight w means code length = max_bits - w + 1, and each symbol with weight w
-    # occupies 2^(w-1) entries in the table.
-    # We compute starting table positions per weight by accumulating from highest
-    # weight (fewest entries per symbol but most symbols typically) downward.
-    rank_count = zeros(Int, max_bits + 1)
+    rank_count      = zeros(Int, max_bits + 1)
+    next_rank_start = zeros(Int, max_bits + 1)
     for sym in 0:nsyms-1
         w = Int(weights[sym+1])
         w > 0 && (rank_count[w] += 1)
     end
-
-    next_rank_start = zeros(Int, max_bits + 1)
     pos = 0
     for w in 1:max_bits
         next_rank_start[w] = pos
         pos += rank_count[w] * (1 << (w - 1))
     end
-
     for sym in 0:nsyms-1
         w = Int(weights[sym+1])
         w == 0 && continue
-        code_len    = max_bits - w + 1
+        nb1         = max_bits - w + 1
         num_entries = 1 << (w - 1)
-        entry       = UInt16((sym << 8) | code_len)
+        entry       = UInt16((sym << 8) | nb1)
         start       = next_rank_start[w]
         for j in 0:num_entries-1
-            dtable[start + j + 1] = entry
+            tmp[start + j + 1] = entry
         end
         next_rank_start[w] += num_entries
+    end
+
+    # Pass 2: upgrade each entry to dual-symbol where a second symbol fits.
+    dtable = Vector{UInt32}(undef, table_size)
+    for idx in 0:table_size-1
+        e1   = Int(tmp[idx + 1])
+        sym1 = (e1 >> 8) & 0xFF
+        nb1  = e1 & 0xFF
+        rem  = max_bits - nb1   # bits remaining after sym1
+        if rem > 0
+            # Peek the next rem bits (the bits that would follow sym1 in this slot).
+            idx2 = (idx << nb1) & (table_size - 1)
+            e2   = Int(tmp[idx2 + 1])
+            sym2 = (e2 >> 8) & 0xFF
+            nb2  = e2 & 0xFF
+            if nb2 ≤ rem
+                # Both symbols fit: dual-symbol entry.
+                dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
+                                  UInt32(sym2 << 8) | UInt32(sym1)
+                continue
+            end
+        end
+        # Single-symbol entry: nb_total = nb1, nb2 = 0.
+        dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
     end
 
     return HuffmanTable(max_bits, dtable)
 end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
-# Inlines bit consumption to avoid the n < 64 safety branch in consume_bits_r!.
+# Entry format: nb1 in bits [23:16], sym1 in bits [7:0].
 @inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable)
     idx      = Int(rb.bits >>> (64 - ht.max_bits))
     e        = @inbounds ht.decode_table[idx + 1]
-    nb       = Int(e & 0xFF)
-    rb.bits <<= nb
-    rb.nbits -= nb
-    return Int(e >> 8)
+    nb1      = Int((e >> 16) & 0xFF)
+    rb.bits <<= nb1
+    rb.nbits -= nb1
+    return Int(e & 0xFF)
 end
 
 # Decode one Huffman symbol from the reverse bit reader.
 @inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable)
     rb.nbits < ht.max_bits && _rbr_refill!(rb)
     _huffman_decode_nocheck!(rb, ht)
+end
+
+# Decode up to 2 Huffman symbols — caller must ensure nbits ≥ max_bits (no refill).
+# Writes sym1 and sym2 to out[pos] and out[pos+1] unconditionally (caller must
+# ensure out has one byte of slack past regen_size for the last-slot case).
+# Returns the number of symbols decoded (1 or 2).
+@inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable,
+                                           out::Vector{UInt8}, pos::Int)
+    idx       = Int(rb.bits >>> (64 - ht.max_bits))
+    e         = @inbounds ht.decode_table[idx + 1]
+    nb_total  = Int(e >> 24)
+    nb1       = Int((e >> 16) & 0xFF)
+    @inbounds out[pos]   = UInt8(e & 0xFF)        # sym1
+    @inbounds out[pos+1] = UInt8((e >> 8) & 0xFF) # sym2 (may be garbage if single-symbol)
+    rb.bits <<= nb_total
+    rb.nbits  -= nb_total
+    return nb_total > nb1 ? 2 : 1
 end
 
 
@@ -827,7 +867,7 @@ mutable struct DecompressState
     # Reusable literals buffer — holds decoded literals for the current block
     literals_buf   ::Vector{UInt8}
     # Reusable Huffman build scratch — pre-sized to maximum, never shrunk
-    huf_dtable     ::Vector{UInt16}
+    huf_dtable     ::Vector{UInt32}
     huf_rank_count ::Vector{Int}
     huf_rank_start ::Vector{Int}
     huf_weights    ::Vector{UInt8}
@@ -848,7 +888,7 @@ DecompressState() = DecompressState(
     INIT_REP, nothing, nothing, nothing, nothing, UInt8[],
     Int[], Int[], Int[],
     UInt8[],
-    Vector{UInt16}(undef, 1 << HUF_TABLELOG_MAX),
+    Vector{UInt32}(undef, 1 << HUF_TABLELOG_MAX),
     zeros(Int, HUF_TABLELOG_MAX + 1),
     zeros(Int, HUF_TABLELOG_MAX + 1),
     UInt8[],
@@ -862,7 +902,7 @@ function DecompressState(dict::ZstdDict)
         dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
         Int[], Int[], Int[],
         UInt8[],
-        Vector{UInt16}(undef, 1 << HUF_TABLELOG_MAX),
+        Vector{UInt32}(undef, 1 << HUF_TABLELOG_MAX),
         zeros(Int, HUF_TABLELOG_MAX + 1),
         zeros(Int, HUF_TABLELOG_MAX + 1),
         UInt8[],
@@ -886,6 +926,7 @@ end
 # Hot-path variant of build_huffman_table: reuses scratch buffers from DecompressState.
 # huf_dtable is pre-sized to 1 << HUF_TABLELOG_MAX; only the first table_size
 # entries are filled and accessed, so sharing the full buffer across calls is safe.
+# Builds a dual-symbol decode table: each entry is (nb_total<<24)|(nb1<<16)|(sym2<<8)|sym1.
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
@@ -896,7 +937,8 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
     rank_count      = state.huf_rank_count
     next_rank_start = state.huf_rank_start
 
-    fill!(view(dtable,          1:table_size), UInt16(max_bits))
+    # Pass 1: build single-symbol entries (nb_total=nb1, nb2=0).
+    # We reuse dtable as the temporary single-symbol store.
     fill!(view(rank_count,      1:max_bits+1), 0)
     fill!(view(next_rank_start, 1:max_bits+1), 0)
 
@@ -904,24 +946,43 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         w = Int(weights[sym+1])
         w > 0 && (rank_count[w] += 1)
     end
-
     pos = 0
     for w in 1:max_bits
         next_rank_start[w] = pos
         pos += rank_count[w] * (1 << (w - 1))
     end
-
     for sym in 0:nsyms-1
         w = Int(weights[sym+1])
         w == 0 && continue
-        code_len    = max_bits - w + 1
+        nb1         = max_bits - w + 1
         num_entries = 1 << (w - 1)
-        entry       = UInt16((sym << 8) | code_len)
-        start       = next_rank_start[w]
+        # Temporary single-symbol entry: nb_total=nb1, nb2=0, sym2=0
+        entry = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym)
+        start = next_rank_start[w]
         for j in 0:num_entries-1
             dtable[start + j + 1] = entry
         end
         next_rank_start[w] += num_entries
+    end
+
+    # Pass 2: upgrade single-symbol entries to dual-symbol where possible.
+    for idx in 0:table_size-1
+        e1       = dtable[idx + 1]
+        sym1     = Int(e1 & 0xFF)
+        nb1      = Int((e1 >> 16) & 0xFF)
+        rem      = max_bits - nb1
+        if rem > 0
+            idx2 = (idx << nb1) & (table_size - 1)
+            e2   = dtable[idx2 + 1]
+            nb2  = Int((e2 >> 16) & 0xFF)   # nb1 of the second symbol
+            if nb2 ≤ rem
+                sym2 = Int(e2 & 0xFF)
+                dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
+                                  UInt32(sym2 << 8) | UInt32(sym1)
+                continue
+            end
+        end
+        # Leave as single-symbol (already correct from pass 1).
     end
 
     return HuffmanTable(max_bits, dtable)
@@ -1084,7 +1145,10 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         end
 
         literals = state.literals_buf
-        resize!(literals, regen_size)
+        # One byte of slack past regen_size so that the unconditional two-symbol
+        # write in _huffman_decode2_nocheck! is always in-bounds; the extra byte
+        # is overwritten but never exposed (we resize back to regen_size after).
+        resize!(literals, regen_size + 1)
 
         if num_streams == 1
             stream_len = payload_end - huf_start + 1
@@ -1111,54 +1175,93 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             rb3 = ReverseBitReader(data, s3_start, j3)
             rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
 
-            # Stream 4 may be shorter: n4 = regen_size - 3*seg_n ≤ seg_n.
-            # Interleave all 4 streams for n4 iterations, then drain streams 1-3.
-            # Batch-refill every safe_n iterations: after one refill nbits ≥ 57,
-            # and each decode consumes ≤ max_bits, so safe_n = 57 ÷ max_bits
-            # symbols can be decoded without another refill check.
-            n4     = regen_size - 3 * seg_n
+            # Dual-symbol interleaved decode.
+            # safe_n lookups fit in one refill (≥ 57 bits loaded, ≤ max_bits per lookup).
+            # safeendX = endX - 2*safe_n: the last position from which a full batch of
+            # safe_n dual-symbol lookups is guaranteed safe.  Each lookup writes pos and
+            # pos+1 unconditionally; the guard ensures pos+1 ≤ endX - 1 < endX, so the
+            # write never crosses into an adjacent segment.
+            # Phase 1: all 4 streams together.
+            # Phase 2: fixed pairs (1,2) and (3,4).
+            # Phase 3: whichever stream in each pair still has capacity runs single-stream.
+            # Phase 4: finish any remaining symbols with single-symbol decode.
             safe_n = 57 ÷ ht.max_bits
+            o1 = 1; o2 = 1 + seg_n; o3 = 1 + 2seg_n; o4 = 1 + 3seg_n
+            end1 = seg_n; end2 = 2seg_n; end3 = 3seg_n; end4 = regen_size
+            safeend1 = end1 - 2safe_n; safeend2 = end2 - 2safe_n
+            safeend3 = end3 - 2safe_n; safeend4 = end4 - 2safe_n
 
-            # Phase 1: all 4 streams (n4 iterations)
-            i = 0
-            while i + safe_n ≤ n4
-                _rbr_refill!(rb1); _rbr_refill!(rb2)
-                _rbr_refill!(rb3); _rbr_refill!(rb4)
-                for j in 0:safe_n - 1
-                    @inbounds literals[1 + i + j]          = _huffman_decode_nocheck!(rb1, ht)
-                    @inbounds literals[1 + i + j +  seg_n] = _huffman_decode_nocheck!(rb2, ht)
-                    @inbounds literals[1 + i + j + 2seg_n] = _huffman_decode_nocheck!(rb3, ht)
-                    @inbounds literals[1 + i + j + 3seg_n] = _huffman_decode_nocheck!(rb4, ht)
+            while o1 ≤ safeend1 && o2 ≤ safeend2 &&
+                  o3 ≤ safeend3 && o4 ≤ safeend4
+                _rbr_refill!(rb1)
+                _rbr_refill!(rb2)
+                _rbr_refill!(rb3)
+                _rbr_refill!(rb4)
+                for _ in 1:safe_n
+                    o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+                    o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+                    o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+                    o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
                 end
-                i += safe_n
-            end
-            while i < n4   # remainder < safe_n
-                @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
-                @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
-                @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
-                @inbounds literals[1 + i + 3seg_n] = huffman_decode!(rb4, ht)
-                i += 1
             end
 
-            # Phase 2: streams 1-3 only (remaining seg_n - n4 iterations)
-            i = n4
-            while i + safe_n ≤ seg_n
-                _rbr_refill!(rb1); _rbr_refill!(rb2); _rbr_refill!(rb3)
-                for j in 0:safe_n - 1
-                    @inbounds literals[1 + i + j]          = _huffman_decode_nocheck!(rb1, ht)
-                    @inbounds literals[1 + i + j +  seg_n] = _huffman_decode_nocheck!(rb2, ht)
-                    @inbounds literals[1 + i + j + 2seg_n] = _huffman_decode_nocheck!(rb3, ht)
+            while o1 ≤ safeend1 && o2 ≤ safeend2
+                _rbr_refill!(rb1)
+                _rbr_refill!(rb2)
+                for _ in 1:safe_n
+                    o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+                    o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
                 end
-                i += safe_n
-            end
-            while i < seg_n   # remainder < safe_n
-                @inbounds literals[1 + i]          = huffman_decode!(rb1, ht)
-                @inbounds literals[1 + i +  seg_n] = huffman_decode!(rb2, ht)
-                @inbounds literals[1 + i + 2seg_n] = huffman_decode!(rb3, ht)
-                i += 1
             end
 
+            while o3 ≤ safeend3 && o4 ≤ safeend4
+                _rbr_refill!(rb3)
+                _rbr_refill!(rb4)
+                for _ in 1:safe_n
+                    o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+                    o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+                end
+            end
+
+            if o1 ≤ safeend1
+                while o1 ≤ safeend1
+                    _rbr_refill!(rb1)
+                    for _ in 1:safe_n
+                        o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+                    end
+                end
+            elseif o2 ≤ safeend2 # must check because possible to overshoot
+                while o2 ≤ safeend2
+                    _rbr_refill!(rb2)
+                    for _ in 1:safe_n
+                        o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+                    end
+                end
+            end
+
+            if o3 ≤ safeend3
+                while o3 ≤ safeend3
+                    _rbr_refill!(rb3)
+                    for _ in 1:safe_n
+                        o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+                    end
+                end
+            elseif o4 ≤ safeend4 # must check because possible to overshoot
+                while o4 ≤ safeend4
+                    _rbr_refill!(rb4)
+                    for _ in 1:safe_n
+                        o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+                    end
+                end
+            end
+
+            while o1 ≤ end1; @inbounds literals[o1] = huffman_decode!(rb1, ht); o1 += 1; end
+            while o2 ≤ end2; @inbounds literals[o2] = huffman_decode!(rb2, ht); o2 += 1; end
+            while o3 ≤ end3; @inbounds literals[o3] = huffman_decode!(rb3, ht); o3 += 1; end
+            while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
         end
+
+        resize!(literals, regen_size)  # drop the slack byte
 
         return literals, header_size + compressed_size
     end
