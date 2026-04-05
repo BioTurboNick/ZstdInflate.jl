@@ -1634,7 +1634,8 @@ function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict,
     return window_size, frame_content_size, content_checksum_flag, pos
 end
 
-function _decompress_frame(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing} = nothing)
+function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
+                            dict::Union{ZstdDict, Nothing} = nothing)
     # Magic number (4 bytes, little-endian)
     magic = _read_magic(data, pos)
     magic == ZSTD_MAGIC ||
@@ -1649,13 +1650,13 @@ function _decompress_frame(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, 
         throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
 
     state = dict !== nothing ? DecompressState(dict) : DecompressState()
-    out   = UInt8[]
-    # Prefer the exact FCS; fall back to length(data) when FCS is unknown
-    # (e.g. frames produced by the streaming API, which set fcs_flag=0).
-    # For incompressible data the compressed size ≈ decompressed size, so
-    # length(data) is an accurate hint.  For compressible data it
-    # under-allocates but those frames decode quickly anyway.
-    sizehint!(out, frame_content_size ≥ 0 ? frame_content_size : length(data))
+    frame_start = length(out)
+    # Pre-size the output when FCS is known.  For unknown FCS, rely on the
+    # caller to have issued a one-time sizehint! before the frame loop; adding
+    # any per-frame hint here causes compounding growth across multi-frame inputs.
+    if frame_content_size ≥ 0
+        sizehint!(out, frame_start + frame_content_size)
+    end
 
     # Decode blocks
     while true
@@ -1683,9 +1684,11 @@ function _decompress_frame(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, 
         last_block != 0 && break
     end
 
+    frame_len = length(out) - frame_start
+
     # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
-    frame_content_size < 0 || frame_content_size == length(out) ||
-        throw(ArgumentError("zstd: decompressed size $(length(out)) does not match frame content size $frame_content_size"))
+    frame_content_size < 0 || frame_content_size == frame_len ||
+        throw(ArgumentError("zstd: decompressed size $frame_len does not match frame content size $frame_content_size"))
 
     # Content checksum (optional 4 bytes)
     if content_checksum_flag
@@ -1693,12 +1696,12 @@ function _decompress_frame(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, 
             throw(ArgumentError("zstd: truncated content checksum"))
         stored = _le32(data, pos)
         pos += 4
-        computed = UInt32(xxhash64(out) & 0xFFFFFFFF)
+        computed = UInt32(xxhash64(@view(out[frame_start+1:end])) & 0xFFFFFFFF)
         stored == computed ||
             throw(ArgumentError("zstd: content checksum mismatch (stored=0x$(string(stored,base=16)), computed=0x$(string(computed,base=16)))"))
     end
 
-    return out, pos
+    return pos
 end
 
 # ============================================================
@@ -1729,13 +1732,16 @@ function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},No
     # of that gap on multi-frame inputs while keeping single-frame paths unchanged.
     pos = 1
     out = UInt8[]
+    # One-time hint: for incompressible data compressed ≈ raw size; for
+    # compressible data this underestimates but limits reallocation to O(1)
+    # doublings regardless of frame count.
+    sizehint!(out, length(data))
     while pos ≤ length(data)
         magic = _read_magic(data, pos)
         if _is_skippable(magic)
             pos = _skip_frame(data, pos)
         elseif magic == ZSTD_MAGIC
-            result, pos = _decompress_frame(data, pos, d)
-            append!(out, result)
+            pos = _decompress_frame!(data, pos, out, d)
         else
             throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
         end
