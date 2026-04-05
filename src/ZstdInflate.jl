@@ -1360,8 +1360,11 @@ function execute_sequences!(
             end
         else
             if offset ≥ ml
-                # Non-overlapping: single bulk copy
-                @inbounds copyto!(out, wpos, out, match_pos, ml)
+                # Non-overlapping: use memcpy rather than memmove.  unsafe_copyto! routes
+                # through memmove; Base.memcpy calls memcpy directly.  On glibc (Linux) this
+                # enables a faster non-overlapping SIMD path; on Windows/macOS the two
+                # functions share an implementation so there is no cost to the choice.
+                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
             elseif offset == 1
                 # Single-byte repeat: fill
                 @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
