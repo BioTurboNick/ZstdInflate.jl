@@ -67,6 +67,16 @@ end
 compress_zstd(data::Vector{UInt8}; level=3) =
     read(ZstdCompressorStream(IOBuffer(data), level=level))
 
+# Compress data as multiple concatenated frames of frame_size bytes each.
+function compress_zstd_multiframe(data::Vector{UInt8}; level=3, frame_size=100_000)
+    out = UInt8[]
+    for i in 1:frame_size:length(data)
+        chunk = view(data, i:min(i + frame_size - 1, length(data)))
+        append!(out, read(ZstdCompressorStream(IOBuffer(chunk), level=level)))
+    end
+    return out
+end
+
 # ----------------------------------------------------------------
 # Benchmark runner
 # ----------------------------------------------------------------
@@ -162,4 +172,26 @@ print_results(results, :in_memory)
 print_results(results, :streaming)
 print_markdown_table(results, :in_memory)
 print_markdown_table(results, :streaming)
+
+# ----------------------------------------------------------------
+# Multi-frame benchmark: large Huffman data split into 100-KB frames
+# ----------------------------------------------------------------
+println("\nMulti-frame decompression (large huffman, 100 × 100 KB frames):")
+println()
+Random.seed!(42)
+let data = huffman_compressible(10_000_000)
+    mf = compress_zstd_multiframe(data)
+    sf = compress_zstd(data)
+    @printf("  %-20s  %d frames, %d bytes compressed\n",
+            "multi-frame", div(length(data), 100_000), length(mf))
+    GC.gc()
+    t_ref_sf  = (@b transcode(ZstdDecompressor, $sf)  seconds=2).time
+    t_ref_mf  = (@b transcode(ZstdDecompressor, $mf)  seconds=2).time
+    t_ours_sf = (@b inflate_zstd($sf)                 seconds=2).time
+    t_ours_mf = (@b inflate_zstd($mf)                 seconds=2).time
+    @printf("  %-20s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
+            "single-frame",    t_ours_sf/t_ref_sf, t_ref_sf*1e6, t_ours_sf*1e6)
+    @printf("  %-20s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
+            "multi-frame",     t_ours_mf/t_ref_mf, t_ref_mf*1e6, t_ours_mf*1e6)
+end
 

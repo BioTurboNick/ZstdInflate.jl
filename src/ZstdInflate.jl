@@ -1721,6 +1721,12 @@ bytes (`Vector{UInt8}`).
 function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
     isempty(data) && throw(ArgumentError("zstd: empty input"))
     d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
+    # TODO: multi-frame parallelism opportunity.  Each zstd frame is fully
+    # independent; a pre-scan over frame headers (to collect frame count and
+    # decompressed sizes) would enable spawning one task per frame and writing
+    # results into a pre-allocated output buffer in parallel.  Benchmarks show
+    # our per-frame overhead is higher than libzstd's, so this could close some
+    # of that gap on multi-frame inputs while keeping single-frame paths unchanged.
     pos = 1
     out = UInt8[]
     while pos ≤ length(data)
