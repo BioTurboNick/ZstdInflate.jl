@@ -1147,14 +1147,14 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
 
         if lit_type == 0   # Raw
             literals = state.literals_buf
-            resize!(literals, regen_size)
+            resize!(literals, regen_size + 15)
             copyto!(literals, 1, data, pos + header_size, regen_size)
             return literals, header_size + regen_size
         else               # RLE
             byte_val = data[pos+header_size]
             literals = state.literals_buf
-            resize!(literals, regen_size)
-            fill!(literals, byte_val)
+            resize!(literals, regen_size + 15)
+            fill!(view(literals, 1:regen_size), byte_val)
             return literals, header_size + 1
         end
     else   # Compressed (2) or Treeless (3)
@@ -1203,10 +1203,9 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         end
 
         literals = state.literals_buf
-        # One byte of slack past regen_size so that the unconditional two-symbol
-        # write in _huffman_decode2_nocheck! is always in-bounds; the extra byte
-        # is overwritten but never exposed (we resize back to regen_size after).
-        resize!(literals, regen_size + 1)
+        # 16 bytes of slack: 1 for the dual-symbol decode unconditional write,
+        # plus 15 for wildcopy16 over-read from literals into out.
+        resize!(literals, regen_size + 16)
 
         if num_streams == 1
             stream_len = payload_end - huf_start + 1
@@ -1319,7 +1318,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
         end
 
-        resize!(literals, regen_size)  # drop the slack byte
+        resize!(literals, regen_size + 15)  # keep wildcopy16 over-read slack; trim dual-symbol slack
 
         return literals, header_size + compressed_size
     end
@@ -1329,6 +1328,27 @@ end
 # Section 8: Sequences section
 #   Reference: RFC 8878 §3.1.1.3.3
 # ============================================================
+
+# Copy n bytes from src to dst using 16-byte SIMD chunks.
+# Modelled on ZSTD_wildcopy in zstd/lib/common/zstd_internal.h: copies always
+# proceed in full 16-byte chunks, deliberately over-reading/over-writing by up
+# to 15 bytes into pre-allocated slack to avoid a branch on the tail.
+# Requires src to have ≥15 bytes of allocated slack past its valid content,
+# and dst to have ≥15 bytes of allocated slack past the write end.
+# Both src and dst must not overlap.
+@inline function _wildcopy16!(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::Int)
+    n == 0 && return
+    if n < 16
+        vstore(vload(Vec{16, UInt8}, src), dst)
+        return
+    end
+    k = 0
+    while k + 16 ≤ n
+        vstore(vload(Vec{16, UInt8}, src + k), dst + k)
+        k += 16
+    end
+    k < n && vstore(vload(Vec{16, UInt8}, src + n - 16), dst + n - 16)
+end
 
 # Execute decoded sequences to produce output bytes.
 # Writes starting at wpos in out; returns the next write position.
@@ -1343,11 +1363,13 @@ function execute_sequences!(
 
     if !preallocated
         # Pre-size output: every literal byte + every match byte will be written exactly once.
-        total = length(literals)
+        # literals has 15 bytes of slack; subtract them so total reflects actual content.
+        # Add 15 bytes of slack at the end for _wildcopy16! over-writes.
+        total = length(literals) - 15
         @inbounds for i in 1:n
             total += ml_vals[i]
         end
-        resize!(out, wpos - 1 + total)
+        resize!(out, wpos - 1 + total + 15)
     end
 
     lit_pos = 1
@@ -1359,7 +1381,7 @@ function execute_sequences!(
 
         # Copy ll literal bytes.  out and literals are distinct arrays so no overlap is possible.
         if ll > 0
-            GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, lit_pos), ll)
+            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), ll)
             wpos    += ll
             lit_pos += ll
         end
@@ -1442,10 +1464,11 @@ function execute_sequences!(
         end
     end
 
-    # Remaining literals after last sequence
-    rem = length(literals) - lit_pos + 1
+    # Remaining literals after last sequence.
+    # Use regen_size (stored in literals length - 15 slack) to get true count.
+    rem = length(literals) - 15 - lit_pos + 1
     if rem > 0
-        GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, lit_pos), rem)
+        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), rem)
         wpos += rem
     end
     return wpos
@@ -1469,12 +1492,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     end
 
     if num_seqs == 0
-        # No sequences: all literals
-        lit_len = length(literals)
+        # No sequences: all literals (literals has 15 bytes of slack)
+        lit_len = length(literals) - 15
         if !preallocated
-            resize!(out, wpos - 1 + lit_len)
+            resize!(out, wpos - 1 + lit_len + 15)
         end
-        GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, 1), lit_len)
+        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, 1), lit_len)
         return wpos + lit_len
     end
 
@@ -1622,11 +1645,12 @@ function decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int,
         if seq_pos ≤ limit
             return read_sequences!(data, seq_pos, limit, state, literals, out, wpos, preallocated)
         else
-            lit_len = length(literals)
+            # No sequences section: all literals (literals has 15 bytes of slack)
+            lit_len = length(literals) - 15
             if !preallocated
-                resize!(out, wpos - 1 + lit_len)
+                resize!(out, wpos - 1 + lit_len + 15)
             end
-            GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, 1), lit_len)
+            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, 1), lit_len)
             return wpos + lit_len
         end
     else
@@ -1784,7 +1808,7 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
     # caller's one-time sizehint! and fall back to per-block resize!.
     preallocated = frame_content_size ≥ 0
     if preallocated
-        resize!(out, frame_start + frame_content_size)
+        resize!(out, frame_start + frame_content_size + 15)
     end
     wpos = frame_start + 1
 
@@ -1813,6 +1837,9 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
 
         last_block != 0 && break
     end
+
+    # Trim slack bytes added for wildcopy16 over-writes
+    resize!(out, wpos - 1)
 
     frame_len = wpos - 1 - frame_start
 
