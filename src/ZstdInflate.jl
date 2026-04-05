@@ -882,7 +882,8 @@ mutable struct DecompressState
     fse_norm ::Vector{Int16}
 end
 
-const _FSE_MAX_TABLE = 512  # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
+const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
+const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
 DecompressState() = DecompressState(
     INIT_REP, nothing, nothing, nothing, nothing, UInt8[],
@@ -1273,21 +1274,24 @@ end
 # ============================================================
 
 # Execute decoded sequences to produce output bytes.
-# Appends to out.
+# Writes starting at wpos in out; returns the next write position.
+# When preallocated=true the caller has already resize!'d out to the exact frame size,
+# so the total scan and per-block resize! can be skipped entirely.
 function execute_sequences!(
         ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
-        literals::Vector{UInt8}, state::DecompressState, out::Vector{UInt8})
+        literals::Vector{UInt8}, state::DecompressState,
+        out::Vector{UInt8}, wpos::Int, preallocated::Bool)
 
     n = length(ll_vals)
 
-    # Pre-size output: every literal byte + every match byte will be written exactly once.
-    total = length(literals)
-    @inbounds for i in 1:n
-        total += ml_vals[i]
+    if !preallocated
+        # Pre-size output: every literal byte + every match byte will be written exactly once.
+        total = length(literals)
+        @inbounds for i in 1:n
+            total += ml_vals[i]
+        end
+        resize!(out, wpos - 1 + total)
     end
-    base = length(out)
-    resize!(out, base + total)
-    wpos = base + 1   # next write index; logical length of out = wpos - 1
 
     lit_pos = 1
 
@@ -1296,9 +1300,9 @@ function execute_sequences!(
         ml = ml_vals[i]
         of = of_vals[i]
 
-        # Copy ll literal bytes
+        # Copy ll literal bytes.  out and literals are distinct arrays so no overlap is possible.
         if ll > 0
-            copyto!(out, wpos, literals, lit_pos, ll)
+            GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, lit_pos), ll)
             wpos    += ll
             lit_pos += ll
         end
@@ -1360,10 +1364,7 @@ function execute_sequences!(
             end
         else
             if offset ≥ ml
-                # Non-overlapping: use memcpy rather than memmove.  unsafe_copyto! routes
-                # through memmove; Base.memcpy calls memcpy directly.  On glibc (Linux) this
-                # enables a faster non-overlapping SIMD path; on Windows/macOS the two
-                # functions share an implementation so there is no cost to the choice.
+                # Non-overlapping match.
                 GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
             elseif offset == 1
                 # Single-byte repeat: fill
@@ -1371,12 +1372,12 @@ function execute_sequences!(
             else
                 # Overlapping repeat pattern: copy base pattern once, then
                 # keep doubling by copying already-written output.  Each
-                # copyto! is non-overlapping (filled bytes precede dest).
-                @inbounds copyto!(out, wpos, out, match_pos, offset)
+                # memcpy is non-overlapping (filled bytes precede dest).
+                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), offset)
                 filled = offset
-                @inbounds while filled < ml
+                while filled < ml
                     to_copy = min(filled, ml - filled)
-                    copyto!(out, wpos + filled, out, wpos, to_copy)
+                    GC.@preserve out Base.memcpy(pointer(out, wpos + filled), pointer(out, wpos), to_copy)
                     filled += to_copy
                 end
             end
@@ -1387,8 +1388,10 @@ function execute_sequences!(
     # Remaining literals after last sequence
     rem = length(literals) - lit_pos + 1
     if rem > 0
-        copyto!(out, wpos, literals, lit_pos, rem)
+        GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, lit_pos), rem)
+        wpos += rem
     end
+    return wpos
 end
 
 # Read and decode the sequences section.
@@ -1396,7 +1399,7 @@ end
 # Appends decompressed bytes to out.
 function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
                          state::DecompressState, literals::Vector{UInt8},
-                         out::Vector{UInt8})
+                         out::Vector{UInt8}, wpos::Int, preallocated::Bool)
     # Read sequence count (RFC 8878 §3.1.1.3.3.1)
     b0 = Int(data[pos]);  pos += 1
     local num_seqs::Int
@@ -1410,8 +1413,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
     if num_seqs == 0
         # No sequences: all literals
-        append!(out, literals)
-        return
+        lit_len = length(literals)
+        if !preallocated
+            resize!(out, wpos - 1 + lit_len)
+        end
+        GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, 1), lit_len)
+        return wpos + lit_len
     end
 
     # Symbol Compression Modes byte (RFC 8878 §3.1.1.3.3.2)
@@ -1478,7 +1485,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         end
     end
 
-    execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out)
+    return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated)
 end
 
 # ============================================================
@@ -1487,23 +1494,36 @@ end
 # ============================================================
 
 function decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int,
-                           block_type::Int, state::DecompressState, out::Vector{UInt8})
+                           block_type::Int, state::DecompressState,
+                           out::Vector{UInt8}, wpos::Int, preallocated::Bool)
     if block_type == 0   # Raw block
-        append!(out, @view data[pos : pos+block_size-1])
+        pos + block_size - 1 ≤ length(data) ||
+            throw(ArgumentError("zstd: truncated raw block"))
+        if !preallocated
+            resize!(out, wpos - 1 + block_size)
+        end
+        GC.@preserve out data Base.memcpy(pointer(out, wpos), pointer(data, pos), block_size)
+        return wpos + block_size
     elseif block_type == 1   # RLE block
         # block_size == regen_size; compressed payload is always 1 byte
-        byte_val = data[pos]
-        n = length(out)
-        resize!(out, n + block_size)
-        fill!(@view(out[n+1:end]), byte_val)
+        if !preallocated
+            resize!(out, wpos - 1 + block_size)
+        end
+        fill!(view(out, wpos:wpos+block_size-1), data[pos])
+        return wpos + block_size
     elseif block_type == 2   # Compressed block
         limit = pos + block_size - 1
         literals, lit_consumed = read_literals(data, pos, state)
         seq_pos = pos + lit_consumed
         if seq_pos ≤ limit
-            read_sequences!(data, seq_pos, limit, state, literals, out)
+            return read_sequences!(data, seq_pos, limit, state, literals, out, wpos, preallocated)
         else
-            append!(out, literals)
+            lit_len = length(literals)
+            if !preallocated
+                resize!(out, wpos - 1 + lit_len)
+            end
+            GC.@preserve out literals Base.memcpy(pointer(out, wpos), pointer(literals, 1), lit_len)
+            return wpos + lit_len
         end
     else
         throw(ArgumentError("zstd: reserved block type 3"))
@@ -1654,12 +1674,15 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
 
     state = dict !== nothing ? DecompressState(dict) : DecompressState()
     frame_start = length(out)
-    # Pre-size the output when FCS is known.  For unknown FCS, rely on the
-    # caller to have issued a one-time sizehint! before the frame loop; adding
-    # any per-frame hint here causes compounding growth across multi-frame inputs.
-    if frame_content_size ≥ 0
-        sizehint!(out, frame_start + frame_content_size)
+    # When FCS is known, resize to the exact frame size upfront so that all
+    # per-block writes go directly into pre-allocated space — no per-block
+    # resize! or ml_vals total scan needed.  When FCS is unknown, rely on the
+    # caller's one-time sizehint! and fall back to per-block resize!.
+    preallocated = frame_content_size ≥ 0
+    if preallocated
+        resize!(out, frame_start + frame_content_size)
     end
+    wpos = frame_start + 1
 
     # Decode blocks
     while true
@@ -1673,21 +1696,21 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
         block_type  = (bh1 >> 1) & 0x03
         # block_size for compressed/raw/RLE: 21-bit field in remaining 21 bits
         block_size  = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
-        block_size ≤ 131072 ||
+        block_size ≤ ZSTD_BLOCKSIZE_MAX ||
             throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
 
         if block_type == 1   # RLE: 1 compressed byte; block_size = regen size
-            decompress_block!(data, pos, block_size, block_type, state, out)
+            wpos = decompress_block!(data, pos, block_size, block_type, state, out, wpos, preallocated)
             pos += 1
         else
-            decompress_block!(data, pos, block_size, block_type, state, out)
+            wpos = decompress_block!(data, pos, block_size, block_type, state, out, wpos, preallocated)
             pos += block_size
         end
 
         last_block != 0 && break
     end
 
-    frame_len = length(out) - frame_start
+    frame_len = wpos - 1 - frame_start
 
     # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
     frame_content_size < 0 || frame_content_size == frame_len ||
