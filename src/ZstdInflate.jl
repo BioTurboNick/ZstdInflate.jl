@@ -290,6 +290,32 @@ function _rbr_refill!(rb::ReverseBitReader)
     rb.bits  = a | b
     rb.nbits = n0 + 8k
     rb.pos   = pos - k
+
+    # FUTURE OPTIMISATION — "consumed counter" model (zstd reference style):
+    #
+    # The fundamental limit of the current design is that loading bytes one at
+    # a time with 8-bit granularity guarantees only 57 bits minimum after each
+    # refill (when n0 = 49, one byte brings nbits to 57).  This caps safe_n at
+    # floor(57 / max_bits) = 4 for max_bits = 12 — one refill every 4
+    # dual-symbol Huffman decodes.
+    #
+    # Switching to a "bits_consumed" counter would make refills O(1):
+    #
+    #   ptr          -= bits_consumed >> 3   # skip fully-consumed bytes
+    #   bitContainer  = ltoh(unsafe_load(Ptr{UInt64}(pointer(data, ptr - 7))))
+    #   bits_consumed &= 7                   # keep the partial-byte remainder
+    #
+    # Since bits_consumed & 7 is typically 0 for byte-aligned codes (and rarely
+    # exceeds a few bits for short Huffman codes), refills routinely restore
+    # 60–64 valid bits rather than the current worst-case 57.  That would raise
+    # safe_n from 4 to 5 for max_bits = 12 (20 % fewer refills) and replace the
+    # current k-iteration byte loop with a single unaligned 8-byte load.
+    #
+    # The change requires updating ReverseBitReader (add bits_consumed field,
+    # remove nbits), and adjusting every consumer:
+    #   _huffman_decode_nocheck! / _huffman_decode2_nocheck! :
+    #     idx = (rb.bits << rb.bits_consumed) >>> (64 - ht.max_bits)
+    #   read_bits_r!, peek_bits_r!, consume_bits_r!, fse_update!, etc.
 end
 
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
