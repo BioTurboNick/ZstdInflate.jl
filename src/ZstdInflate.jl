@@ -596,7 +596,7 @@ struct HuffmanTable
     max_bits::Int
     # Packed dual-symbol decode table indexed by the top max_bits of the peeked code word.
     # Each UInt32 entry encodes up to two symbols:
-    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; max 24)
+    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; ≤ max_bits)
     #   bits [23:16]  nb1      — bits consumed by sym1 alone (needed for single-symbol path)
     #   bits [15: 8]  sym2     — second symbol (valid only when nb_total > nb1)
     #   bits [ 7: 0]  sym1     — first symbol (always valid)
@@ -606,18 +606,13 @@ struct HuffmanTable
     # FUTURE OPTIMISATION — narrower primary table for better L1 cache utilisation:
     #
     # With max_bits = 12 the table is 4096 × 4 = 16 KB, which fills a typical
-    # 16 KB L1-D cache on its own.  Any simultaneous pressure from stream data,
-    # the output buffer, or the literals buffer causes cache misses on every
-    # table lookup, and this is likely the dominant cost at 3× behind libzstd.
-    #
-    # libzstd addresses this with its X1/X2 split-table scheme:
-    #   • A narrow primary table (e.g., 10-bit, 4 KB) handles all codes whose
-    #     length ≤ the primary log.
-    #   • Codes longer than the primary log fall back to a secondary table
-    #     indexed by the remaining bits.  Long codes are rare so the branch is
-    #     almost never taken in practice.
-    # The primary table stays L1-resident throughout the hot decode loop, trading
-    # an occasional secondary lookup for far fewer cache misses overall.
+    # 16 KB L1-D cache on its own.  libzstd addresses this with its X1/X2 split-table
+    # scheme: a narrow primary table (e.g., 11-bit, 8 KB) handles all codes whose
+    # length ≤ the primary log, while longer codes fall through to the full table.
+    # In practice, libzstd's encoder caps at HUF_TABLELOG_DEFAULT = 11, so max_bits = 12
+    # is never observed in real streams and this optimisation has not been implemented.
+    # A @warn in build_huffman_table will fire if max_bits = 12 is ever encountered,
+    # which would be the trigger to implement the split-table path.
 end
 
 # Build a dual-symbol Huffman decode table from a weight array.
@@ -658,7 +653,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         next_rank_start[w] += num_entries
     end
 
-    # Pass 2: upgrade each entry to dual-symbol where a second symbol fits.
+    # Pass 2: build the full max_bits-wide dual-symbol decode table.
     dtable = Vector{UInt32}(undef, table_size)
     for idx in 0:table_size-1
         e1   = Int(tmp[idx + 1])
@@ -666,27 +661,24 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         nb1  = e1 & 0xFF
         rem  = max_bits - nb1   # bits remaining after sym1
         if rem > 0
-            # Peek the next rem bits (the bits that would follow sym1 in this slot).
             idx2 = (idx << nb1) & (table_size - 1)
             e2   = Int(tmp[idx2 + 1])
             sym2 = (e2 >> 8) & 0xFF
             nb2  = e2 & 0xFF
             if nb2 ≤ rem
-                # Both symbols fit: dual-symbol entry.
                 dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
                                   UInt32(sym2 << 8) | UInt32(sym1)
                 continue
             end
         end
-        # Single-symbol entry: nb_total = nb1, nb2 = 0.
         dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
     end
 
+    max_bits == HUF_TABLELOG_MAX && @warn "zstd: Huffman table with max_bits=$max_bits encountered; see FUTURE OPTIMISATION note in HuffmanTable."
     return HuffmanTable(max_bits, dtable)
 end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
-# Entry format: nb1 in bits [23:16], sym1 in bits [7:0].
 @inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable)
     idx      = Int(rb.bits >>> (64 - ht.max_bits))
     e        = @inbounds ht.decode_table[idx + 1]
@@ -708,12 +700,12 @@ end
 # Returns the number of symbols decoded (1 or 2).
 @inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable,
                                            out::Vector{UInt8}, pos::Int)
-    idx       = Int(rb.bits >>> (64 - ht.max_bits))
-    e         = @inbounds ht.decode_table[idx + 1]
-    nb_total  = Int(e >> 24)
-    nb1       = Int((e >> 16) & 0xFF)
-    @inbounds out[pos]   = UInt8(e & 0xFF)        # sym1
-    @inbounds out[pos+1] = UInt8((e >> 8) & 0xFF) # sym2 (may be garbage if single-symbol)
+    idx      = Int(rb.bits >>> (64 - ht.max_bits))
+    e        = @inbounds ht.decode_table[idx + 1]
+    nb_total = Int(e >> 24)
+    nb1      = Int((e >> 16) & 0xFF)
+    @inbounds out[pos]   = UInt8(e & 0xFF)
+    @inbounds out[pos+1] = UInt8((e >> 8) & 0xFF)
     rb.bits <<= nb_total
     rb.nbits  -= nb_total
     return nb_total > nb1 ? 2 : 1
@@ -940,7 +932,7 @@ mutable struct DecompressState
     # Reusable literals buffer — holds decoded literals for the current block
     literals_buf   ::Vector{UInt8}
     # Reusable Huffman build scratch — pre-sized to maximum, never shrunk
-    huf_dtable     ::Vector{UInt32}
+    huf_dtable     ::Vector{UInt32}  # full 2^max_bits decode table
     huf_rank_count ::Vector{Int}
     huf_rank_start ::Vector{Int}
     huf_weights    ::Vector{UInt8}
@@ -998,9 +990,10 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
 end
 
 # Hot-path variant of build_huffman_table: reuses scratch buffers from DecompressState.
-# huf_dtable is pre-sized to 1 << HUF_TABLELOG_MAX; only the first table_size
-# entries are filled and accessed, so sharing the full buffer across calls is safe.
-# Builds a dual-symbol decode table: each entry is (nb_total<<24)|(nb1<<16)|(sym2<<8)|sym1.
+# huf_dtable is pre-sized to 1 << HUF_TABLELOG_MAX and used as the full overflow table.
+# huf_primary_table is pre-sized to 1 << HUF_PRIMARY_BITS and used as the hot-path table.
+# Both buffers are shared across blocks (safe because literals are decoded before the
+# next block's table is built, so the current HuffmanTable is not live during a rebuild).
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
@@ -1011,8 +1004,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
     rank_count      = state.huf_rank_count
     next_rank_start = state.huf_rank_start
 
-    # Pass 1: build single-symbol entries (nb_total=nb1, nb2=0).
-    # We reuse dtable as the temporary single-symbol store.
+    # Pass 1: fill dtable with single-symbol entries (nb_total=nb1, nb2=0, sym2=0).
     fill!(view(rank_count,      1:max_bits+1), 0)
     fill!(view(next_rank_start, 1:max_bits+1), 0)
 
@@ -1030,7 +1022,6 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         w == 0 && continue
         nb1         = max_bits - w + 1
         num_entries = 1 << (w - 1)
-        # Temporary single-symbol entry: nb_total=nb1, nb2=0, sym2=0
         entry = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym)
         start = next_rank_start[w]
         for j in 0:num_entries-1
@@ -1039,7 +1030,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         next_rank_start[w] += num_entries
     end
 
-    # Pass 2: upgrade single-symbol entries to dual-symbol where possible.
+    # Pass 2: upgrade dtable entries to dual-symbol where a second symbol fits.
     for idx in 0:table_size-1
         e1       = dtable[idx + 1]
         sym1     = Int(e1 & 0xFF)
@@ -1048,7 +1039,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         if rem > 0
             idx2 = (idx << nb1) & (table_size - 1)
             e2   = dtable[idx2 + 1]
-            nb2  = Int((e2 >> 16) & 0xFF)   # nb1 of the second symbol
+            nb2  = Int((e2 >> 16) & 0xFF)
             if nb2 ≤ rem
                 sym2 = Int(e2 & 0xFF)
                 dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
@@ -1059,6 +1050,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         # Leave as single-symbol (already correct from pass 1).
     end
 
+    max_bits == HUF_TABLELOG_MAX && @warn "zstd: Huffman table with max_bits=$max_bits encountered; see FUTURE OPTIMISATION note in HuffmanTable."
     return HuffmanTable(max_bits, dtable)
 end
 
