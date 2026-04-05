@@ -261,12 +261,35 @@ function ReverseBitReader(data::Vector{UInt8}, byte_offset::Int, byte_len::Int)
 end
 
 function _rbr_refill!(rb::ReverseBitReader)
-    while rb.nbits ≤ 56 && rb.pos ≥ rb.start
-        # Each byte goes into the region just below the currently loaded bits
-        rb.bits  |= UInt64(rb.data[rb.pos]) << (56 - rb.nbits)
-        rb.nbits += 8
-        rb.pos   -= 1
+    n0 = rb.nbits
+    n0 > 56 && return
+    pos   = rb.pos
+    avail = pos - rb.start + 1
+    avail == 0 && return
+
+    # Number of bytes needed to raise nbits above 56.
+    k = min(((57 - n0) + 7) >> 3, avail)
+
+    # Precompute base shift from n0 so that all per-byte shifts are
+    # independent of each other (no serial nbits-update dependency).
+    # Two accumulators let the CPU pipeline odd- and even-indexed loads.
+    s = 56 - n0   # shift for byte 0; byte j uses s - 8j (always ≥ 0 for j < k)
+    a = rb.bits
+    b = UInt64(0)
+    @inbounds begin
+        k ≥ 1 && (a |= UInt64(rb.data[pos    ]) << s      )
+        k ≥ 2 && (b |= UInt64(rb.data[pos - 1]) << (s -  8))
+        k ≥ 3 && (a |= UInt64(rb.data[pos - 2]) << (s - 16))
+        k ≥ 4 && (b |= UInt64(rb.data[pos - 3]) << (s - 24))
+        k ≥ 5 && (a |= UInt64(rb.data[pos - 4]) << (s - 32))
+        k ≥ 6 && (b |= UInt64(rb.data[pos - 5]) << (s - 40))
+        k ≥ 7 && (a |= UInt64(rb.data[pos - 6]) << (s - 48))
+        k ≥ 8 && (b |= UInt64(rb.data[pos - 7]) << (s - 56))
     end
+
+    rb.bits  = a | b
+    rb.nbits = n0 + 8k
+    rb.pos   = pos - k
 end
 
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
