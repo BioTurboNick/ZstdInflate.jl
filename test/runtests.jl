@@ -80,6 +80,17 @@ end
     pattern = UInt8[1, 2, 3, 4, 5, 6, 7, 8]
     data = repeat(pattern, 10_000)
     @test inflate_zstd(compress(data)) == data
+    # Varied short runs of random bytes — exercises RLE FSE mode for sequences
+    # (the compressor tends to use RLE LL/ML/OF tables when run structure is uniform).
+    Random.seed!(7)
+    let x = UInt8[]
+        sizehint!(x, 100_000)
+        while length(x) < 100_000
+            m = min(rand(1:64), 100_000 - length(x))
+            append!(x, fill(rand(UInt8), m))
+        end
+        @test inflate_zstd(compress(x)) == x
+    end
 end
 
 # ------------------------------------------------------------------

@@ -498,6 +498,14 @@ end
 
 @inline fse_update!(rb::ReverseBitReader, t::RLEFSETable, state::Int) = 0
 
+# Helpers for the batched sequence reader: retrieve the transition width and
+# baseline for the current state without consuming any bits.
+@inline _fse_nb_bits(t::FSETable,    state::Int) = Int(@inbounds t.nb_bits[state + 1])
+@inline _fse_nb_bits(t::RLEFSETable, state::Int) = 0
+
+@inline _fse_baseline(t::FSETable,    state::Int) = Int(@inbounds t.baselines[state + 1])
+@inline _fse_baseline(t::RLEFSETable, state::Int) = 0
+
 # Update without checking for underflow (allows overflow detection after).
 @inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSETable, state::Int)
     nb   = Int(t.nb_bits[state+1])
@@ -1465,23 +1473,70 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         ml_code = fse_peek(ml_tab, ml_state)
         of_code = fse_peek(of_tab, of_state)
 
-        # 2. Read extra bits: order is OF, ML, LL (RFC 8878 §3.1.1.3.3.4)
-        of_extra   = (of_code > 0) ? Int(read_bits_r!(rb, of_code)) : 0
-        of_val64   = (Int64(1) << of_code) + of_extra   # raw Offset_Value (1..2^31)
+        # 2+3 batched: precompute all six bit widths, then extract all from
+        # the same frozen bit word.  This breaks the 6-deep serial dependency
+        # chain (each read_bits_r! currently gates the next via rb.bits).
+        #
+        # All widths are known before any bit is consumed, so the CPU can
+        # issue the six extractions and the cumulative-offset additions in
+        # parallel once the single refill is done.
+        of_n  = of_code
+        ml_n  = Int(@inbounds ML_EXTRA_BITS[ml_code + 1])
+        ll_n  = Int(@inbounds LL_EXTRA_BITS[ll_code + 1])
+
+        # State-transition widths (skip on last sequence — states not used again)
+        update = i < num_seqs
+        ll_nb = update ? _fse_nb_bits(ll_tab, ll_state) : 0
+        ml_nb = update ? _fse_nb_bits(ml_tab, ml_state) : 0
+        of_nb = update ? _fse_nb_bits(of_tab, of_state) : 0
+
+        total_n = of_n + ml_n + ll_n + ll_nb + ml_nb + of_nb
+
+        if total_n ≤ 57
+            # Fast path: a single refill guarantees ≥ 57 bits available.
+            rb.nbits < total_n && _rbr_refill!(rb)
+            rb.nbits ≥ total_n || throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
+
+            # Cumulative bit offsets into the frozen snapshot
+            c_ml  = of_n
+            c_ll  = c_ml + ml_n
+            c_llb = c_ll + ll_n
+            c_mlb = c_llb + ll_nb
+            c_ofb = c_mlb + ml_nb
+
+            # All six extractions read from `bits` independently — ILP-friendly.
+            bits     = rb.bits
+            of_extra = (of_n  > 0) ? Int(bits              >>> (64 - of_n )) : 0
+            ml_extra = (ml_n  > 0) ? Int((bits << c_ml)    >>> (64 - ml_n )) : 0
+            ll_extra = (ll_n  > 0) ? Int((bits << c_ll)    >>> (64 - ll_n )) : 0
+            ll_bits  = (ll_nb > 0) ? Int((bits << c_llb)   >>> (64 - ll_nb)) : 0
+            ml_bits  = (ml_nb > 0) ? Int((bits << c_mlb)   >>> (64 - ml_nb)) : 0
+            of_bits  = (of_nb > 0) ? Int((bits << c_ofb)   >>> (64 - of_nb)) : 0
+
+            # Single bulk consume
+            rb.bits   = bits << total_n
+            rb.nbits -= total_n
+
+        else
+            # Slow path: large offset (of_code > ~20); sequential reads.
+            of_extra   = (of_n  > 0) ? Int(read_bits_r!(rb, of_n )) : 0
+            ml_extra   = Int(read_bits_r!(rb, ml_n))
+            ll_extra   = Int(read_bits_r!(rb, ll_n))
+            ll_bits    = (ll_nb > 0) ? Int(read_bits_r!(rb, ll_nb)) : 0
+            ml_bits    = (ml_nb > 0) ? Int(read_bits_r!(rb, ml_nb)) : 0
+            of_bits    = (of_nb > 0) ? Int(read_bits_r!(rb, of_nb)) : 0
+        end
+
+        of_val64 = (Int64(1) << of_code) + of_extra
         of_val64 ≤ typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
         of_vals[i] = Int(of_val64)
+        ml_vals[i] = Int(@inbounds ML_BASE[ml_code + 1]) + ml_extra
+        ll_vals[i] = Int(@inbounds LL_BASE[ll_code + 1]) + ll_extra
 
-        ml_extra = Int(read_bits_r!(rb, Int(ML_EXTRA_BITS[ml_code+1])))
-        ml_vals[i] = Int(ML_BASE[ml_code+1]) + ml_extra
-
-        ll_extra = Int(read_bits_r!(rb, Int(LL_EXTRA_BITS[ll_code+1])))
-        ll_vals[i] = Int(LL_BASE[ll_code+1]) + ll_extra
-
-        # 3. Update states: order is LL, ML, OF (RFC 8878 §3.1.1.3.3.4)
-        if i < num_seqs
-            ll_state = fse_update!(rb, ll_tab, ll_state)
-            ml_state = fse_update!(rb, ml_tab, ml_state)
-            of_state = fse_update!(rb, of_tab, of_state)
+        if update
+            ll_state = _fse_baseline(ll_tab, ll_state) + ll_bits
+            ml_state = _fse_baseline(ml_tab, ml_state) + ml_bits
+            of_state = _fse_baseline(of_tab, of_state) + of_bits
         end
     end
 
