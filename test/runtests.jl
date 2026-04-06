@@ -448,3 +448,55 @@ end
     @test length(fcs_frames) == 1
     @test fcs_frames[1].fcs == -1
 end
+
+# ------------------------------------------------------------------
+# Parallel decompression (inflate_zstd nthreads kwarg)
+# ------------------------------------------------------------------
+@testset "Parallel decompression" begin
+    # Shared test data: two frames with different content
+    frame_a = compress(UInt8[1, 2, 3])
+    frame_b = compress(collect(UInt8, 4:20))  # different size from frame_a
+    frame_c = compress(UInt8[21, 22])
+    two_frames   = vcat(frame_a, frame_b)
+    three_frames = vcat(frame_a, frame_b, frame_c)
+    expected_two   = vcat(UInt8[1, 2, 3], collect(UInt8, 4:20))
+    expected_three = vcat(expected_two, UInt8[21, 22])
+
+    # AC1.1: parallel output byte-for-byte identical to serial
+    @test inflate_zstd(two_frames; nthreads=2) == inflate_zstd(two_frames; nthreads=1)
+    @test inflate_zstd(two_frames; nthreads=4) == inflate_zstd(two_frames; nthreads=1)
+
+    # AC1.2: frames of different sizes
+    @test inflate_zstd(two_frames; nthreads=2) == expected_two
+
+    # AC1.3: nthreads > number of frames (excess threads idle gracefully)
+    @test inflate_zstd(two_frames; nthreads=100) == expected_two
+
+    # AC2.1: nthreads=1 with multi-frame → serial path, correct result
+    @test inflate_zstd(three_frames; nthreads=1) == expected_three
+
+    # AC2.2: single-frame + nthreads=4 → serial fast-path, correct result
+    @test inflate_zstd(frame_a; nthreads=4) == UInt8[1, 2, 3]
+
+    # AC2.3: empty frame concatenated with non-empty → correct in parallel mode
+    empty_frame = compress(UInt8[])
+    @test inflate_zstd(vcat(empty_frame, frame_b); nthreads=2) == collect(UInt8, 4:20)
+
+    # AC5.1: FCS-absent frames decompress correctly in parallel mode
+    fcs_absent_a = compress_no_fcs(UInt8[1, 2, 3])
+    fcs_absent_b = compress_no_fcs(collect(UInt8, 4:20))
+    fcs_absent_both = vcat(fcs_absent_a, fcs_absent_b)
+    @test inflate_zstd(fcs_absent_both; nthreads=2) == expected_two
+
+    # AC6.1: skippable frames interleaved with zstd frames → parallel output matches serial
+    skip = UInt8[0x50, 0x2A, 0x4D, 0x18, 0x01, 0x00, 0x00, 0x00, 0xFF]
+    interleaved = vcat(skip, frame_a, skip, frame_b, skip)
+    @test inflate_zstd(interleaved; nthreads=2) == inflate_zstd(interleaved; nthreads=1)
+    @test inflate_zstd(interleaved; nthreads=2) == expected_two
+
+    # AC7.1: nthreads=0 throws ArgumentError
+    @test_throws ArgumentError inflate_zstd(two_frames; nthreads=0)
+
+    # AC7.2: nthreads=-1 throws ArgumentError
+    @test_throws ArgumentError inflate_zstd(two_frames; nthreads=-1)
+end
