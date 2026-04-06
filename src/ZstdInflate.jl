@@ -1917,29 +1917,60 @@ end
 @inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == 0x184D2A50
 
 """
-    inflate_zstd(data::Vector{UInt8}; dict=nothing) -> Vector{UInt8}
+    inflate_zstd(data::Vector{UInt8}; dict=nothing, nthreads=Threads.nthreads()) -> Vector{UInt8}
 
 Decompress one or more concatenated Zstandard frames from `data` and return
 the raw bytes.  Skippable frames (RFC 8878 §3.1.2) are silently ignored.
+
+When `nthreads ≥ 2` and `data` contains two or more independent zstd frames,
+each frame is decompressed in a separate Julia task (capped at `nthreads`
+concurrent tasks).  Results are concatenated in frame order.  With `nthreads=1`
+or a single-frame input the existing serial path is taken unchanged.
+
+`nthreads` must be ≥ 1; passing 0 or negative throws `ArgumentError`.
 
 If the frame was compressed with a dictionary, pass it as `dict` — either
 a `ZstdDict` returned by [`parse_dictionary`](@ref), or the raw dictionary
 bytes (`Vector{UInt8}`).
 """
-function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
+    nthreads ≥ 1 || throw(ArgumentError("zstd: nthreads must be ≥ 1, got $nthreads"))
     isempty(data) && throw(ArgumentError("zstd: empty input"))
     d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
-    # TODO: multi-frame parallelism opportunity.  Each zstd frame is fully
-    # independent; a pre-scan over frame headers (to collect frame count and
-    # decompressed sizes) would enable spawning one task per frame and writing
-    # results into a pre-allocated output buffer in parallel.  Benchmarks show
-    # our per-frame overhead is higher than libzstd's, so this could close some
-    # of that gap on multi-frame inputs while keeping single-frame paths unchanged.
-    pos = 1
-    out = UInt8[]
+
+    # Parallel path: only when nthreads ≥ 2 and there are ≥ 2 independent frames.
+    # _scan_frames is O(compressed size) but reads only header/block-header bytes.
+    if nthreads ≥ 2
+        frames, _ = _scan_frames(data, 1, d)
+        if length(frames) ≥ 2
+            sem       = Base.Semaphore(min(nthreads, length(frames)))
+            frame_bufs = Vector{Vector{UInt8}}(undef, length(frames))
+            @sync for (i, frame) in enumerate(frames)
+                Threads.@spawn Base.acquire(sem) do
+                    buf = UInt8[]
+                    frame.fcs > 0 && sizehint!(buf, frame.fcs)
+                    _decompress_frame!(data, frame.data_start, buf, d)
+                    frame_bufs[i] = buf
+                end
+            end
+            total = sum(length, frame_bufs)
+            out   = Vector{UInt8}(undef, total)
+            wp    = 1
+            for buf in frame_bufs
+                n = length(buf)
+                copyto!(out, wp, buf, 1, n)
+                wp += n
+            end
+            return out
+        end
+    end
+
+    # Serial fast-path: nthreads=1, or input has ≤ 1 zstd frame.
     # One-time hint: for incompressible data compressed ≈ raw size; for
     # compressible data this underestimates but limits reallocation to O(1)
     # doublings regardless of frame count.
+    pos = 1
+    out = UInt8[]
     sizehint!(out, length(data))
     while pos ≤ length(data)
         magic = _read_magic(data, pos)
