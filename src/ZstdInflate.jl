@@ -1742,6 +1742,97 @@ function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict,
     return window_size, frame_content_size, content_checksum_flag, pos
 end
 
+"""
+    FrameInfo
+
+Lightweight descriptor for a single non-skippable zstd frame found during
+pre-scan.  `data_start` is the 1-based byte offset of the frame's 4-byte
+magic number in the input vector.  `fcs` is the declared decompressed size
+in bytes, or -1 when the Frame Content Size field is absent from the header.
+"""
+struct FrameInfo
+    data_start ::Int   # 1-based byte offset of the frame's magic number
+    fcs        ::Int   # frame content size in bytes; -1 if absent
+end
+
+"""
+    _scan_frames(data, pos, dict) -> (Vector{FrameInfo}, Int)
+
+Walk `data` starting at byte offset `pos`, reading frame and block headers
+without decompressing, and return a `Vector{FrameInfo}` (one entry per
+non-skippable zstd frame found) together with the position after the last
+consumed byte.
+
+Skippable frames are silently skipped and excluded from the result.
+Throws `ArgumentError` on any structural violation (truncated headers,
+reserved bits, oversized blocks, bad magic numbers) using the same error
+messages as `_decompress_frame!`.
+"""
+function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing})
+    frames = FrameInfo[]
+    while pos ≤ length(data)
+        frame_start = pos
+        magic = _read_magic(data, pos)
+        if _is_skippable(magic)
+            pos = _skip_frame(data, pos)
+        elseif magic == ZSTD_MAGIC
+            pos += 4  # advance past magic number
+
+            # Read frame header fields — validates reserved bits and dict ID
+            fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos =
+                _read_frame_header_descriptor(data, pos)
+            pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
+            # Call _read_window_descriptor solely to advance pos past the
+            # window descriptor byte.  The parsed window size is not needed
+            # for scanning; discard the first return value.
+            _, pos = _read_window_descriptor(data, pos, single_segment_flag)
+            fcs, pos = _read_frame_content_size(data, pos, fcs_size)
+
+            # Scan block headers to advance past the frame without decompressing.
+            # Block header is 3 bytes; block_type distinguishes advance amount:
+            #   0 (raw)        → advance by block_size bytes
+            #   1 (RLE)        → advance by 1 byte (single repeated byte)
+            #   2 (compressed) → advance by block_size bytes
+            #   3 (reserved)   → error; guard here so _scan_frames produces a
+            #                    clean error rather than silently miscomputing
+            #                    frame boundaries for subsequent frames
+            while true
+                length(data) ≥ pos + 2 ||
+                    throw(ArgumentError("zstd: truncated block header"))
+                bh1 = Int(data[pos])
+                bh2 = Int(data[pos + 1])
+                bh3 = Int(data[pos + 2])
+                pos += 3
+                last_block = bh1 & 0x01
+                block_type = (bh1 >> 1) & 0x03
+                block_size = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
+                block_type != 3 ||
+                    throw(ArgumentError("zstd: reserved block type"))
+                block_size ≤ 131072 ||
+                    throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
+                if block_type == 1  # RLE: 1-byte payload regardless of block_size
+                    pos += 1
+                else
+                    pos += block_size
+                end
+                last_block != 0 && break
+            end
+
+            # Skip optional 4-byte content checksum
+            if content_checksum_flag
+                length(data) ≥ pos + 3 ||
+                    throw(ArgumentError("zstd: truncated content checksum"))
+                pos += 4
+            end
+
+            push!(frames, FrameInfo(frame_start, fcs))
+        else
+            throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
+        end
+    end
+    return frames, pos
+end
+
 function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
                             dict::Union{ZstdDict, Nothing} = nothing)
     # Magic number (4 bytes, little-endian)
