@@ -28,6 +28,22 @@ function compress_opts(data::Vector{UInt8}; level=3, checksum=false)
     end
 end
 
+# Compress without Frame Content Size field (ZSTD_c_contentSizeFlag = 0).
+function compress_no_fcs(data::Vector{UInt8})
+    cctx = LibZstd.ZSTD_createCStream()
+    try
+        LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_contentSizeFlag, 0)
+        out = Vector{UInt8}(undef, LibZstd.ZSTD_compressBound(length(data)))
+        inbuf  = LibZstd.ZSTD_inBuffer_s(pointer(data), length(data), 0)
+        outbuf = LibZstd.ZSTD_outBuffer_s(pointer(out), length(out), 0)
+        LibZstd.ZSTD_compressStream2(cctx, Ref(outbuf), Ref(inbuf), LibZstd.ZSTD_e_end)
+        resize!(out, outbuf.pos)
+        return out
+    finally
+        LibZstd.ZSTD_freeCStream(cctx)
+    end
+end
+
 # ------------------------------------------------------------------
 # Text strings
 # ------------------------------------------------------------------
@@ -399,4 +415,36 @@ end
         @test inflate_zstd(vcat(skip, frame)) == UInt8[99]
         @test read(InflateZstdStream(IOBuffer(vcat(skip, frame)))) == UInt8[99]
     end
+end
+
+# ------------------------------------------------------------------
+# _scan_frames internal pre-scan helper
+# ------------------------------------------------------------------
+@testset "_scan_frames pre-scan" begin
+    # Single frame: data_start == 1, fcs matches decompressed size
+    data = compress(UInt8[1, 2, 3])
+    frames, endpos = ZstdInflate._scan_frames(data, 1, nothing)
+    @test length(frames) == 1
+    @test frames[1].data_start == 1
+    @test endpos == length(data) + 1
+
+    # Multi-frame: two frames, correct start offsets
+    frame_a = compress(UInt8[1, 2, 3])
+    frame_b = compress(UInt8[4, 5, 6, 7])
+    both = vcat(frame_a, frame_b)
+    frames2, _ = ZstdInflate._scan_frames(both, 1, nothing)
+    @test length(frames2) == 2
+    @test frames2[1].data_start == 1
+    @test frames2[2].data_start == length(frame_a) + 1
+
+    # Skippable frames are excluded from result
+    skip = UInt8[0x50, 0x2A, 0x4D, 0x18, 0x01, 0x00, 0x00, 0x00, 0xFF]
+    mixed = vcat(skip, frame_a, skip, frame_b)
+    frames3, _ = ZstdInflate._scan_frames(mixed, 1, nothing)
+    @test length(frames3) == 2  # skippable frames not counted
+
+    # FCS-absent frame: fcs == -1
+    fcs_frames, _ = ZstdInflate._scan_frames(compress_no_fcs(UInt8[10, 20, 30]), 1, nothing)
+    @test length(fcs_frames) == 1
+    @test fcs_frames[1].fcs == -1
 end
