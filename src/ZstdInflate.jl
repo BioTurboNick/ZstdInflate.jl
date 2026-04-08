@@ -1470,11 +1470,11 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     ml_mode = (modes_byte >> 2) & 0x03
 
     br = ForwardBitReader(data, pos, limit + 1)
-    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, FSE_MAX_SYMBOL_LITERALS_LENGTH, 9,
+    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
                              state.ll_slot, state)
-    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, FSE_MAX_SYMBOL_OFFSET, 8,
+    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
                              state.of_slot, state)
-    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, FSE_MAX_SYMBOL_MATCH_LENGTH, 9,
+    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, MAX_MATCH_LENGTH, 9,
                              state.ml_slot, state)
     state.ll_tab = ll_tab
     state.of_tab = of_tab
