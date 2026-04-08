@@ -205,62 +205,53 @@ function ReverseBitReader(data::Vector{UInt8}, byte_offset::Int, byte_len::Int)
     return rb
 end
 
+@inline function _load64_le(data::Vector{UInt8}, i::Int)
+    # Load 8 bytes from data[i:i+7] as a little-endian UInt64.
+    # On little-endian x86, data[i+7] (highest address) lands in the MSB,
+    # which is exactly right for a reverse bit reader where data[pos] (the
+    # highest-addressed unread byte) should be the most significant.
+    unsafe_load(Ptr{UInt64}(pointer(data, i)))
+end
+
 function _rbr_refill!(rb::ReverseBitReader)
     n0 = rb.nbits
     n0 > 56 && return
     pos   = rb.pos
     avail = pos - rb.start + 1
-    avail == 0 && return
+    avail ≤ 0 && return
 
-    # Number of bytes needed to raise nbits above 56.
     k = min(((57 - n0) + 7) >> 3, avail)
 
-    # Precompute base shift from n0 so that all per-byte shifts are
-    # independent of each other (no serial nbits-update dependency).
-    # Two accumulators let the CPU pipeline odd- and even-indexed loads.
-    s = 56 - n0   # shift for byte 0; byte j uses s - 8j (always ≥ 0 for j < k)
-    a = rb.bits
-    b = UInt64(0)
-    @inbounds begin
-        k ≥ 1 && (a |= _shl(UInt64(rb.data[pos    ]), s      ))
-        k ≥ 2 && (b |= _shl(UInt64(rb.data[pos - 1]), s -  8 ))
-        k ≥ 3 && (a |= _shl(UInt64(rb.data[pos - 2]), s - 16 ))
-        k ≥ 4 && (b |= _shl(UInt64(rb.data[pos - 3]), s - 24 ))
-        k ≥ 5 && (a |= _shl(UInt64(rb.data[pos - 4]), s - 32 ))
-        k ≥ 6 && (b |= _shl(UInt64(rb.data[pos - 5]), s - 40 ))
-        k ≥ 7 && (a |= _shl(UInt64(rb.data[pos - 6]), s - 48 ))
-        k ≥ 8 && (b |= _shl(UInt64(rb.data[pos - 7]), s - 56 ))
+    if pos ≥ 8
+        # Fast path: single 8-byte load.  data[pos-7..pos] is read as big-endian
+        # so data[pos] (the next byte to consume) lands in the MSB.  Shifting
+        # right by n0 positions the new bytes just below the existing valid bits.
+        # We mask off extra loaded bytes beyond k so they don't contaminate the
+        # lower bit region (which must stay zero for the next refill's OR).
+        raw = _load64_le(rb.data, pos - 7)
+        # Zero out everything below the k bytes we need: keep top 8k bits of raw
+        cleaned = raw & _shl(typemax(UInt64), 64 - 8k)
+        rb.bits |= _shr(cleaned, n0)
+    else
+        # Near start of data (pos < 8): byte-by-byte fallback.
+        # Happens at most once per stream so performance is not critical.
+        s = 56 - n0
+        a = rb.bits
+        b = UInt64(0)
+        @inbounds begin
+            k ≥ 1 && (a |= _shl(UInt64(rb.data[pos    ]), s      ))
+            k ≥ 2 && (b |= _shl(UInt64(rb.data[pos - 1]), s -  8 ))
+            k ≥ 3 && (a |= _shl(UInt64(rb.data[pos - 2]), s - 16 ))
+            k ≥ 4 && (b |= _shl(UInt64(rb.data[pos - 3]), s - 24 ))
+            k ≥ 5 && (a |= _shl(UInt64(rb.data[pos - 4]), s - 32 ))
+            k ≥ 6 && (b |= _shl(UInt64(rb.data[pos - 5]), s - 40 ))
+            k ≥ 7 && (a |= _shl(UInt64(rb.data[pos - 6]), s - 48 ))
+        end
+        rb.bits = a | b
     end
 
-    rb.bits  = a | b
     rb.nbits = n0 + 8k
     rb.pos   = pos - k
-
-    # FUTURE OPTIMISATION — "consumed counter" model (zstd reference style):
-    #
-    # The fundamental limit of the current design is that loading bytes one at
-    # a time with 8-bit granularity guarantees only 57 bits minimum after each
-    # refill (when n0 = 49, one byte brings nbits to 57).  This caps safe_n at
-    # floor(57 / max_bits) = 4 for max_bits = 12 — one refill every 4
-    # dual-symbol Huffman decodes.
-    #
-    # Switching to a "bits_consumed" counter would make refills O(1):
-    #
-    #   ptr          -= bits_consumed >> 3   # skip fully-consumed bytes
-    #   bitContainer  = ltoh(unsafe_load(Ptr{UInt64}(pointer(data, ptr - 7))))
-    #   bits_consumed &= 7                   # keep the partial-byte remainder
-    #
-    # Since bits_consumed & 7 is typically 0 for byte-aligned codes (and rarely
-    # exceeds a few bits for short Huffman codes), refills routinely restore
-    # 60–64 valid bits rather than the current worst-case 57.  That would raise
-    # safe_n from 4 to 5 for max_bits = 12 (20 % fewer refills) and replace the
-    # current k-iteration byte loop with a single unaligned 8-byte load.
-    #
-    # The change requires updating ReverseBitReader (add bits_consumed field,
-    # remove nbits), and adjusting every consumer:
-    #   _huffman_decode_nocheck! / _huffman_decode2_nocheck! :
-    #     idx = (rb.bits << rb.bits_consumed) >>> (64 - ht.max_bits)
-    #   read_bits_r!, peek_bits_r!, consume_bits_r!, fse_update!, etc.
 end
 
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
