@@ -499,4 +499,30 @@ end
 
     # AC7.2: nthreads=-1 throws ArgumentError
     @test_throws ArgumentError inflate_zstd(two_frames; nthreads=-1)
+
+    # AC3.1 / AC3.2: corrupt second frame in parallel input throws CompositeException
+    # Use a checksum-enabled frame so corruption is reliably detected during decompression
+    # (not during pre-scan, which only reads headers)
+    good_b = compress_opts(collect(UInt8, 4:20); checksum=true)
+    corrupt_b2 = copy(good_b)
+    corrupt_b2[end] ⊻= 0xFF  # flip checksum byte → checksum mismatch during decompression
+    corrupt_two = vcat(frame_a, corrupt_b2)
+    @test_throws CompositeException inflate_zstd(corrupt_two; nthreads=2)
+    # Verify the CompositeException wraps the original error
+    try
+        inflate_zstd(corrupt_two; nthreads=2)
+    catch e
+        @test e isa CompositeException
+        @test any(ex -> ex isa TaskFailedException, e.exceptions)
+    end
+
+    # AC4.1: inflate_zstd(filename; nthreads=N) produces correct parallel output
+    mktempdir() do dir
+        path = joinpath(dir, "multi.zst")
+        write(path, two_frames)
+        @test Vector{UInt8}(inflate_zstd(path; nthreads=2)) == expected_two
+    end
+
+    # AC4.2: InflateZstdStream(io; nthreads=N) produces correct parallel output
+    @test read(InflateZstdStream(IOBuffer(two_frames); nthreads=2)) == expected_two
 end

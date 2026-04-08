@@ -182,16 +182,25 @@ Random.seed!(42)
 let data = huffman_compressible(10_000_000)
     mf = compress_zstd_multiframe(data)
     sf = compress_zstd(data)
-    @printf("  %-20s  %d frames, %d bytes compressed\n",
-            "multi-frame", div(length(data), 100_000), length(mf))
+    nframes = div(length(data), 100_000)
+    nt = Threads.nthreads()
+    @printf("  %-25s  %d frames, %d bytes compressed\n", "multi-frame", nframes, length(mf))
+    @printf("  %-25s  %d\n", "Julia threads", nt)
+    println()
     GC.gc()
     t_ref_sf  = (@b transcode(ZstdDecompressor, $sf)  seconds=2).time
     t_ref_mf  = (@b transcode(ZstdDecompressor, $mf)  seconds=2).time
     t_ours_sf = (@b inflate_zstd($sf)                 seconds=2).time
-    t_ours_mf = (@b inflate_zstd($mf)                 seconds=2).time
-    @printf("  %-20s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
+    t_ours_mf = (@b inflate_zstd($mf; nthreads=1)    seconds=2).time
+    t_ours_par = (@b inflate_zstd($mf; nthreads=$nt)  seconds=2).time
+    @printf("  %-25s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
             "single-frame",    t_ours_sf/t_ref_sf, t_ref_sf*1e6, t_ours_sf*1e6)
-    @printf("  %-20s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
-            "multi-frame",     t_ours_mf/t_ref_mf, t_ref_mf*1e6, t_ours_mf*1e6)
+    @printf("  %-25s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
+            "multi-frame serial",  t_ours_mf/t_ref_mf, t_ref_mf*1e6, t_ours_mf*1e6)
+    @printf("  %-25s  ratio=%.2f  CodecZstd=%6.1f μs  ZstdInflate.jl=%6.1f μs\n",
+            "multi-frame parallel", t_ours_par/t_ref_mf, t_ref_mf*1e6, t_ours_par*1e6)
+    if t_ours_mf > 0
+        @printf("\n  Parallel speedup vs serial:  %.2f×\n", t_ours_mf / t_ours_par)
+    end
 end
 

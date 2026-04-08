@@ -792,7 +792,7 @@ function parse_dictionary(raw::Vector{UInt8})
             (UInt32(raw[3]) << 16) | (UInt32(raw[4]) << 24)
     if magic != ZSTD_DICT_MAGIC
         # Raw content dictionary: no entropy tables, default repeat offsets
-        return ZstdDict(UInt32(0), nothing, nothing, nothing, nothing, INIT_REP, raw)
+        return ZstdDict(UInt32(0), nothing, nothing, nothing, nothing, INIT_REPEAT_OFFSETS, raw)
     end
 
     # Structured dictionary
@@ -1986,13 +1986,13 @@ function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},No
 end
 
 """
-    inflate_zstd(filename::AbstractString; dict=nothing) -> String
+    inflate_zstd(filename::AbstractString; dict=nothing, nthreads=Threads.nthreads()) -> String
 
 Read a `.zst` file and return the decompressed content as a `String`.
 """
-function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
     data = read(filename)
-    String(inflate_zstd(data; dict=dict))
+    String(inflate_zstd(data; dict=dict, nthreads=nthreads))
 end
 
 # ============================================================
@@ -2001,7 +2001,7 @@ end
 # ============================================================
 
 """
-    InflateZstdStream(io::IO; dict=nothing)
+    InflateZstdStream(io::IO; dict=nothing, nthreads=Threads.nthreads())
 
 Create a readable stream that decompresses Zstandard data from `io`.
 The stream reads all compressed data at construction time; subsequent
@@ -2015,9 +2015,9 @@ mutable struct InflateZstdStream <: IO
     pos::Int
 end
 
-function InflateZstdStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing)
+function InflateZstdStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
     compressed = read(io)
-    decompressed = inflate_zstd(compressed; dict=dict)
+    decompressed = inflate_zstd(compressed; dict=dict, nthreads=nthreads)
     InflateZstdStream(decompressed, 1)
 end
 
