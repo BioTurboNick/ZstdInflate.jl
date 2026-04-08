@@ -806,15 +806,15 @@ function parse_dictionary(raw::Vector{UInt8})
 
     # 2. FSE table for offsets
     br = ForwardBitReader(raw, pos, length(raw) + 1)
-    of_al, of_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_OFFSET)
+    of_al, of_dist = read_fse_dist!(br, MAX_OFFSET_CODE)
     of_tab = build_fse_table(of_dist, of_al)
 
     # 3. FSE table for match lengths
-    ml_al, ml_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_MATCH_LENGTH)
+    ml_al, ml_dist = read_fse_dist!(br, MAX_MATCH_LENGTH)
     ml_tab = build_fse_table(ml_dist, ml_al)
 
     # 4. FSE table for literals lengths
-    ll_al, ll_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_LITERALS_LENGTH)
+    ll_al, ll_dist = read_fse_dist!(br, MAX_LITERALS_LENGTH)
     ll_tab = build_fse_table(ll_dist, ll_al)
 
     pos = byte_pos(br)
