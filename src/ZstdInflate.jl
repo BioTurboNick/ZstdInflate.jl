@@ -29,70 +29,9 @@ using SIMD
 
 export inflate_zstd, InflateZstdStream, ZstdDict, parse_dictionary
 
-# ============================================================
-# Section 1: Constants
-# ============================================================
+include("constants.jl")
 
-const ZSTD_MAGIC = 0xFD2FB528
-const ZSTD_DICT_MAGIC = 0xEC30A437
 
-# Maximum Huffman table log (RFC 8878 §4.2.1, reference HUF_TABLELOG_ABSOLUTEMAX)
-const HUF_TABLELOG_MAX = 12
-const FSE_MAX_SYMBOL_LL = 35   # RFC 8878 Table 1
-const FSE_MAX_SYMBOL_OF = 28   # RFC 8878 Table 3
-const FSE_MAX_SYMBOL_ML = 52   # RFC 8878 Table 2
-
-# Initial repeat offsets (RFC 8878 §3.1.1.3.3)
-const INIT_REP = (1, 4, 8)
-
-# Predefined FSE distributions (RFC 8878 Appendix B)
-
-const LL_DEFAULT_DIST = Int16[
-    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-    -1, -1, -1, -1
-]
-const LL_DEFAULT_LOG = 6
-
-const ML_DEFAULT_DIST = Int16[
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
-    -1, -1, -1, -1, -1
-]
-const ML_DEFAULT_LOG = 6
-
-const OF_DEFAULT_DIST = Int16[
-    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1
-]
-const OF_DEFAULT_LOG = 5
-
-# Literals Length code tables (RFC 8878 §3.1.1.3.2.3)
-const LL_EXTRA_BITS = UInt8[
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 15, 16
-]
-const LL_BASE = UInt32[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096,
-    8192, 16384, 32768, 65536
-]
-
-# Match Length code tables (RFC 8878 §3.1.1.3.2.2)
-const ML_EXTRA_BITS = UInt8[
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11,
-    12, 13, 14, 15, 16
-]
-const ML_BASE = UInt32[
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-    35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051,
-    4099, 8195, 16387, 32771, 65539
-]
 
 # ============================================================
 # Section 2: xxHash-64  (RFC 8878 §3.1.5 — content checksum)
@@ -336,8 +275,8 @@ end
 end
 
 @inline function consume_bits_r!(rb::ReverseBitReader, n::Int)
-    # RFC 8878: Huffman code lengths are bounded by HUF_TABLELOG_MAX (12),
-    # so n is always in [1, 12] — never ≥ 64.  Catch bugs if that ever changes.
+    # RFC 8878: Huffman code lengths are bounded by HUFTABLE_LOG_MAX (11),
+    # so n is always in [1, 11] — never ≥ 64.  Catch bugs if that ever changes.
     n < 64 || throw(ArgumentError("zstd: consume_bits_r! shift $n ≥ 64"))
     rb.bits  = rb.bits << n
     rb.nbits -= n
@@ -520,9 +459,9 @@ const _ML_TABLE = Ref{FSETable}()
 const _OF_TABLE = Ref{FSETable}()
 
 function __init__()
-    _LL_TABLE[] = build_fse_table(LL_DEFAULT_DIST, LL_DEFAULT_LOG)
-    _ML_TABLE[] = build_fse_table(ML_DEFAULT_DIST, ML_DEFAULT_LOG)
-    _OF_TABLE[] = build_fse_table(OF_DEFAULT_DIST, OF_DEFAULT_LOG)
+    _LL_TABLE[] = build_fse_table(LITERALS_LENGTH_DEFAULT_DIST, LITERALS_LENGTH_ACCURACY_LOG)
+    _ML_TABLE[] = build_fse_table(MATCH_LENGTH_DEFAULT_DIST, MATCH_LENGTH_ACCURACY_LOG)
+    _OF_TABLE[] = build_fse_table(OFFSET_DEFAULT_DIST, OFFSET_ACCURACY_LOG)
 end
 
 # ------- FSE state machine helpers -------
@@ -602,17 +541,6 @@ struct HuffmanTable
     #   bits [ 7: 0]  sym1     — first symbol (always valid)
     # nb_total == nb1 indicates a single-symbol entry; nb_total > nb1 is a two-symbol entry.
     decode_table::Vector{UInt32}
-    #
-    # FUTURE OPTIMISATION — narrower primary table for better L1 cache utilisation:
-    #
-    # With max_bits = 12 the table is 4096 × 4 = 16 KB, which fills a typical
-    # 16 KB L1-D cache on its own.  libzstd addresses this with its X1/X2 split-table
-    # scheme: a narrow primary table (e.g., 11-bit, 8 KB) handles all codes whose
-    # length ≤ the primary log, while longer codes fall through to the full table.
-    # In practice, libzstd's encoder caps at HUF_TABLELOG_DEFAULT = 11, so max_bits = 12
-    # is never observed in real streams and this optimisation has not been implemented.
-    # A @warn in build_huffman_table will fire if max_bits = 12 is ever encountered,
-    # which would be the trigger to implement the split-table path.
 end
 
 # Build a dual-symbol Huffman decode table from a weight array.
@@ -621,8 +549,10 @@ end
 # Each entry is a UInt32: (nb_total<<24)|(nb1<<16)|(sym2<<8)|sym1.
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
     nsyms = length(weights)
-    max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
-    max_bits ≤ HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+    max_bits > 0 ||
+        throw(ArgumentError("zstd: all-zero Huffman weights"))
+    max_bits ≤ HUFTABLE_LOG_MAX ||
+        throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUFTABLE_LOG_MAX)"))
 
     table_size = 1 << max_bits
     # Pass 1: build a temporary single-symbol table (sym, nb1) to use as input
@@ -674,7 +604,6 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
     end
 
-    max_bits == HUF_TABLELOG_MAX && @warn "zstd: Huffman table with max_bits=$max_bits encountered; see FUTURE OPTIMISATION note in HuffmanTable."
     return HuffmanTable(max_bits, dtable)
 end
 
@@ -745,7 +674,7 @@ end
 # RFC 8878 §4.2.1.1
 function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
     # Read the FSE table for weights
-    al, dist  = read_fse_dist!(br, HUF_TABLELOG_MAX)
+    al, dist  = read_fse_dist!(br, HUFTABLE_LOG_MAX)
     t         = build_fse_table(dist, al)
 
     # The remainder of the weight description is a reverse bitstream
@@ -877,15 +806,15 @@ function parse_dictionary(raw::Vector{UInt8})
 
     # 2. FSE table for offsets
     br = ForwardBitReader(raw, pos, length(raw) + 1)
-    of_al, of_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_OF)
+    of_al, of_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_OFFSET)
     of_tab = build_fse_table(of_dist, of_al)
 
     # 3. FSE table for match lengths
-    ml_al, ml_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_ML)
+    ml_al, ml_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_MATCH_LENGTH)
     ml_tab = build_fse_table(ml_dist, ml_al)
 
     # 4. FSE table for literals lengths
-    ll_al, ll_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_LL)
+    ll_al, ll_dist = read_fse_dist!(br, FSE_MAX_SYMBOL_LITERALS_LENGTH)
     ll_tab = build_fse_table(ll_dist, ll_al)
 
     pos = byte_pos(br)
@@ -951,12 +880,12 @@ const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
 DecompressState() = DecompressState(
-    INIT_REP, nothing, nothing, nothing, nothing, UInt8[],
+    INIT_REPEAT_OFFSETS, nothing, nothing, nothing, nothing, UInt8[],
     Int[], Int[], Int[],
     UInt8[],
-    Vector{UInt32}(undef, 1 << HUF_TABLELOG_MAX),
-    zeros(Int, HUF_TABLELOG_MAX + 1),
-    zeros(Int, HUF_TABLELOG_MAX + 1),
+    Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
+    zeros(Int, HUFTABLE_LOG_MAX + 1),
+    zeros(Int, HUFTABLE_LOG_MAX + 1),
     UInt8[],
     FSETableSlot(_FSE_MAX_TABLE),
     FSETableSlot(_FSE_MAX_TABLE),
@@ -968,9 +897,9 @@ function DecompressState(dict::ZstdDict)
         dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
         Int[], Int[], Int[],
         UInt8[],
-        Vector{UInt32}(undef, 1 << HUF_TABLELOG_MAX),
-        zeros(Int, HUF_TABLELOG_MAX + 1),
-        zeros(Int, HUF_TABLELOG_MAX + 1),
+        Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
+        zeros(Int, HUFTABLE_LOG_MAX + 1),
+        zeros(Int, HUFTABLE_LOG_MAX + 1),
         UInt8[],
         FSETableSlot(_FSE_MAX_TABLE),
         FSETableSlot(_FSE_MAX_TABLE),
@@ -990,14 +919,14 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
 end
 
 # Hot-path variant of build_huffman_table: reuses scratch buffers from DecompressState.
-# huf_dtable is pre-sized to 1 << HUF_TABLELOG_MAX and used as the full overflow table.
+# huf_dtable is pre-sized to 1 << HUFTABLE_LOG_MAX and used as the full overflow table.
 # huf_primary_table is pre-sized to 1 << HUF_PRIMARY_BITS and used as the hot-path table.
 # Both buffers are shared across blocks (safe because literals are decoded before the
 # next block's table is built, so the current HuffmanTable is not live during a rebuild).
 function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
     nsyms = length(weights)
     max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
-    max_bits ≤ HUF_TABLELOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUF_TABLELOG_MAX)"))
+    max_bits ≤ HUFTABLE_LOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUFTABLE_LOG_MAX)"))
 
     table_size      = 1 << max_bits
     dtable          = state.huf_dtable
@@ -1050,13 +979,12 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         # Leave as single-symbol (already correct from pass 1).
     end
 
-    max_bits == HUF_TABLELOG_MAX && @warn "zstd: Huffman table with max_bits=$max_bits encountered; see FUTURE OPTIMISATION note in HuffmanTable."
     return HuffmanTable(max_bits, dtable)
 end
 
 # Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
 function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vector{UInt8})
-    al, dist  = read_fse_dist!(br, HUF_TABLELOG_MAX)
+    al, dist  = read_fse_dist!(br, HUFTABLE_LOG_MAX)
     t         = build_fse_table(dist, al)
 
     pos_after = byte_pos(br)
@@ -1536,11 +1464,11 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     ml_mode = (modes_byte >> 2) & 0x03
 
     br = ForwardBitReader(data, pos, limit + 1)
-    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, FSE_MAX_SYMBOL_LL, 9,
+    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, FSE_MAX_SYMBOL_LITERALS_LENGTH, 9,
                              state.ll_slot, state)
-    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, FSE_MAX_SYMBOL_OF, 8,
+    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, FSE_MAX_SYMBOL_OFFSET, 8,
                              state.of_slot, state)
-    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, FSE_MAX_SYMBOL_ML, 9,
+    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, FSE_MAX_SYMBOL_MATCH_LENGTH, 9,
                              state.ml_slot, state)
     state.ll_tab = ll_tab
     state.of_tab = of_tab
@@ -1571,6 +1499,8 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         ll_code = fse_peek(ll_tab, ll_state)
         ml_code = fse_peek(ml_tab, ml_state)
         of_code = fse_peek(of_tab, of_state)
+        of_code ≤ MAX_OFFSET_CODE ||
+            throw(ArgumentError("zstd: offset code $of_code exceeds maximum supported value, $MAX_OFFSET_CODE"))
 
         # 2+3 batched: precompute all six bit widths, then extract all from
         # the same frozen bit word.  This breaks the 6-deep serial dependency
@@ -1580,8 +1510,8 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         # issue the six extractions and the cumulative-offset additions in
         # parallel once the single refill is done.
         of_n  = of_code
-        ml_n  = Int(@inbounds ML_EXTRA_BITS[ml_code + 1])
-        ll_n  = Int(@inbounds LL_EXTRA_BITS[ll_code + 1])
+        ml_n  = Int(@inbounds MATCH_LENGTH_EXTRA_BITS[ml_code + 1])
+        ll_n  = Int(@inbounds LITERALS_LENGTH_EXTRA_BITS[ll_code + 1])
 
         # State-transition widths (skip on last sequence — states not used again)
         update = i < num_seqs
@@ -1629,8 +1559,8 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         of_val64 = (Int64(1) << of_code) + of_extra
         of_val64 ≤ typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
         of_vals[i] = Int(of_val64)
-        ml_vals[i] = Int(@inbounds ML_BASE[ml_code + 1]) + ml_extra
-        ll_vals[i] = Int(@inbounds LL_BASE[ll_code + 1]) + ll_extra
+        ml_vals[i] = Int(@inbounds MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
+        ll_vals[i] = Int(@inbounds LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
 
         if update
             ll_state = _fse_baseline(ll_tab, ll_state) + ll_bits
