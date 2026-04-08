@@ -36,6 +36,11 @@ const MATCH_LENGTH_EXTRA_BITS = UInt8[
 
 const MAX_OFFSET_CODE = 31 # Free to choose, minimum recommended is 22, reference uses 31
 
+# Maximum symbol values for FSE tables (used in sequence decoding)
+const FSE_MAX_SYMBOL_LITERALS_LENGTH = MAX_LITERALS_LENGTH  # 35
+const FSE_MAX_SYMBOL_MATCH_LENGTH    = MAX_MATCH_LENGTH     # 52
+const FSE_MAX_SYMBOL_OFFSET          = MAX_OFFSET_CODE      # 31
+
 
 # Default Distributions (RFC 8878 §3.1.1.3.2.2)
 

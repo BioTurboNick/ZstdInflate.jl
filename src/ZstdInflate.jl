@@ -31,6 +31,12 @@ export inflate_zstd, InflateZstdStream, ZstdDict, parse_dictionary
 
 include("constants.jl")
 
+# Wrapping shift helpers: emit a single shift instruction on x86 without
+# Julia's default guards for shift ≥ 64.  Safe only when the caller knows
+# n ∈ [0, 63] (the hardware masks the count anyway; `& 63` just proves it
+# to LLVM so it drops the overflow branches).
+@inline _shl(x::UInt64, n::Int) = x << (n & 63)
+@inline _shr(x::UInt64, n::Int) = x >>> (n & 63)
 
 
 # ============================================================
@@ -146,9 +152,9 @@ end
     n == 0 && return UInt64(0)
     br.nbits < n && _fbr_refill!(br)
     br.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
-    mask = (n < 64) ? ((UInt64(1) << n) - UInt64(1)) : typemax(UInt64)
+    mask = (n < 64) ? (_shl(UInt64(1), n) - UInt64(1)) : typemax(UInt64)
     val      = br.bits & mask
-    br.bits  = (n < 64) ? (br.bits >>> n) : UInt64(0)
+    br.bits  = (n < 64) ? _shr(br.bits, n) : UInt64(0)
     br.nbits -= n
     return val
 end
@@ -216,14 +222,14 @@ function _rbr_refill!(rb::ReverseBitReader)
     a = rb.bits
     b = UInt64(0)
     @inbounds begin
-        k ≥ 1 && (a |= UInt64(rb.data[pos    ]) << s      )
-        k ≥ 2 && (b |= UInt64(rb.data[pos - 1]) << (s -  8))
-        k ≥ 3 && (a |= UInt64(rb.data[pos - 2]) << (s - 16))
-        k ≥ 4 && (b |= UInt64(rb.data[pos - 3]) << (s - 24))
-        k ≥ 5 && (a |= UInt64(rb.data[pos - 4]) << (s - 32))
-        k ≥ 6 && (b |= UInt64(rb.data[pos - 5]) << (s - 40))
-        k ≥ 7 && (a |= UInt64(rb.data[pos - 6]) << (s - 48))
-        k ≥ 8 && (b |= UInt64(rb.data[pos - 7]) << (s - 56))
+        k ≥ 1 && (a |= _shl(UInt64(rb.data[pos    ]), s      ))
+        k ≥ 2 && (b |= _shl(UInt64(rb.data[pos - 1]), s -  8 ))
+        k ≥ 3 && (a |= _shl(UInt64(rb.data[pos - 2]), s - 16 ))
+        k ≥ 4 && (b |= _shl(UInt64(rb.data[pos - 3]), s - 24 ))
+        k ≥ 5 && (a |= _shl(UInt64(rb.data[pos - 4]), s - 32 ))
+        k ≥ 6 && (b |= _shl(UInt64(rb.data[pos - 5]), s - 40 ))
+        k ≥ 7 && (a |= _shl(UInt64(rb.data[pos - 6]), s - 48 ))
+        k ≥ 8 && (b |= _shl(UInt64(rb.data[pos - 7]), s - 56 ))
     end
 
     rb.bits  = a | b
@@ -261,8 +267,8 @@ end
     n == 0 && return UInt64(0)
     rb.nbits < n && _rbr_refill!(rb)
     rb.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of reverse bitstream"))
-    val      = rb.bits >>> (64 - n)
-    rb.bits  = (n < 64) ? (rb.bits << n) : UInt64(0)
+    val      = _shr(rb.bits, 64 - n)
+    rb.bits  = (n < 64) ? _shl(rb.bits, n) : UInt64(0)
     rb.nbits -= n
     return val
 end
@@ -271,14 +277,14 @@ end
 @inline function peek_bits_r!(rb::ReverseBitReader, n::Int)
     rb.nbits < n && _rbr_refill!(rb)
     rb.nbits ≥ n || throw(ArgumentError("zstd: unexpected end of reverse bitstream (peek)"))
-    return rb.bits >>> (64 - n)
+    return _shr(rb.bits, 64 - n)
 end
 
 @inline function consume_bits_r!(rb::ReverseBitReader, n::Int)
     # RFC 8878: Huffman code lengths are bounded by HUFTABLE_LOG_MAX (11),
     # so n is always in [1, 11] — never ≥ 64.  Catch bugs if that ever changes.
     n < 64 || throw(ArgumentError("zstd: consume_bits_r! shift $n ≥ 64"))
-    rb.bits  = rb.bits << n
+    rb.bits  = _shl(rb.bits, n)
     rb.nbits -= n
 end
 
@@ -288,8 +294,8 @@ end
 @inline function _read_bits_r_unchecked!(rb::ReverseBitReader, n::Int)
     n == 0 && return UInt64(0)
     _rbr_refill!(rb)
-    val      = rb.bits >>> (64 - n)
-    rb.bits  = (n < 64) ? (rb.bits << n) : UInt64(0)
+    val      = _shr(rb.bits, 64 - n)
+    rb.bits  = (n < 64) ? _shl(rb.bits, n) : UInt64(0)
     rb.nbits -= n
     return val
 end
@@ -609,10 +615,10 @@ end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
 @inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable)
-    idx      = Int(rb.bits >>> (64 - ht.max_bits))
+    idx      = _shr(rb.bits, 64 - ht.max_bits) % Int
     e        = @inbounds ht.decode_table[idx + 1]
     nb1      = Int((e >> 16) & 0xFF)
-    rb.bits <<= nb1
+    rb.bits  = _shl(rb.bits, nb1)
     rb.nbits -= nb1
     return Int(e & 0xFF)
 end
@@ -629,13 +635,13 @@ end
 # Returns the number of symbols decoded (1 or 2).
 @inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable,
                                            out::Vector{UInt8}, pos::Int)
-    idx      = Int(rb.bits >>> (64 - ht.max_bits))
+    idx      = _shr(rb.bits, 64 - ht.max_bits) % Int
     e        = @inbounds ht.decode_table[idx + 1]
     nb_total = Int(e >> 24)
     nb1      = Int((e >> 16) & 0xFF)
     @inbounds out[pos]   = UInt8(e & 0xFF)
     @inbounds out[pos+1] = UInt8((e >> 8) & 0xFF)
-    rb.bits <<= nb_total
+    rb.bits  = _shl(rb.bits, nb_total)
     rb.nbits  -= nb_total
     return nb_total > nb1 ? 2 : 1
 end
