@@ -252,6 +252,19 @@ function _rbr_refill!(rb::ReverseBitReader)
 
     rb.nbits = n0 + 8k
     rb.pos   = pos - k
+
+    # FUTURE OPTIMISATION — "consumed counter" model (zstd reference style):
+    #
+    # Switching to a "bits_consumed" counter would make refills O(1):
+    #
+    #   ptr          -= bits_consumed >> 3   # skip fully-consumed bytes
+    #   bitContainer  = load64(ptr)
+    #   bits_consumed &= 7                   # keep the partial-byte remainder
+    #
+    # This would give 60–64 valid bits per refill instead of 57, increasing
+    # safe_n and reducing refill frequency.  The change requires updating
+    # ReverseBitReader (add bits_consumed field, remove nbits), and adjusting
+    # every consumer to use `(rb.bits << rb.bits_consumed) >>> (64 - n)`.
 end
 
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
@@ -528,7 +541,7 @@ end
 #   Reference: RFC 8878 §4.2
 # ============================================================
 
-struct HuffmanTable
+struct HuffmanTable{L}
     max_bits::Int
     # Packed dual-symbol decode table indexed by the top max_bits of the peeked code word.
     # Each UInt32 entry encodes up to two symbols:
@@ -601,7 +614,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
     end
 
-    return HuffmanTable(max_bits, dtable)
+    return HuffmanTable{max_bits}(max_bits, dtable)
 end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
@@ -976,7 +989,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         # Leave as single-symbol (already correct from pass 1).
     end
 
-    return HuffmanTable(max_bits, dtable)
+    return HuffmanTable{max_bits}(max_bits, dtable)
 end
 
 # Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
@@ -1052,6 +1065,117 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int, state::Decompre
         ht = build_huffman_table(weights, table_log, state)
         return ht, nbytes + 1
     end
+end
+
+# Decode four interleaved Huffman streams into `literals[1:regen_size]`.
+# ht::HuffmanTable{L} carries max_bits as a type parameter so that
+# safe_n = 57 ÷ L is a compile-time constant; Julia specialises this
+# function per distinct L and LLVM unrolls the constant-bound inner loops.
+# Called via dynamic dispatch from read_literals — one indirect call per
+# outer (refill) iteration, not per symbol.
+function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
+                            literals::Vector{UInt8}, regen_size::Int,
+                            huf_start::Int, payload_end::Int) where L
+    j1 = Int(_le16(data, huf_start))
+    j2 = Int(_le16(data, huf_start + 2))
+    j3 = Int(_le16(data, huf_start + 4))
+    s1_start = huf_start + 6
+    s2_start = s1_start + j1
+    s3_start = s2_start + j2
+    s4_start = s3_start + j3
+    s4_end   = payload_end
+
+    seg_n = (regen_size + 3) >> 2
+
+    rb1 = ReverseBitReader(data, s1_start, j1)
+    rb2 = ReverseBitReader(data, s2_start, j2)
+    rb3 = ReverseBitReader(data, s3_start, j3)
+    rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
+
+    # Dual-symbol interleaved decode.
+    # safe_n lookups fit in one refill (≥ 57 bits loaded, ≤ max_bits per lookup).
+    # safeendX = endX - 2*safe_n: the last position from which a full batch of
+    # safe_n dual-symbol lookups is guaranteed safe.  Each lookup writes pos and
+    # pos+1 unconditionally; the guard ensures pos+1 ≤ endX - 1 < endX, so the
+    # write never crosses into an adjacent segment.
+    # Phase 1: all 4 streams together.
+    # Phase 2: fixed pairs (1,2) and (3,4).
+    # Phase 3: whichever stream in each pair still has capacity runs single-stream.
+    # Phase 4: finish any remaining symbols with single-symbol decode.
+    safe_n = 57 ÷ L  # compile-time constant: L is a type parameter
+    o1 = 1; o2 = 1 + seg_n; o3 = 1 + 2seg_n; o4 = 1 + 3seg_n
+    end1 = seg_n; end2 = 2seg_n; end3 = 3seg_n; end4 = regen_size
+    safeend1 = end1 - 2safe_n; safeend2 = end2 - 2safe_n
+    safeend3 = end3 - 2safe_n; safeend4 = end4 - 2safe_n
+
+    while o1 ≤ safeend1 && o2 ≤ safeend2 &&
+          o3 ≤ safeend3 && o4 ≤ safeend4
+        _rbr_refill!(rb1)
+        _rbr_refill!(rb2)
+        _rbr_refill!(rb3)
+        _rbr_refill!(rb4)
+        for _ in 1:safe_n
+            o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+            o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+            o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+            o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+        end
+    end
+
+    while o1 ≤ safeend1 && o2 ≤ safeend2
+        _rbr_refill!(rb1)
+        _rbr_refill!(rb2)
+        for _ in 1:safe_n
+            o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+            o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+        end
+    end
+
+    while o3 ≤ safeend3 && o4 ≤ safeend4
+        _rbr_refill!(rb3)
+        _rbr_refill!(rb4)
+        for _ in 1:safe_n
+            o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+            o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+        end
+    end
+
+    if o1 ≤ safeend1
+        while o1 ≤ safeend1
+            _rbr_refill!(rb1)
+            for _ in 1:safe_n
+                o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
+            end
+        end
+    elseif o2 ≤ safeend2 # must check because possible to overshoot
+        while o2 ≤ safeend2
+            _rbr_refill!(rb2)
+            for _ in 1:safe_n
+                o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+            end
+        end
+    end
+
+    if o3 ≤ safeend3
+        while o3 ≤ safeend3
+            _rbr_refill!(rb3)
+            for _ in 1:safe_n
+                o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
+            end
+        end
+    elseif o4 ≤ safeend4 # must check because possible to overshoot
+        while o4 ≤ safeend4
+            _rbr_refill!(rb4)
+            for _ in 1:safe_n
+                o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+            end
+        end
+    end
+
+    while o1 ≤ end1; @inbounds literals[o1] = huffman_decode!(rb1, ht); o1 += 1; end
+    while o2 ≤ end2; @inbounds literals[o2] = huffman_decode!(rb2, ht); o2 += 1; end
+    while o3 ≤ end3; @inbounds literals[o3] = huffman_decode!(rb3, ht); o3 += 1; end
+    while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
 end
 
 # Read the literals section starting at data[pos].
@@ -1147,108 +1271,9 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
                 @inbounds literals[i] = UInt8(huffman_decode!(rb, ht))
             end
         else
-            # 4 streams with a 6-byte jump table
-            j1 = Int(_le16(data, huf_start))
-            j2 = Int(_le16(data, huf_start + 2))
-            j3 = Int(_le16(data, huf_start + 4))
-            s1_start = huf_start + 6
-            s2_start = s1_start + j1
-            s3_start = s2_start + j2
-            s4_start = s3_start + j3
-            s4_end   = payload_end
-
-            # Each of the first 3 streams decodes ceil(regen_size/4) symbols; the last gets the remainder.
-            seg_n = (regen_size + 3) >> 2
-
-            rb1 = ReverseBitReader(data, s1_start, j1)
-            rb2 = ReverseBitReader(data, s2_start, j2)
-            rb3 = ReverseBitReader(data, s3_start, j3)
-            rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
-
-            # Dual-symbol interleaved decode.
-            # safe_n lookups fit in one refill (≥ 57 bits loaded, ≤ max_bits per lookup).
-            # safeendX = endX - 2*safe_n: the last position from which a full batch of
-            # safe_n dual-symbol lookups is guaranteed safe.  Each lookup writes pos and
-            # pos+1 unconditionally; the guard ensures pos+1 ≤ endX - 1 < endX, so the
-            # write never crosses into an adjacent segment.
-            # Phase 1: all 4 streams together.
-            # Phase 2: fixed pairs (1,2) and (3,4).
-            # Phase 3: whichever stream in each pair still has capacity runs single-stream.
-            # Phase 4: finish any remaining symbols with single-symbol decode.
-            safe_n = 57 ÷ ht.max_bits
-            o1 = 1; o2 = 1 + seg_n; o3 = 1 + 2seg_n; o4 = 1 + 3seg_n
-            end1 = seg_n; end2 = 2seg_n; end3 = 3seg_n; end4 = regen_size
-            safeend1 = end1 - 2safe_n; safeend2 = end2 - 2safe_n
-            safeend3 = end3 - 2safe_n; safeend4 = end4 - 2safe_n
-
-            while o1 ≤ safeend1 && o2 ≤ safeend2 &&
-                  o3 ≤ safeend3 && o4 ≤ safeend4
-                _rbr_refill!(rb1)
-                _rbr_refill!(rb2)
-                _rbr_refill!(rb3)
-                _rbr_refill!(rb4)
-                for _ in 1:safe_n
-                    o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-                    o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
-                    o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-                    o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
-                end
-            end
-
-            while o1 ≤ safeend1 && o2 ≤ safeend2
-                _rbr_refill!(rb1)
-                _rbr_refill!(rb2)
-                for _ in 1:safe_n
-                    o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-                    o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
-                end
-            end
-
-            while o3 ≤ safeend3 && o4 ≤ safeend4
-                _rbr_refill!(rb3)
-                _rbr_refill!(rb4)
-                for _ in 1:safe_n
-                    o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-                    o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
-                end
-            end
-
-            if o1 ≤ safeend1
-                while o1 ≤ safeend1
-                    _rbr_refill!(rb1)
-                    for _ in 1:safe_n
-                        o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-                    end
-                end
-            elseif o2 ≤ safeend2 # must check because possible to overshoot
-                while o2 ≤ safeend2
-                    _rbr_refill!(rb2)
-                    for _ in 1:safe_n
-                        o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
-                    end
-                end
-            end
-
-            if o3 ≤ safeend3
-                while o3 ≤ safeend3
-                    _rbr_refill!(rb3)
-                    for _ in 1:safe_n
-                        o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-                    end
-                end
-            elseif o4 ≤ safeend4 # must check because possible to overshoot
-                while o4 ≤ safeend4
-                    _rbr_refill!(rb4)
-                    for _ in 1:safe_n
-                        o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
-                    end
-                end
-            end
-
-            while o1 ≤ end1; @inbounds literals[o1] = huffman_decode!(rb1, ht); o1 += 1; end
-            while o2 ≤ end2; @inbounds literals[o2] = huffman_decode!(rb2, ht); o2 += 1; end
-            while o3 ≤ end3; @inbounds literals[o3] = huffman_decode!(rb3, ht); o3 += 1; end
-            while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
+            # 4 streams: dispatch to _decode_4streams! which specialises on
+            # HuffmanTable{L}, making safe_n = 57 ÷ L a compile-time constant.
+            _decode_4streams!(data, ht, literals, regen_size, huf_start, payload_end)
         end
 
         resize!(literals, regen_size + 15)  # keep wildcopy16 over-read slack; trim dual-symbol slack
