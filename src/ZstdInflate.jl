@@ -542,10 +542,9 @@ end
 # ============================================================
 
 struct HuffmanTable{L}
-    max_bits::Int
-    # Packed dual-symbol decode table indexed by the top max_bits of the peeked code word.
+    # Packed dual-symbol decode table indexed by the top L bits of the peeked code word.
     # Each UInt32 entry encodes up to two symbols:
-    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; ≤ max_bits)
+    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; ≤ L)
     #   bits [23:16]  nb1      — bits consumed by sym1 alone (needed for single-symbol path)
     #   bits [15: 8]  sym2     — second symbol (valid only when nb_total > nb1)
     #   bits [ 7: 0]  sym1     — first symbol (always valid)
@@ -614,12 +613,12 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
     end
 
-    return HuffmanTable{max_bits}(max_bits, dtable)
+    return HuffmanTable{max_bits}(dtable)
 end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
-@inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable)
-    idx      = _shr(rb.bits, 64 - ht.max_bits) % Int
+@inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
+    idx      = _shr(rb.bits, 64 - L) % Int
     e        = @inbounds ht.decode_table[idx + 1]
     nb1      = Int((e >> 16) & 0xFF)
     rb.bits  = _shl(rb.bits, nb1)
@@ -628,8 +627,8 @@ end
 end
 
 # Decode one Huffman symbol from the reverse bit reader.
-@inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable)
-    rb.nbits < ht.max_bits && _rbr_refill!(rb)
+@inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
+    rb.nbits < L && _rbr_refill!(rb)
     _huffman_decode_nocheck!(rb, ht)
 end
 
@@ -637,9 +636,9 @@ end
 # Writes sym1 and sym2 to out[pos] and out[pos+1] unconditionally (caller must
 # ensure out has one byte of slack past regen_size for the last-slot case).
 # Returns the number of symbols decoded (1 or 2).
-@inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable,
-                                           out::Vector{UInt8}, pos::Int)
-    idx      = _shr(rb.bits, 64 - ht.max_bits) % Int
+@inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L},
+                                           out::Vector{UInt8}, pos::Int) where L
+    idx      = _shr(rb.bits, 64 - L) % Int
     e        = @inbounds ht.decode_table[idx + 1]
     nb_total = Int(e >> 24)
     nb1      = Int((e >> 16) & 0xFF)
@@ -989,7 +988,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         # Leave as single-symbol (already correct from pass 1).
     end
 
-    return HuffmanTable{max_bits}(max_bits, dtable)
+    return HuffmanTable{max_bits}(dtable)
 end
 
 # Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
