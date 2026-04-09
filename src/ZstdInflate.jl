@@ -1419,8 +1419,13 @@ function execute_sequences!(
             end
         else
             if offset ≥ ml
-                # Non-overlapping match.
-                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
+                # Non-overlapping match.  For short copies, _wildcopy16! avoids the
+                # libc memcpy FFI call; for larger copies memcpy wins (wider SIMD).
+                if ml ≤ 64
+                    GC.@preserve out _wildcopy16!(pointer(out, wpos), pointer(out, match_pos), ml)
+                else
+                    GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
+                end
             elseif offset == 1
                 # Single-byte repeat: fill
                 @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
