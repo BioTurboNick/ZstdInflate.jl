@@ -30,97 +30,10 @@ using SIMD
 export inflate_zstd, InflateZstdStream, ZstdDict, parse_dictionary
 
 include("constants.jl")
-
-# Wrapping shift helpers: emit a single shift instruction on x86 without
-# Julia's default guards for shift ≥ 64.  Safe only when the caller knows
-# n ∈ [0, 63] (the hardware masks the count anyway; `& 63` just proves it
-# to LLVM so it drops the overflow branches).
-@inline _shl(x::UInt64, n::Int) = x << (n & 63)
-@inline _shr(x::UInt64, n::Int) = x >>> (n & 63)
+include("util.jl")
+include("xxhash.jl")
 
 
-# ============================================================
-# Section 2: xxHash-64  (RFC 8878 §3.1.5 — content checksum)
-#   Reference algorithm: https://cyan4973.github.io/xxHash/
-# ============================================================
-
-const XXH_P1 = 0x9E3779B185EBCA87
-const XXH_P2 = 0xC2B2AE3D27D4EB4F
-const XXH_P3 = 0x165667B19E3779F9
-const XXH_P4 = 0x85EBCA77C2B2AE63
-const XXH_P5 = 0x27D4EB2F165667C5
-
-@inline xxh_rotl64(x::Union{UInt64, Vec{4, UInt64}}, r) = (x << r) | (x >>> (64 - r))
-
-@inline function xxh_round(acc::T, lane::T) where T <: Union{UInt64, Vec{4, UInt64}}
-    acc += lane * XXH_P2
-    acc  = xxh_rotl64(acc, 31)
-    acc *= XXH_P1
-    return acc
-end
-
-@inline function xxh_merge(acc::T, val::T) where T <: Union{UInt64, Vec{4, UInt64}}
-    acc ⊻= xxh_round(T(0), val)
-    acc  = acc * XXH_P1 + XXH_P4
-    return acc
-end
-
-# Little-endian loads
-@inline _le64(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt64}(pointer(d, i))))
-@inline _le32(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt32}(pointer(d, i))))
-@inline _le16(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt16}(pointer(d, i))))
-
-function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
-    len = length(data)
-    pos = 1
-    local h64::UInt64
-
-    if len ≥ 32
-        rdata64 = reinterpret(UInt64, @view data[1:end - (end % 8)])
-        v1 = seed + XXH_P1 + XXH_P2
-        v2 = seed + XXH_P2
-        v3 = seed
-        v4 = seed - XXH_P1
-        while 8(pos - 1) + 32 ≤ len
-            vs = Vec{4, UInt64}((v1, v2, v3, v4))
-            vdata = vload(Vec{4, UInt64}, (@view rdata64[pos:pos + 3]), 1)
-            vs = xxh_round(vs, ltoh(vdata))
-            v1, v2, v3, v4 = NTuple{4, UInt64}(vs)
-            pos += 4
-        end
-        h64  = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) + xxh_rotl64(v3, 12) + xxh_rotl64(v4, 18)
-        h64  = xxh_merge(h64, v1)
-        h64  = xxh_merge(h64, v2)
-        h64  = xxh_merge(h64, v3)
-        h64  = xxh_merge(h64, v4)
-    else
-        h64 = seed + XXH_P5
-    end
-
-    h64 += UInt64(len)
-
-    while 8(pos - 1) + 8 ≤ len
-        rdata64 = reinterpret(UInt64, @view data[1:end - (end % 8)])
-        h64 ⊻= xxh_round(UInt64(0), ltoh(rdata64[pos])); pos += 1
-        h64  = xxh_rotl64(h64, 27) * XXH_P1 + XXH_P4
-    end
-    pos = 2 * (pos - 1) + 1
-    if 4(pos - 1) + 4 ≤ len
-        rdata32 = reinterpret(UInt32, @view data[1:end - (end % 4)])
-        h64 ⊻= UInt64(ltoh(rdata32[pos])) * XXH_P1; pos += 1
-        h64  = xxh_rotl64(h64, 23) * XXH_P2 + XXH_P3
-    end
-    pos = 4 * (pos - 1) + 1
-    while pos ≤ len
-        h64 ⊻= UInt64(data[pos]) * XXH_P5
-        h64  = xxh_rotl64(h64, 11) * XXH_P1; pos += 1
-    end
-
-    h64 ⊻= h64 >>> 33;  h64 *= XXH_P2
-    h64 ⊻= h64 >>> 29;  h64 *= XXH_P3
-    h64 ⊻= h64 >>> 32
-    return h64
-end
 
 # ============================================================
 # Section 3a: Forward bit reader  (LSB-first)
