@@ -38,7 +38,7 @@ function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
             vs = xxh_round(vs, ltoh(vdata))
             pos += 4
         end
-        h64 = sum(xxh_rotl64(vs, Vec{4, UInt64}((1, 7, 12, 18))))
+        h64 = sum(xxh_rotl64(vs, Vec{4, Int64}((1, 7, 12, 18))))
         h64 = xxh_merge(h64, vs[1])
         h64 = xxh_merge(h64, vs[2])
         h64 = xxh_merge(h64, vs[3])
