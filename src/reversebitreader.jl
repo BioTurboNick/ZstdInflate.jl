@@ -46,14 +46,14 @@ function refill!(rb::ReverseBitReader)
     if rb.pos ≥ 8
         # Load 8 bytes, zero out the lower bits that aren't needed yet, and shift into position
         raw = _le64(rb.data, rb.pos - 7)
-        mask = _shl(typemax(UInt64), 64 - 8nread)
-        rb.bits |= _shr(raw & mask, rb.nbits)
+        readmask = _shl(typemax(UInt64), 64 - 8nread)
+        rb.bits |= _shr(raw & readmask, rb.nbits)
     else
         # At start of data; load 8 bytes with zero padding, then shift into position
         raw = _le64(rb.data, 1)
-        mask = _shl(typemax(UInt64), 64 - 8nread)
-        mask = _shr(mask, 64 - 8rb.pos)
-        loaded = _shl(raw & mask, 64 - 8rb.pos)
+        readmask = _shl(typemax(UInt64), 64 - 8nread)
+        readmask = _shr(readmask, 64 - 8rb.pos)
+        loaded = _shl(raw & readmask, 64 - 8rb.pos)
         rb.bits |= _shr(loaded, rb.nbits)
     end
 
