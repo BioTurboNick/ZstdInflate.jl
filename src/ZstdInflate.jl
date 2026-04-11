@@ -131,7 +131,7 @@ function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
     nbits     = accuracy_log + 1
 
     while remaining > 1
-        br.nbits < nbits && _fbr_refill!(br)
+        br.nbits < nbits && refill!(br)
 
         # max = number of values encodable in the short (nbits-1 bit) path
         max_val = (2 * threshold - 1) - remaining
@@ -160,7 +160,7 @@ function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
         if count == 0
             # Zero-run: chained 2-bit repeat count (RFC 8878 §4.1.1)
             while true
-                br.nbits < 2 && _fbr_refill!(br)
+                br.nbits < 2 && refill!(br)
                 r = Int(br.bits & 3)
                 br.bits  >>>= 2
                 br.nbits  -= 2
@@ -206,20 +206,20 @@ end
 # ------- FSE state machine helpers -------
 
 @inline fse_init!(rb::ReverseBitReader, t::FSETable) =
-    Int(read_bits_r!(rb, t.accuracy_log))
+    Int(read_bits!(rb, t.accuracy_log))
 
 @inline fse_peek(t::FSETable, state::Int) = Int(t.symbols[state+1])
 
 @inline function fse_update!(rb::ReverseBitReader, t::FSETable, state::Int)
     nb   = Int(t.nb_bits[state+1])
-    bits = Int(read_bits_r!(rb, nb))
+    bits = Int(read_bits!(rb, nb))
     return Int(t.baselines[state+1]) + bits
 end
 
 # RLE variants — accuracy_log is always 1, both states emit the same symbol,
 # and transitions consume 0 bits.
 @inline fse_init!(rb::ReverseBitReader, t::RLEFSETable) =
-    (read_bits_r!(rb, 1); 0)   # consume the 1-bit state init, state is always 0
+    (read_bits!(rb, 1); 0)   # consume the 1-bit state init, state is always 0
 
 @inline fse_peek(t::RLEFSETable, state::Int) = Int(t.symbol)
 
@@ -236,7 +236,7 @@ end
 # Update without checking for underflow (allows overflow detection after).
 @inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSETable, state::Int)
     nb   = Int(t.nb_bits[state+1])
-    bits = Int(_read_bits_r_unchecked!(rb, nb))
+    bits = Int(_read_bits_unchecked!(rb, nb))
     return Int(t.baselines[state+1]) + bits
 end
 
@@ -467,8 +467,8 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int)
         # FSE-compressed weights: header = compressed_size
         compressed_size = header
         # Forward bit reader over the compressed bytes
-        br = ForwardBitReader(data, pos + 1, pos + compressed_size + 1)
-        weights = _decode_fse_weights(br, pos + compressed_size)
+        br = ForwardBitReader(@view data[pos+1:pos+compressed_size])
+        weights = _decode_fse_weights(br, compressed_size)
         last_sym, last_w, table_log = _infer_last_weight(weights)
         push!(weights, UInt8(last_w))
         ht = build_huffman_table(weights, table_log)
@@ -543,7 +543,7 @@ function parse_dictionary(raw::Vector{UInt8})
     pos += hdr_len
 
     # 2. FSE table for offsets
-    br = ForwardBitReader(raw, pos, length(raw) + 1)
+    br = ForwardBitReader(@view raw[pos:end])
     of_al, of_dist = read_fse_dist!(br, MAX_OFFSET_CODE)
     of_tab = build_fse_table(of_dist, of_al)
 
@@ -765,8 +765,8 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int, state::Decompre
     header = Int(data[pos])
     if header < 128
         compressed_size = header
-        br = ForwardBitReader(data, pos + 1, pos + compressed_size + 1)
-        weights = _decode_fse_weights(br, pos + compressed_size, state.huf_weights)
+        br = ForwardBitReader(@view data[pos+1:pos+compressed_size])
+        weights = _decode_fse_weights(br, compressed_size, state.huf_weights)
         last_sym, last_w, table_log = _infer_last_weight(weights)
         push!(weights, UInt8(last_w))
         ht = build_huffman_table(weights, table_log, state)
@@ -1218,7 +1218,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     of_mode = (modes_byte >> 4) & 0x03
     ml_mode = (modes_byte >> 2) & 0x03
 
-    br = ForwardBitReader(data, pos, limit + 1)
+    br = ForwardBitReader(@view data[pos:limit])
     ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
                              state.ll_slot, state)
     of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
@@ -1259,7 +1259,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
         # 2+3 batched: precompute all six bit widths, then extract all from
         # the same frozen bit word.  This breaks the 6-deep serial dependency
-        # chain (each read_bits_r! currently gates the next via rb.bits).
+        # chain (each read_bits! currently gates the next via rb.bits).
         #
         # All widths are known before any bit is consumed, so the CPU can
         # issue the six extractions and the cumulative-offset additions in
@@ -1303,12 +1303,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
         else
             # Slow path: large offset (of_code > ~20); sequential reads.
-            of_extra   = (of_n  > 0) ? Int(read_bits_r!(rb, of_n )) : 0
-            ml_extra   = Int(read_bits_r!(rb, ml_n))
-            ll_extra   = Int(read_bits_r!(rb, ll_n))
-            ll_bits    = (ll_nb > 0) ? Int(read_bits_r!(rb, ll_nb)) : 0
-            ml_bits    = (ml_nb > 0) ? Int(read_bits_r!(rb, ml_nb)) : 0
-            of_bits    = (of_nb > 0) ? Int(read_bits_r!(rb, of_nb)) : 0
+            of_extra   = (of_n  > 0) ? Int(read_bits!(rb, of_n )) : 0
+            ml_extra   = Int(read_bits!(rb, ml_n))
+            ll_extra   = Int(read_bits!(rb, ll_n))
+            ll_bits    = (ll_nb > 0) ? Int(read_bits!(rb, ll_nb)) : 0
+            ml_bits    = (ml_nb > 0) ? Int(read_bits!(rb, ml_nb)) : 0
+            of_bits    = (of_nb > 0) ? Int(read_bits!(rb, of_nb)) : 0
         end
 
         of_val64 = (Int64(1) << of_code) + of_extra

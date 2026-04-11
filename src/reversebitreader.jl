@@ -82,7 +82,7 @@ function _refill_bytewise!(rb::ReverseBitReader)
     return
 end
 
-@inline function read_bits_r!(rb::ReverseBitReader, n::Int)
+@inline function read_bits!(rb::ReverseBitReader, n::Int)
     n == 0 &&
         return UInt64(0)
     rb.nbits < n &&
@@ -98,7 +98,7 @@ end
 # Read n bits without checking for underflow (allows nbits to go negative).
 # Used by the interleaved FSE weight decoder tail loop where overflow is
 # detected after the read rather than before.
-@inline function _read_bits_r_unchecked!(rb::ReverseBitReader, n::Int)
+@inline function _read_bits_unchecked!(rb::ReverseBitReader, n::Int)
     n == 0 &&
         return UInt64(0)
     refill!(rb)
