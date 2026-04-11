@@ -26,16 +26,12 @@ function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
     bits = UInt64(valid_bits) << (64 - nbits)
 
     rb = ReverseBitReader{T}(data, length(data) - 1, bits, nbits)
-    _first_refill!(rb)
-    return rb
-end
-
-function _first_refill!(rb::ReverseBitReader)
     if length(rb.data) ≤ 8
         _refill_bytewise!(rb)
     else
         refill!(rb)
     end
+    return rb
 end
 
 function refill!(rb::ReverseBitReader)
