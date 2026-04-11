@@ -16,9 +16,9 @@ end
 
 function refill!(br::ForwardBitReader)
     while br.nbits ≤ 56 && br.pos ≤ length(br.data)
-        br.bits  |= _shl(UInt64(br.data[br.pos]), br.nbits)
+        br.bits |= _shl(UInt64(br.data[br.pos]), br.nbits)
         br.nbits += 8
-        br.pos   += 1
+        br.pos += 1
     end
 end
 
