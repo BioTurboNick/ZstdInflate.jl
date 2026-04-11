@@ -35,12 +35,20 @@ end
 
 ### Dictionaries
 
-```julia
-dict = ZstdDict(dict_data::Vector{UInt8})
-# or
-dict = parse_dictionary(dict_data::Vector{UInt8})
+Parse the dictionary once, then pass it to any decompression call:
 
-data = inflate_zstd(compressed, dict=dict)
+```julia
+dict_bytes = read("my.dict")
+dict = parse(ZstdDict, dict_bytes)                        # auto-detects structured vs raw content
+# or: parse(ZstdDict, dict_bytes; raw_content=true)       # force raw content mode
+
+data   = inflate_zstd(compressed; dict=dict)
+text   = inflate_zstd("file.zst"; dict=dict)
+
+open("file.zst") do io
+    stream = InflateZstdStream(io; dict=dict)
+    data = read(stream)
+end
 ```
 
 ## Acknowledgements

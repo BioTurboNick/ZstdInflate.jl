@@ -254,14 +254,15 @@ end
         end
     end
 
-    d = parse_dictionary(dict_buf)
+    d = parse(ZstdDict, dict_buf)
 
     # Basic roundtrip
     data = Vector{UInt8}("The quick brown fox jumps over the lazy dog. Sample #501.")
     @test inflate_zstd(compress_with_dict(data, dict_buf); dict=d) == data
 
-    # Passing raw dict bytes (auto-parsed)
-    @test inflate_zstd(compress_with_dict(data, dict_buf); dict=dict_buf) == data
+    # Raw content dictionary (explicit)
+    raw_dict = parse(ZstdDict, dict_buf; raw_content=true)
+    @test raw_dict isa ZstdDict
 
     # Multiple test strings
     for i in 501:510

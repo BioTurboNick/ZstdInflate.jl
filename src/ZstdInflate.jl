@@ -36,7 +36,7 @@ include("fse.jl")
 include("huffman.jl")
 include("dictionary.jl")
 
-export inflate_zstd, InflateZstdStream, ZstdDict, parse_dictionary
+export inflate_zstd, InflateZstdStream, ZstdDict
 
 
 const _LL_TABLE = Ref{FSETable}()
@@ -1172,14 +1172,13 @@ or a single-frame input the existing serial path is taken unchanged.
 
 `nthreads` must be ≥ 1; passing 0 or negative throws `ArgumentError`.
 
-If the frame was compressed with a dictionary, pass it as `dict` — either
-a `ZstdDict` returned by [`parse_dictionary`](@ref), or the raw dictionary
-bytes (`Vector{UInt8}`).
+If the frame was compressed with a dictionary, pass a `ZstdDict` as `dict`.
+Use `Base.parse(ZstdDict, bytes)` to construct one from raw bytes.
 """
-function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
+function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Nothing}=nothing, nthreads::Int=Threads.nthreads())
     nthreads ≥ 1 || throw(ArgumentError("zstd: nthreads must be ≥ 1, got $nthreads"))
     isempty(data) && throw(ArgumentError("zstd: empty input"))
-    d = dict isa Vector{UInt8} ? parse_dictionary(dict) : dict
+    d = dict
 
     # Parallel path: only when nthreads ≥ 2 and there are ≥ 2 independent frames.
     # _scan_frames is O(compressed size) but reads only header/block-header bytes.
@@ -1233,7 +1232,7 @@ end
 
 Read a `.zst` file and return the decompressed content as a `String`.
 """
-function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
+function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Nothing}=nothing, nthreads::Int=Threads.nthreads())
     data = read(filename)
     String(inflate_zstd(data; dict=dict, nthreads=nthreads))
 end
@@ -1250,15 +1249,15 @@ Create a readable stream that decompresses Zstandard data from `io`.
 The stream reads all compressed data at construction time; subsequent
 reads deliver decompressed bytes.
 
-If the data was compressed with a dictionary, pass it as `dict` — either
-a `ZstdDict` or raw dictionary bytes (`Vector{UInt8}`).
+If the data was compressed with a dictionary, pass a `ZstdDict` as `dict`.
+Use `Base.parse(ZstdDict, bytes)` to construct one from raw bytes.
 """
 mutable struct InflateZstdStream <: IO
     buf::Vector{UInt8}
     pos::Int
 end
 
-function InflateZstdStream(io::IO; dict::Union{ZstdDict,Vector{UInt8},Nothing}=nothing, nthreads::Int=Threads.nthreads())
+function InflateZstdStream(io::IO; dict::Union{ZstdDict,Nothing}=nothing, nthreads::Int=Threads.nthreads())
     compressed = read(io)
     decompressed = inflate_zstd(compressed; dict=dict, nthreads=nthreads)
     InflateZstdStream(decompressed, 1)

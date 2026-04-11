@@ -5,26 +5,37 @@
 
 struct ZstdDict
     id      ::UInt32
-    huffman ::Union{HuffmanTable,Nothing}
-    of_tab  ::Union{FSETable,Nothing}
-    ml_tab  ::Union{FSETable,Nothing}
-    ll_tab  ::Union{FSETable,Nothing}
+    huffman ::Union{HuffmanTable, Nothing}
+    of_tab  ::Union{FSETable, Nothing}
+    ml_tab  ::Union{FSETable, Nothing}
+    ll_tab  ::Union{FSETable, Nothing}
     rep     ::NTuple{3,Int}
     content ::Vector{UInt8}
 end
 
 """
-    parse_dictionary(raw::Vector{UInt8}) -> ZstdDict
+    Base.parse(ZstdDict, raw::Vector{UInt8}; raw_content::Bool=false) -> ZstdDict
 
-Parse a Zstandard dictionary (RFC 8878 §5).  Accepts both structured
-dictionaries (magic `0xEC30A437`) and raw content dictionaries.
+Parse a Zstandard dictionary (RFC 8878 §5).
+
+When `raw_content=false` (the default), the magic number `0xEC30A437` is
+checked: if present the dictionary is parsed as a structured dictionary
+(with entropy tables and repeat offsets); if absent it is treated as a raw
+content dictionary.
+
+When `raw_content=true`, the bytes are always treated as a raw content
+dictionary regardless of their contents — no magic check is performed.
 """
-function parse_dictionary(raw::Vector{UInt8})
+function Base.parse(::Type{ZstdDict}, raw::Vector{UInt8}; raw_content::Bool=false)
+    length(raw) ≥ 1 || throw(ArgumentError("zstd: dictionary too short"))
+    if raw_content
+        return ZstdDict(UInt32(0), nothing, nothing, nothing, nothing, INIT_REPEAT_OFFSETS, raw)
+    end
     length(raw) ≥ 8 || throw(ArgumentError("zstd: dictionary too short"))
     magic = UInt32(raw[1]) | (UInt32(raw[2]) << 8) |
             (UInt32(raw[3]) << 16) | (UInt32(raw[4]) << 24)
     if magic != ZSTD_DICT_MAGIC
-        # Raw content dictionary: no entropy tables, default repeat offsets
+        # Auto mode: no magic → raw content dictionary
         return ZstdDict(UInt32(0), nothing, nothing, nothing, nothing, INIT_REPEAT_OFFSETS, raw)
     end
 
