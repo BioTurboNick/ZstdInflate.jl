@@ -284,23 +284,19 @@ end
 # function per distinct L and LLVM unrolls the constant-bound inner loops.
 # Called via dynamic dispatch from read_literals — one indirect call per
 # outer (refill) iteration, not per symbol.
-function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
-                            literals::Vector{UInt8}, regen_size::Int,
-                            huf_start::Int, payload_end::Int) where L
-    j1 = Int(_le16(data, huf_start))
-    j2 = Int(_le16(data, huf_start + 2))
-    j3 = Int(_le16(data, huf_start + 4))
-    s1_start = huf_start + 6
-    s2_start = s1_start + j1
-    s3_start = s2_start + j2
-    s4_start = s3_start + j3
-    s4_end   = payload_end
+function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
+                            literals::Vector{UInt8}, regen_size::Int) where L
+    s1_start = 7
+    s2_start = s1_start + Int(_le16(data, 1))
+    s3_start = s2_start + Int(_le16(data, 3))
+    s4_start = s3_start + Int(_le16(data, 5))
+    s4_end = length(data)
 
     seg_n = (regen_size + 3) >> 2
 
-    rb1 = ReverseBitReader(@view data[s1_start:s1_start+j1-1])
-    rb2 = ReverseBitReader(@view data[s2_start:s2_start+j2-1])
-    rb3 = ReverseBitReader(@view data[s3_start:s3_start+j3-1])
+    rb1 = ReverseBitReader(@view data[s1_start:s2_start-1])
+    rb2 = ReverseBitReader(@view data[s2_start:s3_start-1])
+    rb3 = ReverseBitReader(@view data[s3_start:s4_start-1])
     rb4 = ReverseBitReader(@view data[s4_start:s4_end])
 
     # Dual-symbol interleaved decode.
@@ -314,13 +310,20 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
     # Phase 3: whichever stream in each pair still has capacity runs single-stream.
     # Phase 4: finish any remaining symbols with single-symbol decode.
     safe_n = 57 ÷ L  # compile-time constant: L is a type parameter
-    o1 = 1; o2 = 1 + seg_n; o3 = 1 + 2seg_n; o4 = 1 + 3seg_n
-    end1 = seg_n; end2 = 2seg_n; end3 = 3seg_n; end4 = regen_size
-    safeend1 = end1 - 2safe_n; safeend2 = end2 - 2safe_n
-    safeend3 = end3 - 2safe_n; safeend4 = end4 - 2safe_n
+    o1 = 1
+    o2 = 1 + seg_n
+    o3 = 1 + 2seg_n
+    o4 = 1 + 3seg_n
+    end1 = seg_n
+    end2 = 2seg_n
+    end3 = 3seg_n
+    end4 = regen_size
+    safeend1 = end1 - 2safe_n
+    safeend2 = end2 - 2safe_n
+    safeend3 = end3 - 2safe_n
+    safeend4 = end4 - 2safe_n
 
-    while o1 ≤ safeend1 && o2 ≤ safeend2 &&
-          o3 ≤ safeend3 && o4 ≤ safeend4
+    while o1 ≤ safeend1 && o2 ≤ safeend2 && o3 ≤ safeend3 && o4 ≤ safeend4
         refill!(rb1)
         refill!(rb2)
         refill!(rb3)
@@ -387,6 +390,8 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
     while o2 ≤ end2; @inbounds literals[o2] = huffman_decode!(rb2, ht); o2 += 1; end
     while o3 ≤ end3; @inbounds literals[o3] = huffman_decode!(rb3, ht); o3 += 1; end
     while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
+
+    return
 end
 
 # Read the literals section starting at data[pos].
