@@ -3,95 +3,90 @@
 #   Used for encoded data bitstreams (literals, sequences)
 # ============================================================
 
-mutable struct ReverseBitReader
-    data::Vector{UInt8}
-    start::Int     # first valid byte of this slice (1-indexed)
-    pos::Int       # next byte to load (decreasing, 1-indexed)
-    bits::UInt64   # bit buffer; bit 63 is the next bit to deliver
-    nbits::Int     # number of valid bits currently in buffer
+mutable struct ReverseBitReader{T <: AbstractVector{UInt8}}
+    data::T
+    pos::Int     # next byte to load (decreasing, 1-indexed)
+    bits::UInt64 # bit buffer; MSB is the next bit to deliver
+    nbits::Int   # number of valid bits currently in buffer
 end
 
-function ReverseBitReader(data::Vector{UInt8}, byte_offset::Int, byte_len::Int)
-    byte_len  > 0 || throw(ArgumentError("zstd: empty reverse bitstream"))
-    last       = data[byte_offset + byte_len - 1]
-    last != 0  || throw(ArgumentError("zstd: reverse bitstream sentinel byte is zero"))
+# Expects the last byte to contain at least one set bit, which indicates the end of the bitstream.
+function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
+    isempty(data) &&
+        throw(ArgumentError("zstd: empty reverse bitstream"))
+    lastbyte = data[end]
+    lastbyte != 0 ||
+        throw(ArgumentError("zstd: reverse bitstream sentinel byte is zero"))
 
-    # Position of the sentinel bit (0 = LSB, 7 = MSB)
-    sentinel   = 63 - leading_zeros(UInt64(last))   # highest set bit of last byte
-
-    # Valid data bits sit below the sentinel: bits [0, sentinel-1]
-    valid_n    = sentinel                            # may be 0 if last == 1
-    valid_bits = UInt64(last) & ((valid_n > 0) ? ((UInt64(1) << valid_n) - UInt64(1)) : UInt64(0))
+    # Read and clear sentinel bit
+    nbits = 7 - leading_zeros(lastbyte)
+    valid_bits = lastbyte ⊻ (UInt8(1) << nbits)
 
     # Pack into the MSB region of the 64-bit container
-    bits  = (valid_n > 0) ? (valid_bits << (64 - valid_n)) : UInt64(0)
-    nbits = valid_n
+    bits = UInt64(valid_bits) << (64 - nbits)
 
-    rb = ReverseBitReader(data, byte_offset, byte_offset + byte_len - 2, bits, nbits)
-    _rbr_refill!(rb)
+    rb = ReverseBitReader{T}(data, length(data) - 1, bits, nbits)
+    _first_refill!(rb)
     return rb
 end
 
-
-function _rbr_refill!(rb::ReverseBitReader)
-    n0 = rb.nbits
-    n0 > 56 && return
-    pos   = rb.pos
-    avail = pos - rb.start + 1
-    avail ≤ 0 && return
-
-    k = min(((57 - n0) + 7) >> 3, avail)
-
-    if pos ≥ 8
-        # Fast path: single 8-byte load.  data[pos-7..pos] is read as big-endian
-        # so data[pos] (the next byte to consume) lands in the MSB.  Shifting
-        # right by n0 positions the new bytes just below the existing valid bits.
-        # We mask off extra loaded bytes beyond k so they don't contaminate the
-        # lower bit region (which must stay zero for the next refill's OR).
-        raw = _le64(rb.data, pos - 7)
-        # Zero out everything below the k bytes we need: keep top 8k bits of raw
-        cleaned = raw & _shl(typemax(UInt64), 64 - 8k)
-        rb.bits |= _shr(cleaned, n0)
+function _first_refill!(rb::ReverseBitReader)
+    if length(rb.data) ≤ 8
+        _refill_bytewise!(rb)
     else
-        # Near start of data (pos < 8): byte-by-byte fallback.
-        # Happens at most once per stream so performance is not critical.
-        s = 56 - n0
-        a = rb.bits
-        b = UInt64(0)
-        @inbounds begin
-            k ≥ 1 && (a |= _shl(UInt64(rb.data[pos    ]), s      ))
-            k ≥ 2 && (b |= _shl(UInt64(rb.data[pos - 1]), s -  8 ))
-            k ≥ 3 && (a |= _shl(UInt64(rb.data[pos - 2]), s - 16 ))
-            k ≥ 4 && (b |= _shl(UInt64(rb.data[pos - 3]), s - 24 ))
-            k ≥ 5 && (a |= _shl(UInt64(rb.data[pos - 4]), s - 32 ))
-            k ≥ 6 && (b |= _shl(UInt64(rb.data[pos - 5]), s - 40 ))
-            k ≥ 7 && (a |= _shl(UInt64(rb.data[pos - 6]), s - 48 ))
-        end
-        rb.bits = a | b
+        refill!(rb)
+    end
+end
+
+function refill!(rb::ReverseBitReader)
+    length(rb.data) > 8 || # Streams this short are already depleted after initialization
+        return
+    navail = rb.pos
+    (navail > 0 && rb.nbits < 57) ||
+        return
+
+    nread = min((64 - rb.nbits) >> 3, navail)
+
+    if rb.pos ≥ 8
+        # Load 8 bytes, zero out the lower bits that aren't needed yet, and shift into position
+        raw = _le64(rb.data, rb.pos - 7)
+        mask = _shl(typemax(UInt64), 64 - 8nread)
+        rb.bits |= _shr(raw & mask, rb.nbits)
+    else
+        # At start of data; load 8 bytes with zero padding, then shift into position
+        raw = _le64(rb.data, 1)
+        mask = _shl(typemax(UInt64), 64 - 8nread)
+        mask = _shr(mask, 64 - 8rb.pos)
+        loaded = _shl(raw & mask, 64 - 8rb.pos)
+        rb.bits |= _shr(loaded, rb.nbits)
     end
 
-    rb.nbits = n0 + 8k
-    rb.pos   = pos - k
+    rb.nbits += 8nread
+    rb.pos -= nread
+    return
+end
 
-    # FUTURE OPTIMISATION — "consumed counter" model (zstd reference style):
-    #
-    # Switching to a "bits_consumed" counter would make refills O(1):
-    #
-    #   ptr          -= bits_consumed >> 3   # skip fully-consumed bytes
-    #   bitContainer  = load64(ptr)
-    #   bits_consumed &= 7                   # keep the partial-byte remainder
-    #
-    # This would give 60–64 valid bits per refill instead of 57, increasing
-    # safe_n and reducing refill frequency.  The change requires updating
-    # ReverseBitReader (add bits_consumed field, remove nbits), and adjusting
-    # every consumer to use `(rb.bits << rb.bits_consumed) >>> (64 - n)`.
+function _refill_bytewise!(rb::ReverseBitReader)
+    navail = rb.pos
+    (navail > 0 && rb.nbits < 57) ||
+        return
+
+    nread = min((64 - rb.nbits) >> 3, navail)
+
+    s = 56 - rb.nbits
+    for i in 0:nread - 1
+        rb.bits |= _shl(UInt64(rb.data[rb.pos - i]), s - 8i)
+    end
+    rb.nbits += 8nread
+    rb.pos -= nread
+    return
 end
 
 @inline function read_bits_r!(rb::ReverseBitReader, n::Int)
     n == 0 &&
         return UInt64(0)
     rb.nbits < n &&
-        _rbr_refill!(rb)
+        refill!(rb)
     rb.nbits ≥ n ||
         throw(ArgumentError("zstd: unexpected end of reverse bitstream"))
     val = _shr(rb.bits, 64 - n)
@@ -106,7 +101,7 @@ end
 @inline function _read_bits_r_unchecked!(rb::ReverseBitReader, n::Int)
     n == 0 &&
         return UInt64(0)
-    _rbr_refill!(rb)
+    refill!(rb)
     val = _shr(rb.bits, 64 - n)
     rb.bits <<= n
     rb.nbits -= n

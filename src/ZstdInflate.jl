@@ -357,7 +357,7 @@ end
 
 # Decode one Huffman symbol from the reverse bit reader.
 @inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
-    rb.nbits < L && _rbr_refill!(rb)
+    rb.nbits < L && refill!(rb)
     _huffman_decode_nocheck!(rb, ht)
 end
 
@@ -420,7 +420,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
     n_remain  = byte_limit - pos_after + 1
     n_remain > 0 || throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
 
-    rb = ReverseBitReader(br.data, pos_after, n_remain)
+    rb = ReverseBitReader(@view br.data[pos_after:pos_after+n_remain-1])
 
     # Init two interleaved states
     state1 = fse_init!(rb, t)
@@ -729,7 +729,7 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vec
     n_remain  = byte_limit - pos_after + 1
     n_remain > 0 || throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
 
-    rb = ReverseBitReader(br.data, pos_after, n_remain)
+    rb = ReverseBitReader(@view br.data[pos_after:pos_after+n_remain-1])
 
     state1 = fse_init!(rb, t)
     state2 = fse_init!(rb, t)
@@ -815,10 +815,10 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
 
     seg_n = (regen_size + 3) >> 2
 
-    rb1 = ReverseBitReader(data, s1_start, j1)
-    rb2 = ReverseBitReader(data, s2_start, j2)
-    rb3 = ReverseBitReader(data, s3_start, j3)
-    rb4 = ReverseBitReader(data, s4_start, s4_end - s4_start + 1)
+    rb1 = ReverseBitReader(@view data[s1_start:s1_start+j1-1])
+    rb2 = ReverseBitReader(@view data[s2_start:s2_start+j2-1])
+    rb3 = ReverseBitReader(@view data[s3_start:s3_start+j3-1])
+    rb4 = ReverseBitReader(@view data[s4_start:s4_end])
 
     # Dual-symbol interleaved decode.
     # safe_n lookups fit in one refill (≥ 57 bits loaded, ≤ max_bits per lookup).
@@ -838,10 +838,10 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
 
     while o1 ≤ safeend1 && o2 ≤ safeend2 &&
           o3 ≤ safeend3 && o4 ≤ safeend4
-        _rbr_refill!(rb1)
-        _rbr_refill!(rb2)
-        _rbr_refill!(rb3)
-        _rbr_refill!(rb4)
+        refill!(rb1)
+        refill!(rb2)
+        refill!(rb3)
+        refill!(rb4)
         for _ in 1:safe_n
             o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
             o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
@@ -851,8 +851,8 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
     end
 
     while o1 ≤ safeend1 && o2 ≤ safeend2
-        _rbr_refill!(rb1)
-        _rbr_refill!(rb2)
+        refill!(rb1)
+        refill!(rb2)
         for _ in 1:safe_n
             o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
             o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
@@ -860,8 +860,8 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
     end
 
     while o3 ≤ safeend3 && o4 ≤ safeend4
-        _rbr_refill!(rb3)
-        _rbr_refill!(rb4)
+        refill!(rb3)
+        refill!(rb4)
         for _ in 1:safe_n
             o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
             o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
@@ -870,14 +870,14 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
 
     if o1 ≤ safeend1
         while o1 ≤ safeend1
-            _rbr_refill!(rb1)
+            refill!(rb1)
             for _ in 1:safe_n
                 o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
             end
         end
     elseif o2 ≤ safeend2 # must check because possible to overshoot
         while o2 ≤ safeend2
-            _rbr_refill!(rb2)
+            refill!(rb2)
             for _ in 1:safe_n
                 o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
             end
@@ -886,14 +886,14 @@ function _decode_4streams!(data::Vector{UInt8}, ht::HuffmanTable{L},
 
     if o3 ≤ safeend3
         while o3 ≤ safeend3
-            _rbr_refill!(rb3)
+            refill!(rb3)
             for _ in 1:safe_n
                 o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
             end
         end
     elseif o4 ≤ safeend4 # must check because possible to overshoot
         while o4 ≤ safeend4
-            _rbr_refill!(rb4)
+            refill!(rb4)
             for _ in 1:safe_n
                 o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
             end
@@ -994,7 +994,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
 
         if num_streams == 1
             stream_len = payload_end - huf_start + 1
-            rb = ReverseBitReader(data, huf_start, stream_len)
+            rb = ReverseBitReader(@view data[huf_start:huf_start+stream_len-1])
             for i in 1:regen_size
                 @inbounds literals[i] = UInt8(huffman_decode!(rb, ht))
             end
@@ -1235,7 +1235,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     seq_len   = limit - seq_start + 1
     seq_len > 0 || throw(ArgumentError("zstd: no data for sequences bitstream"))
 
-    rb = ReverseBitReader(data, seq_start, seq_len)
+    rb = ReverseBitReader(@view data[seq_start:seq_start+seq_len-1])
 
     # Init FSE states: order is LL, OF, ML (RFC 8878 §3.1.1.3.3.4)
     ll_state = fse_init!(rb, ll_tab)
@@ -1278,7 +1278,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
         if total_n ≤ 57
             # Fast path: a single refill guarantees ≥ 57 bits available.
-            rb.nbits < total_n && _rbr_refill!(rb)
+            rb.nbits < total_n && refill!(rb)
             rb.nbits ≥ total_n || throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
 
             # Cumulative bit offsets into the frozen snapshot
