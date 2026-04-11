@@ -36,7 +36,6 @@ const MATCH_LENGTH_EXTRA_BITS = UInt8[
 
 const MAX_OFFSET_CODE = 31 # Free to choose, minimum recommended is 22, reference uses 31
 
-
 # Default Distributions (RFC 8878 §3.1.1.3.2.2)
 
 const LITERALS_LENGTH_ACCURACY_LOG = 6
@@ -45,6 +44,7 @@ const LITERALS_LENGTH_DEFAULT_DIST = Int16[
      2,  2,  2,  2,  2,  2,  2,  2,  2,  3,  2,  1,  1,  1,  1,  1,
     -1, -1, -1, -1
 ]
+const DEFAULT_LL_TABLE = build_fse_table(LITERALS_LENGTH_DEFAULT_DIST, LITERALS_LENGTH_ACCURACY_LOG)
 
 const MATCH_LENGTH_ACCURACY_LOG = 6
 const MATCH_LENGTH_DEFAULT_DIST = Int16[
@@ -53,12 +53,14 @@ const MATCH_LENGTH_DEFAULT_DIST = Int16[
      1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1, -1, -1,
     -1, -1, -1, -1, -1
 ]
+const DEFAULT_ML_TABLE = build_fse_table(MATCH_LENGTH_DEFAULT_DIST, MATCH_LENGTH_ACCURACY_LOG)
 
 const OFFSET_ACCURACY_LOG = 5
 const OFFSET_DEFAULT_DIST = Int16[
     1,  1,  1,  1,  1,  1,  2,  2,  2,  1,  1,  1,  1,  1,  1,  1,
     1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1
 ]
+const DEFAULT_OFFSET_TABLE = build_fse_table(OFFSET_DEFAULT_DIST, OFFSET_ACCURACY_LOG)
 
 
 # Initial repeat offsets (RFC 8878 §3.1.1.5)

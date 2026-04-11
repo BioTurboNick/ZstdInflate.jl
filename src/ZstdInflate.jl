@@ -27,7 +27,6 @@ module ZstdInflate
 
 using SIMD
 
-include("constants.jl")
 include("util.jl")
 include("xxhash.jl")
 include("forwardbitreader.jl")
@@ -35,19 +34,9 @@ include("reversebitreader.jl")
 include("fse.jl")
 include("huffman.jl")
 include("dictionary.jl")
+include("constants.jl")
 
 export inflate_zstd, InflateZstdStream, ZstdDict
-
-
-const _LL_TABLE = Ref{FSETable}()
-const _ML_TABLE = Ref{FSETable}()
-const _OF_TABLE = Ref{FSETable}()
-
-function __init__()
-    _LL_TABLE[] = build_fse_table(LITERALS_LENGTH_DEFAULT_DIST, LITERALS_LENGTH_ACCURACY_LOG)
-    _ML_TABLE[] = build_fse_table(MATCH_LENGTH_DEFAULT_DIST, MATCH_LENGTH_ACCURACY_LOG)
-    _OF_TABLE[] = build_fse_table(OFFSET_DEFAULT_DIST, OFFSET_ACCURACY_LOG)
-end
 
 
 # ============================================================
@@ -707,11 +696,11 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     ml_mode = (modes_byte >> 2) & 0x03
 
     br = ForwardBitReader(@view data[pos:limit])
-    ll_tab = read_fse_table!(br, _LL_TABLE[], state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
+    ll_tab = read_fse_table!(br, DEFAULT_LL_TABLE, state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
                              state.ll_slot, state)
-    of_tab = read_fse_table!(br, _OF_TABLE[], state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
+    of_tab = read_fse_table!(br, DEFAULT_OF_TABLE, state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
                              state.of_slot, state)
-    ml_tab = read_fse_table!(br, _ML_TABLE[], state.ml_tab, ml_mode, MAX_MATCH_LENGTH, 9,
+    ml_tab = read_fse_table!(br, DEFAULT_ML_TABLE, state.ml_tab, ml_mode, MAX_MATCH_LENGTH, 9,
                              state.ml_slot, state)
     state.ll_tab = ll_tab
     state.of_tab = of_tab
