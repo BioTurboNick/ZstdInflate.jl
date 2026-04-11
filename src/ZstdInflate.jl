@@ -489,7 +489,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         else
             # 4 streams: dispatch to _decode_4streams! which specialises on
             # HuffmanTable{L}, making safe_n = 57 ÷ L a compile-time constant.
-            _decode_4streams!(data, ht, literals, regen_size, huf_start, payload_end)
+            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
         end
 
         resize!(literals, regen_size + 15)  # keep wildcopy16 over-read slack; trim dual-symbol slack
