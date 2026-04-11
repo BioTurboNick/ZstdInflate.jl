@@ -767,12 +767,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
             # All six extractions read from `bits` independently — ILP-friendly.
             bits     = rb.bits
-            of_extra = (of_n  > 0) ? Int(bits              >>> (64 - of_n )) : 0
-            ml_extra = (ml_n  > 0) ? Int((bits << c_ml)    >>> (64 - ml_n )) : 0
-            ll_extra = (ll_n  > 0) ? Int((bits << c_ll)    >>> (64 - ll_n )) : 0
-            ll_bits  = (ll_nb > 0) ? Int((bits << c_llb)   >>> (64 - ll_nb)) : 0
-            ml_bits  = (ml_nb > 0) ? Int((bits << c_mlb)   >>> (64 - ml_nb)) : 0
-            of_bits  = (of_nb > 0) ? Int((bits << c_ofb)   >>> (64 - of_nb)) : 0
+            of_extra = Int(bits              >>> (64 - of_n ))
+            ml_extra = Int((bits << c_ml)    >>> (64 - ml_n ))
+            ll_extra = Int((bits << c_ll)    >>> (64 - ll_n ))
+            ll_bits  = Int((bits << c_llb)   >>> (64 - ll_nb))
+            ml_bits  = Int((bits << c_mlb)   >>> (64 - ml_nb))
+            of_bits  = Int((bits << c_ofb)   >>> (64 - of_nb))
 
             # Single bulk consume
             rb.bits   = bits << total_n
@@ -780,12 +780,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
         else
             # Slow path: large offset (of_code > ~20); sequential reads.
-            of_extra   = (of_n  > 0) ? Int(read_bits!(rb, of_n )) : 0
+            of_extra   = Int(read_bits!(rb, of_n ))
             ml_extra   = Int(read_bits!(rb, ml_n))
             ll_extra   = Int(read_bits!(rb, ll_n))
-            ll_bits    = (ll_nb > 0) ? Int(read_bits!(rb, ll_nb)) : 0
-            ml_bits    = (ml_nb > 0) ? Int(read_bits!(rb, ml_nb)) : 0
-            of_bits    = (of_nb > 0) ? Int(read_bits!(rb, of_nb)) : 0
+            ll_bits    = Int(read_bits!(rb, ll_nb))
+            ml_bits    = Int(read_bits!(rb, ml_nb))
+            of_bits    = Int(read_bits!(rb, of_nb))
         end
 
         of_val64 = (Int64(1) << of_code) + of_extra
