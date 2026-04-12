@@ -119,6 +119,73 @@ end
 end
 
 
+# Decode two symbols from each of 2 streams simultaneously using SIMD.
+# Mirrors _huffman_decode4x_2nocheck! but operates on ReverseBitReader2X.
+@inline function _huffman_decode2x_2nocheck!(rb::ReverseBitReader2X, ht::HuffmanTable{L},
+                                              out::Vector{UInt8},
+                                              oi::Vec{2, Int}) where L
+    idx = _shr.(rb.bits, Int64(64 - L))
+
+    @inbounds e = (
+        ht.decode_table[idx[1] % Int + 1],
+        ht.decode_table[idx[2] % Int + 1]
+    )
+
+    GC.@preserve out unsafe_store!.(Ptr{UInt16}.(pointer.(Ref(out), (oi[1], oi[2]))),
+                                    htol.(e .% UInt16))
+
+    nb_total = Int64.(e .>> 24)
+    rb.bits  = _shl.(rb.bits, nb_total)
+    rb.nbits = rb.nbits .- nb_total
+
+    e_vec = Vec{2, UInt32}(e)
+    nb1   = (e_vec >> UInt32(16)) & Vec{2, UInt32}(UInt32(0xFF))
+    return min((e_vec >> UInt32(24)) - nb1, Vec{2, UInt32}(UInt32(1))) + Vec{2, UInt32}(UInt32(1))
+end
+
+# Decode two symbols from each of 4 streams simultaneously using SIMD.
+# bits/nbits from ReverseBitReader4X are loaded into Vec{4,...} for the
+# index extraction and bit-consumption steps; table lookups remain scalar.
+# Writes symbol pairs to out at o1..o4 (unconditionally — caller ensures slack).
+# Returns (adv1, adv2, adv3, adv4): 1 or 2 symbols advanced per stream.
+@inline function _huffman_decode4x_2nocheck!(rb::ReverseBitReader4X, ht::HuffmanTable{L},
+                                              out::Vector{UInt8},
+                                              oi::Vec{4, Int}) where L
+    # Extract all 4 table indices in parallel: shift MSBs down to top L bits.
+    idx = _shr.(rb.bits, Int64(64 - L))
+
+    # Scalar table lookups (gather not supported in SIMD.jl).
+    # @inbounds: idx[i] is in [0, 2^L) by construction (top L bits of a UInt64),
+    # so idx[i] % Int + 1 is in [1, 2^L] = valid range for decode_table.
+    @inbounds e = (
+        ht.decode_table[idx[1] % Int + 1],
+        ht.decode_table[idx[2] % Int + 1],
+        ht.decode_table[idx[3] % Int + 1],
+        ht.decode_table[idx[4] % Int + 1]
+    )
+
+    # Write symbol pairs as a single 16-bit store each: e[i] & 0xFFFF = (sym2<<8)|sym1,
+    # which on a little-endian machine writes sym1 at out[oi] and sym2 at out[oi+1].
+    # In the single-symbol case sym2 lands one slot past the actual end — safe because
+    # the caller guarantees at least one byte of slack past each segment boundary.
+    GC.@preserve out unsafe_store!.(Ptr{UInt16}.(pointer.(Ref(out), Tuple(oi))), htol.(e .% UInt16))
+
+    # Consume bits and update counts.
+    # _shl (masks shift count with 63) avoids the dead safety check Julia's `<<` emits for
+    # shifts ≥ 64: nb_total ≤ L ≤ 11, so the check is unreachable but LLVM can't prove it.
+    nb_total = Int64.(e .>> 24)
+    rb.bits  = _shl.(rb.bits, nb_total)
+    rb.nbits = rb.nbits .- nb_total
+
+    # Advance: 2 if double-symbol entry (nb_total > nb1), else 1.
+    # nb_total - nb1 is 0 for single, ≥1 for double; min(..., 1) + 1 gives 1 or 2.
+    # Compiles to vpminud + vpaddd — 2 insns replacing 31 scalar ones.
+    e_vec = Vec{4, UInt32}(e)
+    nb1   = (e_vec >> UInt32(16)) & Vec{4, UInt32}(UInt32(0xFF))
+    return min((e_vec >> UInt32(24)) - nb1, Vec{4, UInt32}(UInt32(1))) + Vec{4, UInt32}(UInt32(1))
+end
+
+
 # ============================================================
 # Section 6: Huffman tree description
 #   Reference: RFC 8878 §4.2.1

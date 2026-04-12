@@ -283,102 +283,127 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
 
     seg_n = (regen_size + 3) >> 2
 
-    rb1 = ReverseBitReader(@view data[s1_start:s2_start-1])
-    rb2 = ReverseBitReader(@view data[s2_start:s3_start-1])
-    rb3 = ReverseBitReader(@view data[s3_start:s4_start-1])
-    rb4 = ReverseBitReader(@view data[s4_start:s4_end])
-
-    # Dual-symbol interleaved decode.
-    # safe_n lookups fit in one refill (≥ 57 bits loaded, ≤ max_bits per lookup).
-    # safeendX = endX - 2*safe_n: the last position from which a full batch of
-    # safe_n dual-symbol lookups is guaranteed safe.  Each lookup writes pos and
-    # pos+1 unconditionally; the guard ensures pos+1 ≤ endX - 1 < endX, so the
-    # write never crosses into an adjacent segment.
-    # Phase 1: all 4 streams together.
-    # Phase 2: fixed pairs (1,2) and (3,4).
+    # Phase 1: all 4 streams together via SIMD-friendly ReverseBitReader4X.
+    # Phase 2: 2-stream pairs chosen by remaining capacity (optimal SIMD utilisation).
     # Phase 3: whichever stream in each pair still has capacity runs single-stream.
     # Phase 4: finish any remaining symbols with single-symbol decode.
     safe_n = 57 ÷ L  # compile-time constant: L is a type parameter
-    o1 = 1
-    o2 = 1 + seg_n
-    o3 = 1 + 2seg_n
-    o4 = 1 + 3seg_n
-    end1 = seg_n
-    end2 = 2seg_n
-    end3 = 3seg_n
-    end4 = regen_size
-    safeend1 = end1 - 2safe_n
-    safeend2 = end2 - 2safe_n
-    safeend3 = end3 - 2safe_n
-    safeend4 = end4 - 2safe_n
+    oi = (1, 1 + seg_n, 1 + 2seg_n, 1 + 3seg_n)  # output indices for each stream
+    ends = (seg_n, 2seg_n, 3seg_n, regen_size)
+    safeends = (ends[1] - 2safe_n, ends[2] - 2safe_n, ends[3] - 2safe_n, ends[4] - 2safe_n)
 
-    while o1 ≤ safeend1 && o2 ≤ safeend2 && o3 ≤ safeend3 && o4 ≤ safeend4
-        refill!(rb1)
-        refill!(rb2)
-        refill!(rb3)
-        refill!(rb4)
+    # Phase 1: 4-stream SIMD decode — bits/nbits updated via Vec{4,...} each iteration.
+    # safe_n dual-symbol lookups fit in one refill (≥ 57 bits, ≤ max_bits per lookup).
+    # safeendX = endX - 2*safe_n: last position where a full batch is safe. Each lookup
+    # writes pos and pos+1 unconditionally; the guard ensures pos+1 < endX.
+    rb4x = ReverseBitReader4X(
+        @view(data[s1_start:s2_start-1]),
+        @view(data[s2_start:s3_start-1]),
+        @view(data[s3_start:s4_start-1]),
+        @view(data[s4_start:s4_end]),
+    )
+    oi_vec = Vec{4, Int}(oi)
+    safeends_vec = Vec{4, Int}(safeends)
+    while all(oi_vec ≤ safeends_vec)
+        refill_unchecked!(rb4x)
         for _ in 1:safe_n
-            o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-            o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
-            o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-            o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+            nread = _huffman_decode4x_2nocheck!(rb4x, ht, literals, oi_vec)
+            oi_vec = oi_vec + Vec{4, Int}(nread)
         end
     end
+    oi = Tuple(oi_vec)  # spill Vec back to scalar for remaining phases
 
-    while o1 ≤ safeend1 && o2 ≤ safeend2
-        refill!(rb1)
-        refill!(rb2)
+    # Phase 2: 2-stream SIMD decode for the two streams with the most remaining work,
+    # plus a single-stream 2-symbol loop for the third. The fourth (least remaining —
+    # typically the one that caused phase 1 to exit) goes straight to the scalar tail.
+    # Sort stream indices by remaining safe-decode capacity; take the top two as the pair.
+    r = (safeends[1] - oi[1], safeends[2] - oi[2],
+         safeends[3] - oi[3], safeends[4] - oi[4])
+    ia, ib, ic, id = sortperm([r[1], r[2], r[3], r[4]], rev=true)
+
+    # Extract all 4 stream readers from rb4x (updated after phase 1).
+    s1 = _extract_stream(rb4x, Val(1))
+    s2 = _extract_stream(rb4x, Val(2))
+    s3 = _extract_stream(rb4x, Val(3))
+    s4 = _extract_stream(rb4x, Val(4))
+    sv = (s1, s2, s3, s4)
+
+    # Phase 2a: 2X SIMD loop for the top-2 streams (ia, ib).
+    rbA = ReverseBitReader2X(sv[ia], sv[ib])
+    oi_A = Vec{2, Int}((oi[ia], oi[ib]))
+    se_A = Vec{2, Int}((safeends[ia], safeends[ib]))
+    while all(oi_A ≤ se_A)
+        refill_unchecked!(rbA)
         for _ in 1:safe_n
-            o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-            o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
+            nread = _huffman_decode2x_2nocheck!(rbA, ht, literals, oi_A)
+            oi_A = oi_A + Vec{2, Int}(nread)
         end
     end
+    ra_ia = _extract_stream(rbA, Val(1))
+    ra_ib = _extract_stream(rbA, Val(2))
 
-    while o3 ≤ safeend3 && o4 ≤ safeend4
-        refill!(rb3)
-        refill!(rb4)
+    # Pair the survivor of phase 2a with ic for phase 2b.
+    # At most one of ia/ib can be ≤ safeend after the loop exits.
+    ia_alive = oi_A[1] ≤ se_A[1]
+    re_2a  = ia_alive ? ra_ia        : ra_ib
+    oi_2a  = ia_alive ? Int(oi_A[1]) : Int(oi_A[2])
+    se_2a  = ia_alive ? safeends[ia] : safeends[ib]
+
+    # Phase 2b: 2X SIMD loop for (survivor of 2a, ic).
+    rbB = ReverseBitReader2X(re_2a, sv[ic])
+    oi_B = Vec{2, Int}((oi_2a, oi[ic]))
+    se_B = Vec{2, Int}((se_2a, safeends[ic]))
+    while all(oi_B ≤ se_B)
+        refill_unchecked!(rbB)
         for _ in 1:safe_n
-            o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-            o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
+            nread = _huffman_decode2x_2nocheck!(rbB, ht, literals, oi_B)
+            oi_B = oi_B + Vec{2, Int}(nread)
+        end
+    end
+    rb_2b  = _extract_stream(rbB, Val(1))   # survivor-of-2a reader, updated
+    rb_ic2 = _extract_stream(rbB, Val(2))   # ic reader, updated
+
+    # Run the survivor of phase 2b single-stream until its safe limit.
+    ie_alive = oi_B[1] ≤ se_B[1]
+    re_2b  = ie_alive ? rb_2b  : rb_ic2
+    oi_2b  = ie_alive ? Int(oi_B[1]) : Int(oi_B[2])
+    se_2b  = ie_alive ? se_2a  : safeends[ic]
+    while oi_2b ≤ se_2b
+        refill!(re_2b)
+        for _ in 1:safe_n
+            o = _huffman_decode2_nocheck!(re_2b, ht, literals, oi_2b)
+            oi_2b += o
         end
     end
 
-    if o1 ≤ safeend1
-        while o1 ≤ safeend1
-            refill!(rb1)
-            for _ in 1:safe_n
-                o1 += _huffman_decode2_nocheck!(rb1, ht, literals, o1)
-            end
-        end
-    elseif o2 ≤ safeend2 # must check because possible to overshoot
-        while o2 ≤ safeend2
-            refill!(rb2)
-            for _ in 1:safe_n
-                o2 += _huffman_decode2_nocheck!(rb2, ht, literals, o2)
-            end
-        end
-    end
+    # Reconstruct rb1..4 / oi in original stream order.
+    # ia: used in 2a slot 1 → rb_2b if ia_alive, else ra_ia
+    # ib: used in 2a slot 2 → rb_2b if !ia_alive, else ra_ib
+    # ic: used in 2b slot 2 → rb_ic2 (always)
+    # id: never used past phase 1 → sv[id]
+    final_rb_ia = ia_alive ? rb_2b  : ra_ia
+    final_rb_ib = ia_alive ? ra_ib  : rb_2b
+    final_rb_ic = rb_ic2
+    final_rb_id = sv[id]
 
-    if o3 ≤ safeend3
-        while o3 ≤ safeend3
-            refill!(rb3)
-            for _ in 1:safe_n
-                o3 += _huffman_decode2_nocheck!(rb3, ht, literals, o3)
-            end
-        end
-    elseif o4 ≤ safeend4 # must check because possible to overshoot
-        while o4 ≤ safeend4
-            refill!(rb4)
-            for _ in 1:safe_n
-                o4 += _huffman_decode2_nocheck!(rb4, ht, literals, o4)
-            end
-        end
-    end
+    oi_final_ia = ia_alive ? (ie_alive ? oi_2b : Int(oi_B[1])) : Int(oi_A[1])
+    oi_final_ib = ia_alive ? Int(oi_A[2]) : (ie_alive ? oi_2b : Int(oi_B[1]))
+    oi_final_ic = ie_alive ? Int(oi_B[2]) : oi_2b
+    oi_final_id = oi[id]
 
-    while o1 ≤ end1; @inbounds literals[o1] = huffman_decode!(rb1, ht); o1 += 1; end
-    while o2 ≤ end2; @inbounds literals[o2] = huffman_decode!(rb2, ht); o2 += 1; end
-    while o3 ≤ end3; @inbounds literals[o3] = huffman_decode!(rb3, ht); o3 += 1; end
-    while o4 ≤ end4; @inbounds literals[o4] = huffman_decode!(rb4, ht); o4 += 1; end
+    rb1 = 1==ia ? final_rb_ia : 1==ib ? final_rb_ib : 1==ic ? final_rb_ic : final_rb_id
+    rb2 = 2==ia ? final_rb_ia : 2==ib ? final_rb_ib : 2==ic ? final_rb_ic : final_rb_id
+    rb3 = 3==ia ? final_rb_ia : 3==ib ? final_rb_ib : 3==ic ? final_rb_ic : final_rb_id
+    rb4 = 4==ia ? final_rb_ia : 4==ib ? final_rb_ib : 4==ic ? final_rb_ic : final_rb_id
+    oi = (ia==1 ? oi_final_ia : ib==1 ? oi_final_ib : ic==1 ? oi_final_ic : oi_final_id,
+          ia==2 ? oi_final_ia : ib==2 ? oi_final_ib : ic==2 ? oi_final_ic : oi_final_id,
+          ia==3 ? oi_final_ia : ib==3 ? oi_final_ib : ic==3 ? oi_final_ic : oi_final_id,
+          ia==4 ? oi_final_ia : ib==4 ? oi_final_ib : ic==4 ? oi_final_ic : oi_final_id)
+
+    let p = oi[1]; while p ≤ ends[1]; @inbounds literals[p] = huffman_decode!(rb1, ht); p += 1; end; end
+    let p = oi[2]; while p ≤ ends[2]; @inbounds literals[p] = huffman_decode!(rb2, ht); p += 1; end; end
+    let p = oi[3]; while p ≤ ends[3]; @inbounds literals[p] = huffman_decode!(rb3, ht); p += 1; end; end
+    let p = oi[4]; while p ≤ ends[4]; @inbounds literals[p] = huffman_decode!(rb4, ht); p += 1; end; end
 
     return
 end
