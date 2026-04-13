@@ -11,15 +11,18 @@ symbol entry is invalid.
 =#
 struct HuffmanTableEntry{L} # TODO: The type param may not be needed, test it
     symbols::NTuple{2, UInt8} # Second symbol is valid only if nbits_total > nbits_sym1
-    steam_nbits::UInt8        # [0:L]
-    nsymbols::UInt8           # 1 or 2
+    stream_nbits::UInt8       # [0:L]
+    nsymbols::UInt8           # 0, 1 or 2 (0 should only be present during table construction; 0 means invalid entry) TODO: Check if this is true
 
-    function HuffmanTableEntry{L}(symbols::NTuple{2, UInt8}, steam_nbits::UInt8, nsymbols::UInt8) where L
-        steam_nbits ≤ L ||
-            throw(ArgumentError("zstd: Huffman table entry steam_nbits $steam_nbits exceeds max_bits ($L)"))
-        0 < nsymbols < 3 ||
-            throw(ArgumentError("zstd: Huffman table entry nsymbols must be 1 or 2"))
+    function HuffmanTableEntry{L}(symbols::NTuple{2, UInt8}, stream_nbits::UInt8, nsymbols::UInt8) where L
+        stream_nbits ≤ L ||
+            throw(ArgumentError("zstd: Huffman table entry stream_nbits $stream_nbits exceeds max_bits ($L)"))
+        0 ≤ nsymbols ≤ 2 ||
+            throw(ArgumentError("zstd: Huffman table entry nsymbols must be 0, 1 or 2"))
         new{L}(symbols, steam_nbits, nsymbols)
+    end
+    function HuffmanTableEntry{L}() where L
+        new{L}((0x00, 0x00), 0x00, 0x00)
     end
 end
 
@@ -39,14 +42,14 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUFTABLE_LOG_MAX)"))
 
     table_size = 1 << max_bits
-    # Pass 1: build a temporary single-symbol table (sym, nb1) to use as input
-    # for the dual-symbol pass below.
-    tmp = fill(UInt16(max_bits), table_size)  # (sym<<8)|nb1
 
-    rank_count      = zeros(Int, max_bits + 1)
+    decode_table = HuffmanTable{max_bits}(fill(HuffmanTableEntry{max_bits}(), table_size))
+
+    # Pass 1: Populate single-symbol entries for all symbols
+    rank_count = zeros(Int, max_bits + 1)
     next_rank_start = zeros(Int, max_bits + 1)
-    for sym in 0:nsyms-1
-        w = Int(weights[sym+1])
+    for sym in 0:nsyms - 1
+        w = Int(weights[sym + 1])
         w > 0 && (rank_count[w] += 1)
     end
     pos = 0
@@ -54,40 +57,31 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         next_rank_start[w] = pos
         pos += rank_count[w] * (1 << (w - 1))
     end
-    for sym in 0:nsyms-1
-        w = Int(weights[sym+1])
+    for sym in UInt8.(0:nsyms - 1)
+        w = Int(weights[sym + 1])
         w == 0 && continue
-        nb1         = max_bits - w + 1
+        nb1 = UInt8(max_bits - w + 1)
         num_entries = 1 << (w - 1)
-        entry       = UInt16((sym << 8) | nb1)
-        start       = next_rank_start[w]
-        for j in 0:num_entries-1
-            tmp[start + j + 1] = entry
+        entry = HuffmanTableEntry{max_bits}((sym, 0x00), nb1, 0x01)
+        start = next_rank_start[w]
+        for j in 0:num_entries - 1
+            decode_table[start + j + 1] = entry
         end
         next_rank_start[w] += num_entries
     end
 
-    # Pass 2: build the full max_bits-wide dual-symbol decode table.
-    dtable = Vector{HuffmanTableEntry{max_bits}}(undef, table_size)
-    for idx in 0:table_size-1
-        e1   = Int(tmp[idx + 1])
-        sym1 = (e1 >> 8) & 0xFF
-        nb1  = e1 & 0xFF
-        rem  = max_bits - nb1   # bits remaining after sym1
-        if rem > 0
-            idx2 = (idx << nb1) & (table_size - 1)
-            e2   = Int(tmp[idx2 + 1])
-            sym2 = (e2 >> 8) & 0xFF
-            nb2  = e2 & 0xFF
-            if nb2 ≤ rem
-                dtable[idx + 1] = HuffmanTableEntry{max_bits}((sym1, sym2), nb1 + nb2, 2)
-                continue
-            end
-        end
-        dtable[idx + 1] = HuffmanTableEntry{max_bits}((sym1, 0), nb1, 1)
+    # Pass 2: Add second symbols where there is room in the table (i.e., nbits1 + nbits2 ≤ max_bits)
+    for idx in 0:table_size - 1
+        entry = decode_table[idx + 1]
+        nbits_remaining = max_bits - entry.stream_nbits
+        nbits_remaining > 0 || continue
+        idx2 = (idx << entry.stream_nbits) & (table_size - 1)
+        (sym2, nbits_sym2) = decode_table[idx2 + 1]
+        nbits_sym2 ≤ nbits_remaining || continue
+        decode_table[idx + 1] = HuffmanTableEntry{max_bits}((entry.symbols[1], sym2), entry.stream_nbits + nbits_sym2, 0x02)
     end
 
-    return HuffmanTable{max_bits}(dtable)
+    return HuffmanTable{max_bits}(decode_table)
 end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
