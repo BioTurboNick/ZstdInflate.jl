@@ -7,8 +7,9 @@
 The Huffman decode table is a flat array of 2^L entries, where `L` is the maximum code length of any symbol.
 The index into the table is the next `L` read from the bitstream. Each entry contains either one or two symbols,
 the number of bits of the stream they take up, and the number of symbols present. If nsymbols == 1, the second
-symbol entry is invalid.
+symbol entry is invalid. The design allows us to opportunistically read a second symbol in the same read.
 =#
+
 struct HuffmanTableEntry{L} # TODO: The type param may not be needed, test it
     symbols::NTuple{2, UInt8} # Second symbol is valid only if nbits_total > nbits_sym1
     stream_nbits::UInt8       # [0:L]
@@ -29,6 +30,8 @@ end
 struct HuffmanTable{L}
     decode_table::Vector{HuffmanTableEntry{L}}
 end
+
+@propagate_inbounds getindex(ht::HuffmanTable, args...) = getindex(ht.decode_table, args)
 
 # Build a dual-symbol Huffman decode table from a weight array.
 # weights[i+1] = weight for symbol i (0 = absent; weight w ≥ 1 means code length
@@ -70,7 +73,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
         next_rank_start[w] += num_entries
     end
 
-    # Pass 2: Add second symbols where there is room in the table (i.e., nbits1 + nbits2 ≤ max_bits)
+    # Pass 2: Add second symbols where there is room in the entry (i.e., nbits1 + nbits2 ≤ max_bits)
     for idx in 0:table_size - 1
         entry = decode_table[idx + 1]
         nbits_remaining = max_bits - entry.stream_nbits
@@ -86,12 +89,12 @@ end
 
 # Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
 @inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
-    idx      = _shr(rb.bits, 64 - L) % Int
-    e        = @inbounds ht.decode_table[idx + 1]
-    nb1      = Int((e >> 16) & 0xFF)
-    rb.bits  = _shl(rb.bits, nb1)
+    idx = _shr(rb.bits, 64 - L) % Int
+    ht_entry = @inbounds ht[idx + 1]
+    nb1 = Int(ht_entry.stream_nbits)
+    rb.bits = _shl(rb.bits, nb1)
     rb.nbits -= nb1
-    return Int(e & 0xFF)
+    return Int(ht_entry.symbols[1])
 end
 
 # Decode one Huffman symbol from the reverse bit reader.
@@ -106,12 +109,12 @@ end
 # Returns the number of symbols decoded (1 or 2).
 @inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L},
                                            out::Vector{UInt8}, pos::Int) where L
-    idx      = _shr(rb.bits, 64 - L) % Int
-    ht_entry        = @inbounds ht.decode_table[idx + 1]
-    nb_total = Int(ht_entry.nb_bits)
+    idx = _shr(rb.bits, 64 - L) % Int
+    ht_entry = @inbounds ht[idx + 1]
+    nb_total = Int(ht_entry.stream_nbits)
     @inbounds out[pos:pos + 1] .= ht_entry.symbols
-    rb.bits  = _shl(rb.bits, nb_total)
-    rb.nbits  -= nb_total
+    rb.bits = _shl(rb.bits, nb_total)
+    rb.nbits -= nb_total
     return ht_entry.nsymbols
 end
 
