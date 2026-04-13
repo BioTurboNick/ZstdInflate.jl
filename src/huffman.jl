@@ -3,15 +3,28 @@
 #   Reference: RFC 8878 §4.2
 # ============================================================
 
+#=
+The Huffman decode table is a flat array of 2^L entries, where `L` is the maximum code length of any symbol.
+The index into the table is the next `L` read from the bitstream. Each entry contains either one or two symbols,
+the number of bits of the stream they take up, and the number of symbols present. If nsymbols == 1, the second
+symbol entry is invalid.
+=#
+struct HuffmanTableEntry{L} # TODO: The type param may not be needed, test it
+    symbols::NTuple{2, UInt8} # Second symbol is valid only if nbits_total > nbits_sym1
+    steam_nbits::UInt8        # [0:L]
+    nsymbols::UInt8           # 1 or 2
+
+    function HuffmanTableEntry{L}(symbols::NTuple{2, UInt8}, steam_nbits::UInt8, nsymbols::UInt8) where L
+        steam_nbits ≤ L ||
+            throw(ArgumentError("zstd: Huffman table entry steam_nbits $steam_nbits exceeds max_bits ($L)"))
+        0 < nsymbols < 3 ||
+            throw(ArgumentError("zstd: Huffman table entry nsymbols must be 1 or 2"))
+        new{L}(symbols, steam_nbits, nsymbols)
+    end
+end
+
 struct HuffmanTable{L}
-    # Packed dual-symbol decode table indexed by the top L bits of the peeked code word.
-    # Each UInt32 entry encodes up to two symbols:
-    #   bits [31:24]  nb_total — total bits consumed (nb1 + nb2; ≤ L)
-    #   bits [23:16]  nb1      — bits consumed by sym1 alone (needed for single-symbol path)
-    #   bits [15: 8]  sym2     — second symbol (valid only when nb_total > nb1)
-    #   bits [ 7: 0]  sym1     — first symbol (always valid)
-    # nb_total == nb1 indicates a single-symbol entry; nb_total > nb1 is a two-symbol entry.
-    decode_table::Vector{UInt32}
+    decode_table::Vector{HuffmanTableEntry{L}}
 end
 
 # Build a dual-symbol Huffman decode table from a weight array.
@@ -55,7 +68,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
     end
 
     # Pass 2: build the full max_bits-wide dual-symbol decode table.
-    dtable = Vector{UInt32}(undef, table_size)
+    dtable = Vector{HuffmanTableEntry{max_bits}}(undef, table_size)
     for idx in 0:table_size-1
         e1   = Int(tmp[idx + 1])
         sym1 = (e1 >> 8) & 0xFF
@@ -67,12 +80,11 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int)
             sym2 = (e2 >> 8) & 0xFF
             nb2  = e2 & 0xFF
             if nb2 ≤ rem
-                dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
-                                  UInt32(sym2 << 8) | UInt32(sym1)
+                dtable[idx + 1] = HuffmanTableEntry{max_bits}((sym1, sym2), nb1 + nb2, 2)
                 continue
             end
         end
-        dtable[idx + 1] = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym1)
+        dtable[idx + 1] = HuffmanTableEntry{max_bits}((sym1, 0), nb1, 1)
     end
 
     return HuffmanTable{max_bits}(dtable)
@@ -101,14 +113,12 @@ end
 @inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L},
                                            out::Vector{UInt8}, pos::Int) where L
     idx      = _shr(rb.bits, 64 - L) % Int
-    e        = @inbounds ht.decode_table[idx + 1]
-    nb_total = Int(e >> 24)
-    nb1      = Int((e >> 16) & 0xFF)
-    @inbounds out[pos]   = UInt8(e & 0xFF)
-    @inbounds out[pos+1] = UInt8((e >> 8) & 0xFF)
+    ht_entry        = @inbounds ht.decode_table[idx + 1]
+    nb_total = Int(ht_entry.nb_bits)
+    @inbounds out[pos:pos + 1] .= ht_entry.symbols
     rb.bits  = _shl(rb.bits, nb_total)
     rb.nbits  -= nb_total
-    return nb_total > nb1 ? 2 : 1
+    return ht_entry.nsymbols
 end
 
 
