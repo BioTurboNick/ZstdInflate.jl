@@ -315,7 +315,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
         refill_unchecked!(rb4x)
         for _ in 1:safe_n
             nread = _huffman_decode4x_2nocheck!(rb4x, ht, literals, oi_vec)
-            oi_vec = oi_vec + Vec{4, Int}(nread)
+            oi_vec += Vec{4, Int}(nread)
         end
     end
     oi = Tuple(oi_vec)  # spill Vec back to scalar for remaining phases
@@ -343,7 +343,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
         refill_unchecked!(rbA)
         for _ in 1:safe_n
             nread = _huffman_decode2x_2nocheck!(rbA, ht, literals, oi_A)
-            oi_A = oi_A + Vec{2, Int}(nread)
+            oi_A += Vec{2, Int}(nread)
         end
     end
     ra_ia = _extract_stream(rbA, Val(1))
@@ -364,7 +364,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
         refill_unchecked!(rbB)
         for _ in 1:safe_n
             nread = _huffman_decode2x_2nocheck!(rbB, ht, literals, oi_B)
-            oi_B = oi_B + Vec{2, Int}(nread)
+            oi_B += Vec{2, Int}(nread)
         end
     end
     rb_2b  = _extract_stream(rbB, Val(1))   # survivor-of-2a reader, updated
