@@ -100,7 +100,18 @@ end
 # Decode one Huffman symbol from the reverse bit reader.
 @inline function huffman_decode!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
     rb.nbits < L && refill!(rb)
-    _huffman_decode_nocheck!(rb, ht)
+    idx        = _shr(rb.bits, 64 - L) % Int
+    e          = @inbounds ht.decode_table[idx + 1]
+    nb_total   = Int((e >> 16) & 0xFF)
+    nb_advance = Int(e >> 24)
+    @inbounds out[p] = e % UInt8
+    rb.bits   = _shl(rb.bits, nb_total)
+    rb.nbits -= nb_total
+    if nb_advance > 1 && p < p_end
+        @inbounds out[p + 1] = UInt8((e >> 8) & 0xFF)
+        return 2
+    end
+    return 1
 end
 
 # Decode up to 2 Huffman symbols — caller must ensure nbits ≥ max_bits (no refill).
@@ -134,13 +145,12 @@ end
     GC.@preserve out unsafe_store!.(Ptr{UInt16}.(pointer.(Ref(out), (oi[1], oi[2]))),
                                     htol.(e .% UInt16))
 
-    nb_total = Int64.(e .>> 24)
+    nb_total = Int64.((e .>> 16) .& UInt32(0xFF))
     rb.bits  = _shl.(rb.bits, nb_total)
     rb.nbits = rb.nbits .- nb_total
 
-    e_vec = Vec{2, UInt32}(e)
-    nb1   = (e_vec >> UInt32(16)) & Vec{2, UInt32}(UInt32(0xFF))
-    return min((e_vec >> UInt32(24)) - nb1, Vec{2, UInt32}(UInt32(1))) + Vec{2, UInt32}(UInt32(1))
+    # nb_advance pre-computed in table bits [31:24]; extract with a single shift.
+    return Vec{2, UInt32}(e) >> UInt32(24)
 end
 
 # Decode two symbols from each of 4 streams simultaneously using SIMD.
@@ -173,16 +183,13 @@ end
     # Consume bits and update counts.
     # _shl (masks shift count with 63) avoids the dead safety check Julia's `<<` emits for
     # shifts ≥ 64: nb_total ≤ L ≤ 11, so the check is unreachable but LLVM can't prove it.
-    nb_total = Int64.(e .>> 24)
+    nb_total = Int64.((e .>> 16) .& UInt32(0xFF))
     rb.bits  = _shl.(rb.bits, nb_total)
     rb.nbits = rb.nbits .- nb_total
 
-    # Advance: 2 if double-symbol entry (nb_total > nb1), else 1.
-    # nb_total - nb1 is 0 for single, ≥1 for double; min(..., 1) + 1 gives 1 or 2.
-    # Compiles to vpminud + vpaddd — 2 insns replacing 31 scalar ones.
+    # nb_advance pre-computed in table bits [31:24]; extract with a single vpsrld.
     e_vec = Vec{4, UInt32}(e)
-    nb1   = (e_vec >> UInt32(16)) & Vec{4, UInt32}(UInt32(0xFF))
-    return min((e_vec >> UInt32(24)) - nb1, Vec{4, UInt32}(UInt32(1))) + Vec{4, UInt32}(UInt32(1))
+    return e_vec >> UInt32(24)
 end
 
 

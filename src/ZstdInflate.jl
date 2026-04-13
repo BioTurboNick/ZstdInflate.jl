@@ -143,7 +143,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
     rank_count      = state.huf_rank_count
     next_rank_start = state.huf_rank_start
 
-    # Pass 1: fill dtable with single-symbol entries (nb_total=nb1, nb2=0, sym2=0).
+    # Pass 1: fill dtable with single-symbol entries (nb_advance=1, nb_total=nb1, sym2=0).
     fill!(view(rank_count,      1:max_bits+1), 0)
     fill!(view(next_rank_start, 1:max_bits+1), 0)
 
@@ -161,7 +161,7 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         w == 0 && continue
         nb1         = max_bits - w + 1
         num_entries = 1 << (w - 1)
-        entry = UInt32(nb1 << 24) | UInt32(nb1 << 16) | UInt32(sym)
+        entry = UInt32(1 << 24) | UInt32(nb1 << 16) | UInt32(sym)
         start = next_rank_start[w]
         for j in 0:num_entries-1
             dtable[start + j + 1] = entry
@@ -170,6 +170,8 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
     end
 
     # Pass 2: upgrade dtable entries to dual-symbol where a second symbol fits.
+    # e2 = dtable[idx2] may already be a dual-sym entry (upgraded earlier when idx2 < idx);
+    # in that case bits [23:16] hold nb_total, not nb1. Recover nb1 from the weights array.
     for idx in 0:table_size-1
         e1       = dtable[idx + 1]
         sym1     = Int(e1 & 0xFF)
@@ -178,10 +180,15 @@ function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::Decom
         if rem > 0
             idx2 = (idx << nb1) & (table_size - 1)
             e2   = dtable[idx2 + 1]
-            nb2  = Int((e2 >> 16) & 0xFF)
+            sym2 = Int(e2 & 0xFF)
+            nb2  = if Int(e2 >> 24) == 1
+                Int((e2 >> 16) & 0xFF)               # single-sym: nb1 at bits [23:16] ✓
+            else
+                w2 = Int(sym2 + 1 ≤ length(weights) ? weights[sym2 + 1] : UInt8(0))
+                w2 > 0 ? max_bits - w2 + 1 : max_bits + 1   # dual-sym: recompute from weight
+            end
             if nb2 ≤ rem
-                sym2 = Int(e2 & 0xFF)
-                dtable[idx + 1] = UInt32((nb1 + nb2) << 24) | UInt32(nb1 << 16) |
+                dtable[idx + 1] = UInt32(2 << 24) | UInt32((nb1 + nb2) << 16) |
                                   UInt32(sym2 << 8) | UInt32(sym1)
                 continue
             end
@@ -400,10 +407,10 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
           ia==3 ? oi_final_ia : ib==3 ? oi_final_ib : ic==3 ? oi_final_ic : oi_final_id,
           ia==4 ? oi_final_ia : ib==4 ? oi_final_ib : ic==4 ? oi_final_ic : oi_final_id)
 
-    let p = oi[1]; while p ≤ ends[1]; @inbounds literals[p] = huffman_decode!(rb1, ht); p += 1; end; end
-    let p = oi[2]; while p ≤ ends[2]; @inbounds literals[p] = huffman_decode!(rb2, ht); p += 1; end; end
-    let p = oi[3]; while p ≤ ends[3]; @inbounds literals[p] = huffman_decode!(rb3, ht); p += 1; end; end
-    let p = oi[4]; while p ≤ ends[4]; @inbounds literals[p] = huffman_decode!(rb4, ht); p += 1; end; end
+    let p = oi[1]; while p ≤ ends[1]; p += _huffman_decode12!(rb1, ht, literals, p, ends[1]); end; end
+    let p = oi[2]; while p ≤ ends[2]; p += _huffman_decode12!(rb2, ht, literals, p, ends[2]); end; end
+    let p = oi[3]; while p ≤ ends[3]; p += _huffman_decode12!(rb3, ht, literals, p, ends[3]); end; end
+    let p = oi[4]; while p ≤ ends[4]; p += _huffman_decode12!(rb4, ht, literals, p, ends[4]); end; end
 
     return
 end
@@ -497,8 +504,10 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         if num_streams == 1
             stream_len = payload_end - huf_start + 1
             rb = ReverseBitReader(@view data[huf_start:huf_start+stream_len-1])
-            for i in 1:regen_size
-                @inbounds literals[i] = UInt8(huffman_decode!(rb, ht))
+            let p = 1
+                while p ≤ regen_size
+                    p += _huffman_decode12!(rb, ht, literals, p, regen_size)
+                end
             end
         else
             # 4 streams: dispatch to _decode_4streams! which specialises on
