@@ -31,7 +31,7 @@ struct HuffmanTable{L, T <: AbstractVector{HuffmanTableEntry{L}}}
     decode_table::T
 end
 
-Base.@propagate_inbounds getindex(ht::HuffmanTable, args...) = getindex(ht.decode_table, args...)
+Base.@propagate_inbounds Base.getindex(ht::HuffmanTable, args...) = getindex(ht.decode_table, args...)
 
 # Build a dual-symbol Huffman decode table from a weight array.
 function build_huffman_table!(weights::Vector{UInt8}, max_bits::Int; kwargs...)
@@ -44,7 +44,6 @@ function build_huffman_table!(weights::Vector{UInt8}, max_bits::Int; kwargs...)
     v = fill(HuffmanTableEntry{max_bits}(), table_size)
     return build_huffman_table!(v, weights; kwargs...)
 end
-
 
 function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}, weights::Vector{UInt8}; scratch_buffers::Union{Nothing, NTuple{2, AbstractVector{Int}}} = nothing) where L
     fill!(decode_table, HuffmanTableEntry{L}())
@@ -75,28 +74,20 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
 
     # Pass 2: Add second symbols where there is room in the entry (i.e., nbits1 + nbits2 ≤ max_bits)
     nbits_sym1s = [decode_table[i].stream_nbits for i ∈ eachindex(decode_table)]
-    for idx ∈ eachindex(decode_table) .- 1
-        entry = decode_table[idx + 1]
+    for (i, entry) ∈ enumerate(decode_table)
+        code = i - 1
         nbits_remaining = L - entry.stream_nbits
         nbits_remaining > 0 || continue
-        idx2 = (idx << entry.stream_nbits) & (length(decode_table) - 1)
-        nbits_sym2 = Int(nbits_sym1s[idx2 + 1])
+        code2 = (code << entry.stream_nbits) & (length(decode_table) - 1)
+        j = code2 + 1
+        nbits_sym2 = Int(nbits_sym1s[j])
         nbits_sym2 ≤ nbits_remaining || continue
-        entry2 = decode_table[idx2 + 1]
-        decode_table[idx + 1] = HuffmanTableEntry{L}((entry.symbols[1], entry2.symbols[1]), UInt8(entry.stream_nbits + nbits_sym2), 0x02)
+        entry2 = decode_table[j]
+        stream_nbits = UInt8(entry.stream_nbits + nbits_sym2)
+        decode_table[i] = HuffmanTableEntry{L}((entry.symbols[1], entry2.symbols[1]), stream_nbits, 0x02)
     end
 
     return HuffmanTable{L, typeof(decode_table)}(decode_table)
-end
-
-# Decode one Huffman symbol — caller must ensure nbits ≥ max_bits (no refill).
-@inline function _huffman_decode_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L}) where L
-    idx = _shr(rb.bits, 64 - L) % Int
-    ht_entry = @inbounds ht.decode_table[idx + 1]
-    nb1 = Int(ht_entry.stream_nbits)
-    rb.bits = _shl(rb.bits, nb1)
-    rb.nbits -= nb1
-    return Int(ht_entry.symbols[1])
 end
 
 # Decode 1 or 2 Huffman symbols into out[p] (and out[p+1] if nsymbols==2 && p<p_end).
@@ -115,76 +106,6 @@ end
         return 2
     end
     return 1
-end
-
-# Decode up to 2 Huffman symbols — caller must ensure nbits ≥ max_bits (no refill).
-# Writes sym1 and sym2 to out[pos] and out[pos+1] unconditionally (caller must
-# ensure out has one byte of slack past regen_size for the last-slot case).
-# Returns the number of symbols decoded (1 or 2).
-@inline function _huffman_decode2_nocheck!(rb::ReverseBitReader, ht::HuffmanTable{L},
-                                           out::Vector{UInt8}, pos::Int) where L
-    idx = _shr(rb.bits, 64 - L) % Int
-    ht_entry = @inbounds ht.decode_table[idx + 1]
-    nb_total = Int(ht_entry.stream_nbits)
-    @inbounds out[pos:pos + 1] .= ht_entry.symbols
-    rb.bits = _shl(rb.bits, nb_total)
-    rb.nbits -= nb_total
-    return ht_entry.nsymbols
-end
-
-
-# Decode two symbols from each of 2 streams simultaneously using SIMD.
-# Mirrors _huffman_decode4x_2nocheck! but operates on ReverseBitReader2X.
-@inline function _huffman_decode2x_2nocheck!(rb::ReverseBitReader2X, ht::HuffmanTable{L},
-                                              out::Vector{UInt8},
-                                              oi::Vec{2, Int}) where L
-    idx = _shr.(rb.bits, Int64(64 - L))
-
-    @inbounds e = (
-        ht.decode_table[idx[1] % Int + 1],
-        ht.decode_table[idx[2] % Int + 1]
-    )
-
-    GC.@preserve out unsafe_store!.(Ptr{NTuple{2, UInt8}}.(pointer.(Ref(out), (oi[1], oi[2]))),
-                                    htol.(getfield.(e, :symbols)))
-
-    nb_total = (Int64(e[1].stream_nbits), Int64(e[2].stream_nbits))
-    rb.bits  = _shl.(rb.bits, nb_total)
-    rb.nbits = rb.nbits .- nb_total
-
-    return Vec{2, UInt32}((UInt32(e[1].nsymbols), UInt32(e[2].nsymbols)))
-end
-
-# Decode two symbols from each of 4 streams simultaneously using SIMD.
-# bits/nbits from ReverseBitReader4X are loaded into Vec{4,...} for the
-# index extraction and bit-consumption steps; table lookups remain scalar.
-# Writes symbol pairs to out at o1..o4 (unconditionally — caller ensures slack).
-# Returns (adv1, adv2, adv3, adv4): 1 or 2 symbols advanced per stream.
-@inline function _huffman_decode4x_2nocheck!(rb::ReverseBitReader4X, ht::HuffmanTable{L},
-                                              out::Vector{UInt8},
-                                              oi::Vec{4, Int}) where L
-    idx = _shr.(rb.bits, Int64(64 - L))
-
-    @inbounds e = (
-        ht.decode_table[idx[1] % Int + 1],
-        ht.decode_table[idx[2] % Int + 1],
-        ht.decode_table[idx[3] % Int + 1],
-        ht.decode_table[idx[4] % Int + 1]
-    )
-
-    # Write symbol pairs as a 16-bit store each: sym1 at out[oi], sym2 at out[oi+1].
-    # In the single-symbol case sym2 lands one slot past the actual end — safe because
-    # the caller guarantees at least one byte of slack past each segment boundary.
-    GC.@preserve out unsafe_store!.(Ptr{NTuple{2, UInt8}}.(pointer.(Ref(out), Tuple(oi))),
-                                    htol.(getfield.(e, :symbols)))
-
-    nb_total = (Int64(e[1].stream_nbits), Int64(e[2].stream_nbits),
-                Int64(e[3].stream_nbits), Int64(e[4].stream_nbits))
-    rb.bits  = _shl.(rb.bits, nb_total)
-    rb.nbits = rb.nbits .- nb_total
-
-    return Vec{4, UInt32}((UInt32(e[1].nsymbols), UInt32(e[2].nsymbols),
-                           UInt32(e[3].nsymbols), UInt32(e[4].nsymbols)))
 end
 
 

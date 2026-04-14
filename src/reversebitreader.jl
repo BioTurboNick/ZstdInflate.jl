@@ -34,6 +34,17 @@ function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
     return rb
 end
 
+@inline function Base.peek(rb::ReverseBitReader, ::Val{L}) where L
+    _shr(rb.bits, Int64(64 - L))
+end
+
+@inline function Base.skip(rb::ReverseBitReader, nbits_offset::Int)
+    n = Int(nbits_offset)
+    rb.bits = _shl(rb.bits, n)
+    rb.nbits = rb.nbits - n
+    return
+end
+
 function refill!(rb::ReverseBitReader)
     length(rb.data) > 8 || # Streams this short are already depleted after initialization
         return
@@ -143,16 +154,16 @@ end
 
 # Groups four reverse bit streams whose hot-path state (bits/nbits/pos) is
 # stored as NTuple{4,...} so a single Vec load covers all four lanes.
-mutable struct ReverseBitReader4X{T <: AbstractVector{UInt8}}
-    data ::NTuple{4, T}
-    bits ::NTuple{4, UInt64}
-    nbits::NTuple{4, Int64}
-    pos  ::NTuple{4, Int64}
+mutable struct ReverseBitReaderX{X, T <: AbstractVector{UInt8}}
+    data ::NTuple{X, T}
+    bits ::NTuple{X, UInt64}
+    nbits::NTuple{X, Int64}
+    pos  ::NTuple{X, Int64}
 end
 
 # Construct from four data slices, delegating per-stream init (sentinel handling,
 # initial refill) to the existing ReverseBitReader constructor.
-function ReverseBitReader4X(d1::T, d2::T, d3::T, d4::T) where T <: AbstractVector{UInt8}
+function ReverseBitReaderX(d1::T, d2::T, d3::T, d4::T) where T <: AbstractVector{UInt8}
     rb1 = ReverseBitReader(d1)
     rb2 = ReverseBitReader(d2)
     rb3 = ReverseBitReader(d3)
@@ -160,7 +171,23 @@ function ReverseBitReader4X(d1::T, d2::T, d3::T, d4::T) where T <: AbstractVecto
     bits  = (rb1.bits,         rb2.bits,         rb3.bits,         rb4.bits)
     nbits = (Int64(rb1.nbits), Int64(rb2.nbits), Int64(rb3.nbits), Int64(rb4.nbits))
     pos   = (Int64(rb1.pos),   Int64(rb2.pos),   Int64(rb3.pos),   Int64(rb4.pos))
-    ReverseBitReader4X{T}((d1, d2, d3, d4), bits, nbits, pos)
+    ReverseBitReaderX{4, T}((d1, d2, d3, d4), bits, nbits, pos)
+end
+
+function ReverseBitReaderX(d1::T, d2::T) where T <: AbstractVector{UInt8}
+    rb1 = ReverseBitReader(d1)
+    rb2 = ReverseBitReader(d2)
+    bits  = (rb1.bits,         rb2.bits)
+    nbits = (Int64(rb1.nbits), Int64(rb2.nbits))
+    pos   = (Int64(rb1.pos),   Int64(rb2.pos))
+    ReverseBitReaderX{2, T}((d1, d2), bits, nbits, pos)
+end
+
+function ReverseBitReaderX(rb1::ReverseBitReader{T}, rb2::ReverseBitReader{T}) where T <: AbstractVector{UInt8}
+    bits  = (rb1.bits,         rb2.bits)
+    nbits = (Int64(rb1.nbits), Int64(rb2.nbits))
+    pos   = (Int64(rb1.pos),   Int64(rb2.pos))
+    ReverseBitReaderX{2, T}((rb1.data, rb2.data), bits, nbits, pos)
 end
 
 # Refill all four streams.
@@ -188,66 +215,32 @@ end
                                Vec{2, Int64}, Vec{2, UInt64}}) =
     ~((UInt64(1) << ((8 - nread) * 8)) - UInt64(1))
 
-
-function refill_unchecked!(rb::ReverseBitReader4X)
+function refill_unchecked!(rb::ReverseBitReaderX)
     nread    = (64 .- rb.nbits) .>>> 3             # logical shift: value always ≥ 0, avoids vpsrad emulation
-    raw      = _le64.(rb.data, rb.pos .- 7)        # NTuple{4,UInt64}, 8-byte loads
-    readmask = _readmask.(nread)                    # NTuple{4,UInt64}, top 8*nread bits
+    raw      = _le64.(rb.data, rb.pos .- 7)        # NTuple{X,UInt64}, 8-byte loads
+    readmask = _readmask.(nread)                   # NTuple{X,UInt64}, top 8*nread bits
     rb.bits  = rb.bits .| ((raw .& readmask) .>>> (rb.nbits .& Int64(63)))
     rb.nbits = rb.nbits .+ 8 .* nread
     rb.pos   = rb.pos .- nread
+    return
+end
+
+@inline function Base.peek(rb::ReverseBitReaderX, ::Val{L}) where L
+    _shr.(rb.bits, Int64(64 - L))
+end
+
+@inline function Base.skip(rb::ReverseBitReaderX{X}, nbits_offset::NTuple{X, Int}) where X
+    rb.bits  = _shl.(rb.bits, Int64.(nbits_offset))
+    rb.nbits = rb.nbits .- nbits_offset
     return
 end
 
 # Extract one stream as an individual ReverseBitReader (used for tail phases).
-@inline function _extract_stream(rb4x::ReverseBitReader4X{T}, ::Val{I}) where {T, I}
-    data = I == 1 ? rb4x.data[1] : I == 2 ? rb4x.data[2] : I == 3 ? rb4x.data[3] : rb4x.data[4]
-    ReverseBitReader{T}(data, Int(rb4x.pos[I]), rb4x.bits[I], Int(rb4x.nbits[I]))
-end
-
-# ============================================================
-# 2-stream SIMD reverse bit reader
-# ============================================================
-
-mutable struct ReverseBitReader2X{T <: AbstractVector{UInt8}}
-    data ::NTuple{2, T}
-    bits ::NTuple{2, UInt64}
-    nbits::NTuple{2, Int64}
-    pos  ::NTuple{2, Int64}
-end
-
-# Construct from two streams of a ReverseBitReader4X (no re-init needed;
-# bits/nbits/pos are already populated by the 4X reader).
-@inline function ReverseBitReader2X(rb4x::ReverseBitReader4X{T}, ::Val{A}, ::Val{B}) where {T, A, B}
-    ReverseBitReader2X{T}(
-        (rb4x.data[A],         rb4x.data[B]),
-        (rb4x.bits[A],         rb4x.bits[B]),
-        (rb4x.nbits[A],        rb4x.nbits[B]),
-        (rb4x.pos[A],          rb4x.pos[B]),
-    )
-end
-
-function refill_unchecked!(rb::ReverseBitReader2X)
-    nread    = (64 .- rb.nbits) .>>> 3
-    raw      = _le64.(rb.data, rb.pos .- 7)
-    readmask = _readmask.(nread)
-    rb.bits  = rb.bits .| ((raw .& readmask) .>>> (rb.nbits .& Int64(63)))
-    rb.nbits = rb.nbits .+ 8 .* nread
-    rb.pos   = rb.pos .- nread
-    return
-end
-
-@inline function _extract_stream(rb2x::ReverseBitReader2X{T}, ::Val{I}) where {T, I}
+@inline function _extract_stream(rb2x::ReverseBitReaderX{2, T}, ::Val{I}) where {T, I}
     ReverseBitReader{T}(rb2x.data[I], Int(rb2x.pos[I]), rb2x.bits[I], Int(rb2x.nbits[I]))
 end
 
-# Construct a ReverseBitReader2X from two individual ReverseBitReaders
-# (e.g. to cross-pair streams after a 2X phase).
-@inline function ReverseBitReader2X(rba::ReverseBitReader{T}, rbb::ReverseBitReader{T}) where T
-    ReverseBitReader2X{T}(
-        (rba.data,         rbb.data),
-        (rba.bits,         rbb.bits),
-        (Int64(rba.nbits), Int64(rbb.nbits)),
-        (Int64(rba.pos),   Int64(rbb.pos)),
-    )
+@inline function _extract_stream(rb4x::ReverseBitReaderX{4, T}, ::Val{I}) where {T, I}
+    data = I == 1 ? rb4x.data[1] : I == 2 ? rb4x.data[2] : I == 3 ? rb4x.data[3] : rb4x.data[4]
+    ReverseBitReader{T}(data, Int(rb4x.pos[I]), rb4x.bits[I], Int(rb4x.nbits[I]))
 end

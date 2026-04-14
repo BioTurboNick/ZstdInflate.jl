@@ -35,6 +35,7 @@ include("fse.jl")
 include("huffman.jl")
 include("dictionary.jl")
 include("constants.jl")
+include("decompress.jl")
 
 export inflate_zstd, InflateZstdStream, ZstdDict
 
@@ -234,7 +235,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     # safe_n dual-symbol lookups fit in one refill (≥ 57 bits, ≤ max_bits per lookup).
     # safeendX = endX - 2*safe_n: last position where a full batch is safe. Each lookup
     # writes pos and pos+1 unconditionally; the guard ensures pos+1 < endX.
-    rb4x = ReverseBitReader4X(
+    rb4x = ReverseBitReaderX(
         @view(data[s1_start:s2_start-1]),
         @view(data[s2_start:s3_start-1]),
         @view(data[s3_start:s4_start-1]),
@@ -245,8 +246,8 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     while all(oi_vec ≤ safeends_vec)
         refill_unchecked!(rb4x)
         for _ in 1:safe_n
-            nread = _huffman_decode4x_2nocheck!(rb4x, ht, literals, oi_vec)
-            oi_vec += Vec{4, Int}(nread)
+            nread = decode4x2!(rb4x, ht, literals, oi_vec)
+            oi_vec += nread
         end
     end
     oi = Tuple(oi_vec)  # spill Vec back to scalar for remaining phases
@@ -267,14 +268,14 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     sv = (s1, s2, s3, s4)
 
     # Phase 2a: 2X SIMD loop for the top-2 streams (ia, ib).
-    rbA = ReverseBitReader2X(sv[ia], sv[ib])
+    rbA = ReverseBitReaderX(sv[ia], sv[ib])
     oi_A = Vec{2, Int}((oi[ia], oi[ib]))
     se_A = Vec{2, Int}((safeends[ia], safeends[ib]))
     while all(oi_A ≤ se_A)
         refill_unchecked!(rbA)
         for _ in 1:safe_n
-            nread = _huffman_decode2x_2nocheck!(rbA, ht, literals, oi_A)
-            oi_A += Vec{2, Int}(nread)
+            nread = decode2x2!(rbA, ht, literals, oi_A)
+            oi_A += nread
         end
     end
     ra_ia = _extract_stream(rbA, Val(1))
@@ -288,14 +289,14 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     se_2a  = ia_alive ? safeends[ia] : safeends[ib]
 
     # Phase 2b: 2X SIMD loop for (survivor of 2a, ic).
-    rbB = ReverseBitReader2X(re_2a, sv[ic])
+    rbB = ReverseBitReaderX(re_2a, sv[ic])
     oi_B = Vec{2, Int}((oi_2a, oi[ic]))
     se_B = Vec{2, Int}((se_2a, safeends[ic]))
     while all(oi_B ≤ se_B)
         refill_unchecked!(rbB)
         for _ in 1:safe_n
-            nread = _huffman_decode2x_2nocheck!(rbB, ht, literals, oi_B)
-            oi_B += Vec{2, Int}(nread)
+            nread = decode2x2!(rbB, ht, literals, oi_B)
+            oi_B += nread
         end
     end
     rb_2b  = _extract_stream(rbB, Val(1))   # survivor-of-2a reader, updated
@@ -309,8 +310,8 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     while oi_2b ≤ se_2b
         refill!(re_2b)
         for _ in 1:safe_n
-            o = _huffman_decode2_nocheck!(re_2b, ht, literals, oi_2b)
-            oi_2b += o
+            nread = decode1x2!(re_2b, ht, literals, oi_2b)
+            oi_2b += nread
         end
     end
 
