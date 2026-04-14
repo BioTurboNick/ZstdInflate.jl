@@ -108,8 +108,8 @@ function DecompressState(dict::ZstdDict)
         Int[], Int[], Int[],
         UInt8[],
         Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
-        zeros(Int, HUFTABLE_LOG_MAX + 1),
-        zeros(Int, HUFTABLE_LOG_MAX + 1),
+        zeros(Int, HUFTABLE_LOG_MAX),
+        zeros(Int, HUFTABLE_LOG_MAX),
         UInt8[],
         FSETableSlot(_FSE_MAX_TABLE),
         FSETableSlot(_FSE_MAX_TABLE),
@@ -126,77 +126,6 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
     return read_fse_table!(br, default, prev, mode, max_sym, max_al,
                            slot.syms, slot.nb, slot.base,
                            state.fse_occ, state.fse_norm)
-end
-
-# Hot-path variant of build_huffman_table: reuses scratch buffers from DecompressState.
-# huf_dtable is pre-sized to 1 << HUFTABLE_LOG_MAX and used as the full overflow table.
-# huf_primary_table is pre-sized to 1 << HUF_PRIMARY_BITS and used as the hot-path table.
-# Both buffers are shared across blocks (safe because literals are decoded before the
-# next block's table is built, so the current HuffmanTable is not live during a rebuild).
-function build_huffman_table(weights::Vector{UInt8}, max_bits::Int, state::DecompressState)
-    nsyms = length(weights)
-    max_bits > 0 || throw(ArgumentError("zstd: all-zero Huffman weights"))
-    max_bits ≤ HUFTABLE_LOG_MAX || throw(ArgumentError("zstd: Huffman table log $max_bits exceeds maximum ($HUFTABLE_LOG_MAX)"))
-
-    table_size      = 1 << max_bits
-    dtable          = state.huf_dtable
-    rank_count      = state.huf_rank_count
-    next_rank_start = state.huf_rank_start
-
-    # Pass 1: fill dtable with single-symbol entries (nb_advance=1, nb_total=nb1, sym2=0).
-    fill!(view(rank_count,      1:max_bits+1), 0)
-    fill!(view(next_rank_start, 1:max_bits+1), 0)
-
-    for sym in 0:nsyms-1
-        w = Int(weights[sym+1])
-        w > 0 && (rank_count[w] += 1)
-    end
-    pos = 0
-    for w in 1:max_bits
-        next_rank_start[w] = pos
-        pos += rank_count[w] * (1 << (w - 1))
-    end
-    for sym in 0:nsyms-1
-        w = Int(weights[sym+1])
-        w == 0 && continue
-        nb1         = max_bits - w + 1
-        num_entries = 1 << (w - 1)
-        entry = UInt32(1 << 24) | UInt32(nb1 << 16) | UInt32(sym)
-        start = next_rank_start[w]
-        for j in 0:num_entries-1
-            dtable[start + j + 1] = entry
-        end
-        next_rank_start[w] += num_entries
-    end
-
-    # Pass 2: upgrade dtable entries to dual-symbol where a second symbol fits.
-    # e2 = dtable[idx2] may already be a dual-sym entry (upgraded earlier when idx2 < idx);
-    # in that case bits [23:16] hold nb_total, not nb1. Recover nb1 from the weights array.
-    for idx in 0:table_size-1
-        e1       = dtable[idx + 1]
-        sym1     = Int(e1 & 0xFF)
-        nb1      = Int((e1 >> 16) & 0xFF)
-        rem      = max_bits - nb1
-        if rem > 0
-            idx2 = (idx << nb1) & (table_size - 1)
-            e2   = dtable[idx2 + 1]
-            sym2 = Int(e2 & 0xFF)
-            nb2  = if Int(e2 >> 24) == 1
-                Int((e2 >> 16) & 0xFF)               # single-sym: nb1 at bits [23:16] ✓
-            else
-                w2 = Int(sym2 + 1 ≤ length(weights) ? weights[sym2 + 1] : UInt8(0))
-                w2 > 0 ? max_bits - w2 + 1 : max_bits + 1   # dual-sym: recompute from weight
-            end
-            if nb2 ≤ rem
-                dtable[idx + 1] = UInt32(2 << 24) | UInt32((nb1 + nb2) << 16) |
-                                  UInt32(sym2 << 8) | UInt32(sym1)
-                continue
-            end
-        end
-        # Leave as single-symbol (already correct from pass 1).
-    end
-
-    return HuffmanTable{max_bits}(dtable)
 end
 
 # Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
@@ -248,7 +177,8 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int, state::Decompre
         weights = _decode_fse_weights(br, compressed_size, state.huf_weights)
         last_sym, last_w, table_log = _infer_last_weight(weights)
         push!(weights, UInt8(last_w))
-        ht = build_huffman_table(weights, table_log, state)
+        ht = build_huffman_table!(weights, table_log,
+                                 scratch_buffers=(state.huf_rank_count, state.huf_rank_start))
         return ht, compressed_size + 1
     else
         nsyms  = header - 127
@@ -269,7 +199,8 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int, state::Decompre
         else
             push!(weights, UInt8(last_w))
         end
-        ht = build_huffman_table(weights, table_log, state)
+        ht = build_huffman_table!(weights, table_log,
+                                 scratch_buffers=(state.huf_rank_count, state.huf_rank_start))
         return ht, nbytes + 1
     end
 end
