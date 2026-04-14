@@ -46,3 +46,18 @@ end
     skip(rb, nbits_consumed)
     return Int64(entry.nsymbols)
 end
+
+# Read 1-2 symbols from 1 stream and return the number of symbols read
+# Does not write second symbol if it is not present
+@inline function decode1x2_tail!(rb::ReverseBitReader, ht::HuffmanTable{L}, out::Vector{UInt8}, o::Int) where L
+    rb.nbits ≥ L || refill!(rb)
+    i = peek(rb, Val(L))
+    entry = @inbounds ht.decode_table[i + 1]
+    nbits_consumed = Int(entry.stream_nbits)
+    @inbounds out[o] = entry.symbols[1]
+    skip(rb, nbits_consumed)
+    if entry.nsymbols == 2
+        @inbounds out[o + 1] = entry.symbols[2]
+    end
+    return entry.nsymbols
+end

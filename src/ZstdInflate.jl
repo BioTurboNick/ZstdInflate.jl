@@ -339,10 +339,10 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
           ia==3 ? oi_final_ia : ib==3 ? oi_final_ib : ic==3 ? oi_final_ic : oi_final_id,
           ia==4 ? oi_final_ia : ib==4 ? oi_final_ib : ic==4 ? oi_final_ic : oi_final_id)
 
-    let p = oi[1]; while p ≤ ends[1]; p += _huffman_decode12!(rb1, ht, literals, p, ends[1]); end; end
-    let p = oi[2]; while p ≤ ends[2]; p += _huffman_decode12!(rb2, ht, literals, p, ends[2]); end; end
-    let p = oi[3]; while p ≤ ends[3]; p += _huffman_decode12!(rb3, ht, literals, p, ends[3]); end; end
-    let p = oi[4]; while p ≤ ends[4]; p += _huffman_decode12!(rb4, ht, literals, p, ends[4]); end; end
+    let p = oi[1]; while p ≤ ends[1]; p += decode1x2_tail!(rb1, ht, literals, p); end; end
+    let p = oi[2]; while p ≤ ends[2]; p += decode1x2_tail!(rb2, ht, literals, p); end; end
+    let p = oi[3]; while p ≤ ends[3]; p += decode1x2_tail!(rb3, ht, literals, p); end; end
+    let p = oi[4]; while p ≤ ends[4]; p += decode1x2_tail!(rb4, ht, literals, p); end; end
 
     return
 end
@@ -438,7 +438,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             rb = ReverseBitReader(@view data[huf_start:huf_start+stream_len-1])
             let p = 1
                 while p ≤ regen_size
-                    p += _huffman_decode12!(rb, ht, literals, p, regen_size)
+                    p += decode1x2_tail!(rb, ht, literals, p)
                 end
             end
         else

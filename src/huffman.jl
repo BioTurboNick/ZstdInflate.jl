@@ -90,23 +90,7 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
     return HuffmanTable{L, typeof(decode_table)}(decode_table)
 end
 
-# Decode 1 or 2 Huffman symbols into out[p] (and out[p+1] if nsymbols==2 && p<p_end).
-# Refills the bit reader as needed. Returns the number of symbols written.
-@inline function _huffman_decode12!(rb::ReverseBitReader, ht::HuffmanTable{L},
-                                    out::Vector{UInt8}, p::Int, p_end::Int) where L
-    rb.nbits < L && refill!(rb)
-    idx      = _shr(rb.bits, 64 - L) % Int
-    e        = @inbounds ht.decode_table[idx + 1]
-    nb_total = Int(e.stream_nbits)
-    @inbounds out[p] = e.symbols[1]
-    rb.bits   = _shl(rb.bits, nb_total)
-    rb.nbits -= nb_total
-    if e.nsymbols > 1 && p < p_end
-        @inbounds out[p + 1] = e.symbols[2]
-        return 2
-    end
-    return 1
-end
+
 
 
 # ============================================================
