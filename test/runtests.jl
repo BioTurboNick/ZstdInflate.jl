@@ -3,6 +3,7 @@
 
 using Test
 using Random
+using InteractiveUtils
 using ZstdInflate
 using CodecZstd: ZstdCompressorStream
 using CodecZstd.LibZstd
@@ -526,4 +527,38 @@ end
 
     # AC4.2: InflateZstdStream(io; nthreads=N) produces correct parallel output
     @test read(InflateZstdStream(IOBuffer(two_frames); nthreads=2)) == expected_two
+end
+
+# ------------------------------------------------------------------
+# _decode_4streams! codegen properties
+# Guards against structural regressions to instruction count, call
+# density, and register pressure.  Thresholds are baseline + 10%
+# (measured 2026-04-14: instrs=1986, calls=108, spills=102) so any
+# meaningful structural change — lost inlining, new dynamic dispatch,
+# or register pressure explosion — triggers an immediate failure.
+# ------------------------------------------------------------------
+@testset "_decode_4streams! codegen properties" begin
+    # Use typeof(@view ...) to get the concrete SubArray type that
+    # inflate_zstd passes to _decode_4streams!, without hardcoding it.
+    DataView = typeof(@view(UInt8[1][1:1]))
+    buf = IOBuffer()
+    code_native(buf, ZstdInflate._decode_4streams!,
+        (DataView, ZstdInflate.HuffmanTable{11}, Vector{UInt8}, Int),
+        syntax=:intel, debuginfo=:none)
+    asm = String(take!(buf))
+
+    @test !isempty(asm)  # confirm the specialisation was found
+
+    lines = split(asm, '\n')
+    instr_lines = filter(
+        l -> occursin(r"^\t", l) && !occursin(r"^\t\.", l) && !occursin(r"^\t#", l),
+        lines)
+
+    n_instrs = length(instr_lines)
+    n_calls  = count(l -> occursin(r"\bcall\b", l), instr_lines)
+    n_spills = count(l -> occursin("-byte Spill", l), instr_lines)
+
+    @test n_instrs < 2185   # baseline 1986 — catches code-size explosions
+    @test n_calls  < 119    # baseline 108  — catches lost inlining / new dispatch
+    @test n_spills < 113    # baseline 102  — catches register pressure regressions
 end

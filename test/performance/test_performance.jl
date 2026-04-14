@@ -7,7 +7,7 @@ using ZstdInflate
 using Chairmarks
 using CodecZstd
 using CodecZstd: ZstdDecompressor, ZstdDecompressorStream, ZstdCompressorStream
-import Zstandard
+# import Zstandard
 using StatsBase
 using Random
 using Printf
