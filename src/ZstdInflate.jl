@@ -130,7 +130,7 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
 end
 
 # Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
-function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vector{UInt8})
+function _decode_fse_weights!(br::ForwardBitReader, byte_limit::Int, weights::Vector{UInt8})
     al, dist  = read_fse_dist!(br, HUFTABLE_LOG_MAX)
     t         = build_fse_table(dist, al)
 
@@ -167,43 +167,6 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int, weights::Vec
     br.bits  = UInt64(0)
 
     return weights
-end
-
-# Hot-path variant of read_huffman_description: reuses state scratch buffers.
-function read_huffman_description(data::Vector{UInt8}, pos::Int, state::DecompressState)
-    header = Int(data[pos])
-    if header < 128
-        compressed_size = header
-        br = ForwardBitReader(@view data[pos+1:pos+compressed_size])
-        weights = _decode_fse_weights(br, compressed_size, state.huf_weights)
-        last_sym, last_w, table_log = _infer_last_weight(weights)
-        push!(weights, UInt8(last_w))
-        ht = build_huffman_table!(weights, table_log,
-                                 scratch_buffers=(state.huf_rank_count, state.huf_rank_start))
-        return ht, compressed_size + 1
-    else
-        nsyms  = header - 127
-        nbytes = (nsyms + 1) >> 1
-        weights = state.huf_weights
-        resize!(weights, nsyms)
-        for i in 1:nbytes
-            b = data[pos + i]
-            lo = b & 0x0f
-            hi = (b >> 4) & 0x0f
-            idx = (i-1)*2
-            if idx + 1 ≤ nsyms;  weights[idx + 1] = hi;  end
-            if idx + 2 ≤ nsyms;  weights[idx + 2] = lo;  end
-        end
-        last_sym, last_w, table_log = _infer_last_weight(weights)
-        if last_sym ≤ nsyms
-            weights[last_sym] = UInt8(last_w)
-        else
-            push!(weights, UInt8(last_w))
-        end
-        ht = build_huffman_table!(weights, table_log,
-                                 scratch_buffers=(state.huf_rank_count, state.huf_rank_start))
-        return ht, nbytes + 1
-    end
 end
 
 # Read the literals section starting at data[pos].

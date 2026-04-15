@@ -1,5 +1,5 @@
 # ============================================================
-# Section 5: Huffman decode table
+# Huffman decode table
 #   Reference: RFC 8878 §4.2
 # ============================================================
 
@@ -172,38 +172,30 @@ function _decode_fse_weights(br::ForwardBitReader, byte_limit::Int)
     return weights
 end
 
-# Read the Huffman tree description and return a HuffmanTable.
-# data[pos] is the first byte of the description.
-# Returns (HuffmanTable, bytes_consumed).
-function read_huffman_description(data::Vector{UInt8}, pos::Int)
+function read_huffman_description(data::Vector{UInt8}, pos::Int, state::DecompressState)
     header = Int(data[pos])
+    weights = state.huf_weights
+    local table_log
     if header < 128
-        # FSE-compressed weights: header = compressed_size
-        compressed_size = header
-        # Forward bit reader over the compressed bytes
-        br = ForwardBitReader(@view data[pos+1:pos+compressed_size])
-        weights = _decode_fse_weights(br, compressed_size)
-        last_sym, last_w, table_log = _infer_last_weight(weights)
+        nbytes_compressed = header
+        br = ForwardBitReader(@view data[pos .+ (1:nbytes_compressed)])
+        _decode_fse_weights!(br, nbytes_compressed, weights)
+        _, last_w, table_log = _infer_last_weight(weights)
         push!(weights, UInt8(last_w))
-        ht = build_huffman_table!(weights, table_log)
-        return ht, compressed_size + 1
     else
-        # Direct representation: (header - 127) weight nibbles follow
-        nsyms = header - 127
-        # Each byte holds two nibbles; ceil(nsyms/2) bytes
-        nbytes = (nsyms + 1) >> 1
-        weights = Vector{UInt8}(undef, nsyms)
-        for i in 1:nbytes
+        nsyms  = header - 127
+        nbytes_compressed = (nsyms + 1) >> 1
+        weights = state.huf_weights
+        resize!(weights, nsyms)
+        for i in 1:nbytes_compressed
             b = data[pos + i]
             lo = b & 0x0f
             hi = (b >> 4) & 0x0f
-            idx = (i-1)*2
-            if idx + 1 ≤ nsyms
-                weights[idx + 1] = hi    # high nibble = first weight
-            end
-            if idx + 2 ≤ nsyms
-                weights[idx + 2] = lo    # low nibble = second weight
-            end
+            idx = (i - 1) * 2 + 1
+            idx ≤ nsyms &&
+                (weights[idx] = hi)
+            idx + 1 ≤ nsyms &&
+                (weights[idx + 1] = lo)
         end
         last_sym, last_w, table_log = _infer_last_weight(weights)
         if last_sym ≤ nsyms
@@ -211,7 +203,8 @@ function read_huffman_description(data::Vector{UInt8}, pos::Int)
         else
             push!(weights, UInt8(last_w))
         end
-        ht = build_huffman_table!(weights, table_log)
-        return ht, nbytes + 1
     end
+
+    ht = build_huffman_table!(weights, table_log, scratch_buffers = (state.huf_rank_count, state.huf_rank_start))
+    return ht, nbytes_compressed + 1
 end
