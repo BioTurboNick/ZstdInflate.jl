@@ -34,7 +34,7 @@ function xxhash64(data::AbstractVector{UInt8}, seed::UInt64 = UInt64(0))
             seed,
             seed - XXH_P1))
         while 8(pos - 1) + 32 ≤ len
-            vdata = vload(Vec{4, UInt64}, (@view rdata64[pos:pos + 3]), 1)
+            vdata = @inbounds vloada(Vec{4, UInt64}, (@view rdata64[pos:pos + 3]), 1)
             vs = xxh_round(vs, ltoh(vdata))
             pos += 4
         end
