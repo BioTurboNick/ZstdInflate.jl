@@ -1,3 +1,105 @@
+# ============================================================
+# Huffman tree loading
+#   Reference: RFC 8878 §4.2.1
+# ============================================================
+
+function read_huffman_description(data::Vector{UInt8}, pos::Int; scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}}} = nothing)
+    headerByte = Int(data[pos]) # RFC 8878 §4.2.1.1
+    weights = scratch_buffers !== nothing ? scratch_buffers[1] : UInt8[]
+    is_fse_encoded = headerByte < 128
+    if is_fse_encoded
+        nbytes = headerByte
+        br = ForwardBitReader(@view data[pos .+ (1:nbytes)])
+        _, table_log = _read_fse_weights!(weights, br, nbytes)
+    else
+        nsyms = headerByte - 127
+        nbytes = (nsyms + 1) >> 1
+        weightdata = @view data[pos .+ (1:nbytes)]
+        _, table_log = _read_direct_weights!(weights, weightdata, nsyms)
+    end
+    scratch_buffers !== nothing && (scratch_buffers = scratch_buffers[2:3])
+    ht = build_huffman_table!(weights, table_log; scratch_buffers)
+    return ht, nbytes+ 1
+end
+
+function _read_direct_weights!(weights::Vector{UInt8}, data::AbstractVector{UInt8}, nsyms::Int)
+    nbytes = (nsyms + 1) >> 1
+    resize!(weights, nsyms + 1)
+    for i in 1:nbytes
+        b = data[i]
+        j = (i - 1) * 2 + 1
+        weights[j] = (b >> 4) & 0x0f
+        j + 1 ≤ nsyms &&
+            (weights[j + 1] = b & 0x0f)
+    end
+    last_w, table_log = _infer_last_weight(weights)
+    weights[end] = last_w
+    return weights, table_log
+end
+
+# RFC 8878 §4.2.1.2
+function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_limit::Int)
+    al, dist = read_fse_dist!(br, HUFTABLE_LOG_MAX)
+    t = build_fse_table(dist, al)
+
+    pos_after = byte_pos(br)
+    n_remain = byte_limit - pos_after + 1
+    n_remain > 0 ||
+        throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
+
+    rb = ReverseBitReader(@view br.data[pos_after:pos_after+n_remain-1])
+
+    state1 = fse_init!(rb, t)
+    state2 = fse_init!(rb, t)
+
+    empty!(weights)
+    while true
+        sym1 = fse_peek(t, state1)
+        state1 = _fse_update_unchecked(rb, t, state1)
+        push!(weights, UInt8(sym1))
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
+            push!(weights, UInt8(fse_peek(t, state2)))
+            break
+        end
+
+        sym2 = fse_peek(t, state2)
+        state2 = _fse_update_unchecked(rb, t, state2)
+        push!(weights, UInt8(sym2))
+        if _rbr_overflowed(rb) || length(weights) ≥ 255
+            push!(weights, UInt8(fse_peek(t, state1)))
+            break
+        end
+    end
+
+    br.pos = byte_limit + 1
+    br.nbits = 0
+    br.bits = UInt64(0)
+
+    last_w, table_log = _infer_last_weight(weights)
+    push!(weights, UInt8(last_w))
+
+    return weights, table_log
+end
+
+function _infer_last_weight(weights::Vector{UInt8})
+    total = Int(sum(w -> UInt64(1) << (Int(w) - 1), weights))
+    total > 0 || return (1, 1)  # single symbol edge case
+    table_log = _flog2(total) + 1
+    p = UInt64(1) << table_log
+    p > total || (table_log += 1; p <<= 1)
+    rest = Int(p - total)
+    rest > 0 && (rest & (rest - 1)) == 0 ||
+        throw(ArgumentError("zstd: invalid Huffman weight sum"))
+    last_w = _flog2(rest) + 1
+    return last_w, table_log
+end
+
+
+# ============================================================
+# Huffman stream decoding
+#   Reference: RFC 8878 §4.2.2
+# ============================================================
+
 # Decode the four Huffman streams stored in `data` using the lookup table `ht` and store
 # the result in `literals`. This code is tuned to promote LLVM SIMD instructions; changes
 # in it or the functions it calls could break this. Use caution.

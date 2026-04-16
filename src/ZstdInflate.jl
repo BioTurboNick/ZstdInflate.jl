@@ -35,7 +35,6 @@ include("fse.jl")
 include("huffman.jl")
 include("dictionary.jl")
 include("constants.jl")
-include("decompress.jl")
 
 export inflate_zstd, InflateZstdStream, ZstdDict
 
@@ -87,6 +86,8 @@ mutable struct DecompressState
     fse_norm ::Vector{Int16}
 end
 
+include("decompress.jl")
+
 const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
@@ -129,45 +130,6 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
                            state.fse_occ, state.fse_norm)
 end
 
-# Hot-path variant of _decode_fse_weights: reuses a caller-supplied buffer.
-function _decode_fse_weights!(br::ForwardBitReader, byte_limit::Int, weights::Vector{UInt8})
-    al, dist  = read_fse_dist!(br, HUFTABLE_LOG_MAX)
-    t         = build_fse_table(dist, al)
-
-    pos_after = byte_pos(br)
-    n_remain  = byte_limit - pos_after + 1
-    n_remain > 0 || throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
-
-    rb = ReverseBitReader(@view br.data[pos_after:pos_after+n_remain-1])
-
-    state1 = fse_init!(rb, t)
-    state2 = fse_init!(rb, t)
-
-    empty!(weights)
-    while true
-        sym1 = fse_peek(t, state1)
-        state1 = _fse_update_unchecked(rb, t, state1)
-        push!(weights, UInt8(sym1))
-        if _rbr_overflowed(rb) || length(weights) ≥ 255
-            push!(weights, UInt8(fse_peek(t, state2)))
-            break
-        end
-
-        sym2 = fse_peek(t, state2)
-        state2 = _fse_update_unchecked(rb, t, state2)
-        push!(weights, UInt8(sym2))
-        if _rbr_overflowed(rb) || length(weights) ≥ 255
-            push!(weights, UInt8(fse_peek(t, state1)))
-            break
-        end
-    end
-
-    br.pos   = byte_limit + 1
-    br.nbits = 0
-    br.bits  = UInt64(0)
-
-    return weights
-end
 
 # Read the literals section starting at data[pos].
 # Returns (literals::Vector{UInt8}, bytes_consumed::Int).
@@ -241,7 +203,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         payload_end   = payload_start + compressed_size - 1
 
         if lit_type == 2   # Compressed: Huffman description included
-            ht, hdr_len = read_huffman_description(data, payload_start, state)
+            ht, hdr_len = read_huffman_description(data, payload_start; scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
             state.huffman = ht
             huf_start = payload_start + hdr_len
         else               # Treeless: reuse previous Huffman table

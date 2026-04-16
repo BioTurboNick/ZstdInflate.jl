@@ -13,3 +13,6 @@
 @inline _le64(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt64}(pointer(d, i))))
 @inline _le32(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt32}(pointer(d, i))))
 @inline _le16(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt16}(pointer(d, i))))
+
+# floor(log2(n)) for n ≥ 1
+@inline _flog2(n::Int) = 63 - leading_zeros(UInt64(n))

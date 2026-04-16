@@ -16,8 +16,6 @@ struct RLEFSETable
     symbol::UInt8
 end
 
-# floor(log2(n)) for n ≥ 1
-@inline _flog2(n::Int) = 63 - leading_zeros(UInt64(n))
 
 # Build an FSE decode table from a normalized probability distribution.
 # norm[i+1] is the probability of symbol i; -1 means "probability 1/tableSize".
