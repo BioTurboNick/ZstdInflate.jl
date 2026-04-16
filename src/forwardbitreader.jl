@@ -22,7 +22,18 @@ function refill!(br::ForwardBitReader)
     end
 end
 
-@inline function read_bits!(br::ForwardBitReader, n::Int)
+@inline function Base.peek(br::ForwardBitReader, n::Int)
+    n > 0 ||
+        return UInt64(0)
+    br.nbits < n &&
+        refill!(br)
+    br.nbits ≥ n ||
+        throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
+    readmask = (UInt64(1) << n) - UInt64(1)
+    return br.bits & readmask
+end
+
+@inline function Base.read(br::ForwardBitReader, n::Int)
     n > 0 ||
         return UInt64(0)
     br.nbits < n &&
@@ -34,6 +45,18 @@ end
     br.bits >>>= n
     br.nbits -= n
     return val
+end
+
+@inline function Base.skip(br::ForwardBitReader, n::Int)
+    n > 0 ||
+        return
+    br.nbits < n &&
+        refill!(br)
+    br.nbits ≥ n ||
+        throw(ArgumentError("zstd: unexpected end of bitstream (need $n bits, have $(br.nbits))"))
+    br.bits >>>= n
+    br.nbits -= n
+    return
 end
 
 # Discard any sub-byte leftover so the reader is byte-aligned.

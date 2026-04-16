@@ -1,25 +1,118 @@
 # ============================================================
+# Compressed block reading
+#   Reference: RFC 8878 §3.1.1.3
+# ============================================================
+
+
+
+# ============================================================
+# Literals reading
+#   Reference: RFC 8878 §3.1.1.3
+# ============================================================
+
+# Read the literals section starting at data[pos].
+# Returns (literals::Vector{UInt8}, bytes_consumed::Int).
+function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
+    br = ForwardBitReader(@view data[pos:end])
+    litblock_type = read(br, 2)
+    size_format = peek(br, 2)
+
+    is_raw = litblock_type == 0
+    is_rle = litblock_type == 1
+    is_treeless = litblock_type == 3
+
+    if is_raw || is_rle
+        size_format_nbits = iseven(size_format) ? 1 :
+                                                  2
+        size_nbits, header_nbytes = iseven(size_format) ? ( 5, 1) :
+                                    size_format == 1    ? (12, 2) :
+                                                          (20, 3)
+        skip(br, size_format_nbits)
+        regen_size = Int(read(br, size_nbits))
+        compressed_size = is_raw ? regen_size :
+                                   1
+
+        literals = state.literals_buf
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+
+        block_start = pos + header_nbytes
+
+        if is_raw
+            copyto!(literals, 1, data, block_start, regen_size)
+        else
+            literals[1:regen_size] .= data[block_start]
+        end
+
+        return literals, header_nbytes + compressed_size
+    else # Compressed (2) or Treeless (3)
+        size_nbits, header_nbytes = size_format < 2  ? (10, 3) :
+                                    size_format == 2 ? (14, 4) :
+                                                       (18, 5)
+        num_streams = size_format == 0 ? 1 :
+                                         4
+        
+        skip(br, 2)
+        regen_size = Int(read(br, size_nbits))
+        compressed_size = Int(read(br, size_nbits))
+
+        payload_start = pos + header_nbytes
+        payload_end = payload_start + compressed_size - 1
+
+        if is_treeless
+            state.huffman !== nothing ||
+                throw(ArgumentError("zstd: treeless literals but no prior Huffman table"))
+            ht = state.huffman
+            huf_start = payload_start
+        else # Compressed
+            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
+            state.huffman = ht
+            huf_start = payload_start + hdr_len
+        end
+
+        literals = state.literals_buf
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+
+        if num_streams == 1
+            stream_len = payload_end - huf_start + 1
+            rb = ReverseBitReader(@view data[huf_start:huf_start + stream_len - 1])
+            let p = 1
+                while p ≤ regen_size
+                    p += decode1x2_tail!(rb, ht, literals, p)
+                end
+            end
+        else
+            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
+        end
+
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)  # trim dual-symbol slack
+
+        return literals, header_nbytes + compressed_size
+    end
+end
+
+
+# ============================================================
 # Huffman tree loading
 #   Reference: RFC 8878 §4.2.1
 # ============================================================
 
-function read_huffman_description(data::Vector{UInt8}, pos::Int; scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}}} = nothing)
-    headerByte = Int(data[pos]) # RFC 8878 §4.2.1.1
+function read_huffman_description(data::AbstractVector{UInt8}; scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}}} = nothing)
+    headerByte = Int(data[1]) # RFC 8878 §4.2.1.1
     weights = scratch_buffers !== nothing ? scratch_buffers[1] : UInt8[]
     is_fse_encoded = headerByte < 128
     if is_fse_encoded
         nbytes = headerByte
-        br = ForwardBitReader(@view data[pos .+ (1:nbytes)])
+        br = ForwardBitReader(@view data[2:nbytes + 1])
         _, table_log = _read_fse_weights!(weights, br, nbytes)
     else
         nsyms = headerByte - 127
         nbytes = (nsyms + 1) >> 1
-        weightdata = @view data[pos .+ (1:nbytes)]
+        weightdata = @view data[2:nbytes + 1]
         _, table_log = _read_direct_weights!(weights, weightdata, nsyms)
     end
     scratch_buffers !== nothing && (scratch_buffers = scratch_buffers[2:3])
     ht = build_huffman_table!(weights, table_log; scratch_buffers)
-    return ht, nbytes+ 1
+    return ht, nbytes + 1
 end
 
 function _read_direct_weights!(weights::Vector{UInt8}, data::AbstractVector{UInt8}, nsyms::Int)

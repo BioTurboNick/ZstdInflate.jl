@@ -89,7 +89,7 @@ function _refill_bytewise!(rb::ReverseBitReader)
     return
 end
 
-@inline function read_bits!(rb::ReverseBitReader, n::Int)
+@inline function Base.read(rb::ReverseBitReader, n::Int)
     n == 0 &&
         return UInt64(0)
     rb.nbits < n &&

@@ -69,3 +69,8 @@ const INIT_REPEAT_OFFSETS = (1, 4, 8)
 
 # Maximum Huffman table log (RFC 8878 §4.2.1)
 const HUFTABLE_LOG_MAX = 11
+
+# Slack bytes appended to the literals buffer beyond regen_size.
+# wildcopy16 copies in 16-byte chunks; a copy starting at the last valid byte
+# can over-read 15 bytes past regen_size, so those bytes must be allocated.
+const LITERALS_WILDCOPY_SLACK = 15

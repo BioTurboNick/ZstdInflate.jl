@@ -131,112 +131,6 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
 end
 
 
-# Read the literals section starting at data[pos].
-# Returns (literals::Vector{UInt8}, bytes_consumed::Int).
-function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
-    b0 = Int(data[pos])
-    lit_type = b0 & 0x03
-    size_format = (b0 >> 2) & 0x03
-
-    if lit_type == 0 || lit_type == 1   # Raw or RLE
-        # Sizes:
-        #   size_format == 00 → 5-bit size in bits [7:3] of b0
-        #   size_format == 01 → 12-bit size in (b0>>4) | (b1<<4)
-        #   size_format == 10 → 20-bit size in (b0>>4) | (b1<<4) | (b2<<12)  (actually 14-bit? no, 20)
-        #   size_format == 11 → reserved
-        if size_format == 0 || size_format == 2
-            regen_size = (b0 >> 3) & 0x1f
-            header_size = 1
-        elseif size_format == 1
-            regen_size = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4)
-            header_size = 2
-        else  # size_format == 3
-            regen_size = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | (Int(data[pos+2]) << 12)
-            header_size = 3
-        end
-
-        if lit_type == 0   # Raw
-            literals = state.literals_buf
-            resize!(literals, regen_size + 15)
-            copyto!(literals, 1, data, pos + header_size, regen_size)
-            return literals, header_size + regen_size
-        else               # RLE
-            byte_val = data[pos+header_size]
-            literals = state.literals_buf
-            resize!(literals, regen_size + 15)
-            fill!(view(literals, 1:regen_size), byte_val)
-            return literals, header_size + 1
-        end
-    else   # Compressed (2) or Treeless (3)
-        # Header sizes (RFC 8878 §3.1.1.3.2.2):
-        #   size_format == 00 → 10-bit sizes, 3 streams NOT used (1 stream), 3-byte header
-        #   size_format == 01 → 10-bit sizes, 4-stream, 3-byte header (actually: 10+10 bits = 2.5 bytes → 3 bytes)
-        #   size_format == 10 → 14-bit sizes, 4-stream, 4-byte header
-        #   size_format == 11 → 18-bit sizes, 4-stream, 5-byte header
-        local compressed_size::Int, regen_size::Int, header_size::Int, num_streams::Int
-        if size_format == 0
-            # 1-stream, header: b0 b1 b2
-            # regen_size  = bits [7:2] of b0 combined with b1 [3:0]: 10 bits
-            # compressed_size = b1[7:4] | b2: 10 bits
-            regen_size      = ((b0 >> 4) & 0x0f) | ((Int(data[pos+1]) & 0x3f) << 4)
-            compressed_size = ((Int(data[pos+1]) >> 6) & 0x03) | (Int(data[pos+2]) << 2)
-            header_size     = 3
-            num_streams     = 1
-        elseif size_format == 1
-            regen_size      = ((b0 >> 4) & 0x0f) | ((Int(data[pos+1]) & 0x3f) << 4)
-            compressed_size = ((Int(data[pos+1]) >> 6) & 0x03) | (Int(data[pos+2]) << 2)
-            header_size     = 3
-            num_streams     = 4
-        elseif size_format == 2
-            regen_size      = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | ((Int(data[pos+2]) & 0x03) << 12)
-            compressed_size = ((Int(data[pos+2]) >> 2) & 0x3f) | (Int(data[pos+3]) << 6)
-            header_size     = 4
-            num_streams     = 4
-        else  # size_format == 3
-            regen_size      = ((b0 >> 4) & 0x0f) | (Int(data[pos+1]) << 4) | ((Int(data[pos+2]) & 0x3f) << 12)
-            compressed_size = ((Int(data[pos+2]) >> 6) & 0x03) | (Int(data[pos+3]) << 2) | (Int(data[pos+4]) << 10)
-            header_size     = 5
-            num_streams     = 4
-        end
-
-        payload_start = pos + header_size
-        payload_end   = payload_start + compressed_size - 1
-
-        if lit_type == 2   # Compressed: Huffman description included
-            ht, hdr_len = read_huffman_description(data, payload_start; scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
-            state.huffman = ht
-            huf_start = payload_start + hdr_len
-        else               # Treeless: reuse previous Huffman table
-            state.huffman !== nothing || throw(ArgumentError("zstd: treeless literals but no prior Huffman table"))
-            ht = state.huffman
-            huf_start = payload_start
-        end
-
-        literals = state.literals_buf
-        # 16 bytes of slack: 1 for the dual-symbol decode unconditional write,
-        # plus 15 for wildcopy16 over-read from literals into out.
-        resize!(literals, regen_size + 16)
-
-        if num_streams == 1
-            stream_len = payload_end - huf_start + 1
-            rb = ReverseBitReader(@view data[huf_start:huf_start+stream_len-1])
-            let p = 1
-                while p ≤ regen_size
-                    p += decode1x2_tail!(rb, ht, literals, p)
-                end
-            end
-        else
-            # 4 streams: dispatch to _decode_4streams! which specialises on
-            # HuffmanTable{L}, making safe_n = 57 ÷ L a compile-time constant.
-            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
-        end
-
-        resize!(literals, regen_size + 15)  # keep wildcopy16 over-read slack; trim dual-symbol slack
-
-        return literals, header_size + compressed_size
-    end
-end
-
 # ============================================================
 # Section 8: Sequences section
 #   Reference: RFC 8878 §3.1.1.3.3
@@ -252,15 +146,15 @@ end
 @inline function _wildcopy16!(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::Int)
     n == 0 && return
     if n < 16
-        vstore(vload(Vec{16, UInt8}, src), dst)
+        @inbounds vstore(vload(Vec{16, UInt8}, src), dst)
         return
     end
     k = 0
     while k + 16 ≤ n
-        vstore(vload(Vec{16, UInt8}, src + k), dst + k)
+        @inbounds vstore(vload(Vec{16, UInt8}, src + k), dst + k)
         k += 16
     end
-    k < n && vstore(vload(Vec{16, UInt8}, src + n - 16), dst + n - 16)
+    k < n && @inbounds vstore(vload(Vec{16, UInt8}, src + n - 16), dst + n - 16)
 end
 
 # Execute decoded sequences to produce output bytes.
@@ -530,12 +424,12 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
         else
             # Slow path: large offset (of_code > ~20); sequential reads.
-            of_extra   = Int(read_bits!(rb, of_n ))
-            ml_extra   = Int(read_bits!(rb, ml_n))
-            ll_extra   = Int(read_bits!(rb, ll_n))
-            ll_bits    = Int(read_bits!(rb, ll_nb))
-            ml_bits    = Int(read_bits!(rb, ml_nb))
-            of_bits    = Int(read_bits!(rb, of_nb))
+            of_extra   = Int(read(rb, of_n ))
+            ml_extra   = Int(read(rb, ml_n))
+            ll_extra   = Int(read(rb, ll_n))
+            ll_bits    = Int(read(rb, ll_nb))
+            ml_bits    = Int(read(rb, ml_nb))
+            of_bits    = Int(read(rb, of_nb))
         end
 
         of_val64 = (Int64(1) << of_code) + of_extra

@@ -82,7 +82,7 @@ end
 # Implements the exact reference zstd sliding-threshold algorithm.
 # Hot-path: caller supplies a reusable norm buffer (emptied on entry).
 function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
-    accuracy_log = Int(read_bits!(br, 4)) + 5
+    accuracy_log = Int(read(br, 4)) + 5
     table_size   = 1 << accuracy_log
 
     empty!(norm)
@@ -154,20 +154,20 @@ end
 # ------- FSE state machine helpers -------
 
 @inline fse_init!(rb::ReverseBitReader, t::FSETable) =
-    Int(read_bits!(rb, t.accuracy_log))
+    Int(read(rb, t.accuracy_log))
 
 @inline fse_peek(t::FSETable, state::Int) = Int(t.symbols[state+1])
 
 @inline function fse_update!(rb::ReverseBitReader, t::FSETable, state::Int)
     nb   = Int(t.nb_bits[state+1])
-    bits = Int(read_bits!(rb, nb))
+    bits = Int(read(rb, nb))
     return Int(t.baselines[state+1]) + bits
 end
 
 # RLE variants — accuracy_log is always 1, both states emit the same symbol,
 # and transitions consume 0 bits.
 @inline fse_init!(rb::ReverseBitReader, t::RLEFSETable) =
-    (read_bits!(rb, 1); 0)   # consume the 1-bit state init, state is always 0
+    (read(rb, 1); 0)   # consume the 1-bit state init, state is always 0
 
 @inline fse_peek(t::RLEFSETable, state::Int) = Int(t.symbol)
 
@@ -200,7 +200,7 @@ function read_fse_table!(br::ForwardBitReader, default::FSETable,
     if mode == 0
         return default
     elseif mode == 1
-        sym = read_bits!(br, 8)   # RLE: single symbol
+        sym = read(br, 8)   # RLE: single symbol
         return RLEFSETable(UInt8(sym))
     elseif mode == 2
         al, dist = read_fse_dist!(br, max_sym, norm)
