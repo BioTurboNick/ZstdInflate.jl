@@ -1,8 +1,5 @@
-# ============================================================
 # Finite State Entropy (FSE) decode table
 #   Reference: RFC 8878 §4.1
-# ============================================================
-
 struct FSEDistTable
     accuracy_log::Int
     symbols  ::Vector{UInt8}
@@ -10,10 +7,10 @@ struct FSEDistTable
     baselines::Vector{UInt32}
 end
 
+# Run-length encoding table
 struct RLEDistTable
     symbol::UInt8
 end
-
 
 # Build an FSE decode table from a normalized probability distribution.
 # norm[i+1] is the probability of symbol i; -1 means "probability 1/tableSize".

@@ -1,3 +1,221 @@
+# ============================================================
+# Section 10: Frame decompression
+#   Reference: RFC 8878 §3.1
+# ============================================================
+
+@inline function _read_magic(data::Vector{UInt8}, pos::Int)
+    length(data) ≥ pos + 3 ||
+        throw(ArgumentError("zstd: truncated frame (magic)"))
+    _le32(data, pos)
+end
+
+# Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
+function _skip_frame(data::Vector{UInt8}, pos::Int)
+    pos += 4 # past magic
+
+    length(data) ≥ pos + 3 ||
+        throw(ArgumentError("zstd: truncated skippable frame (size)"))
+
+    frame_size = Int64(_le32(data, pos)) # 4-byte LE size field (may exceed Int32)
+    pos += 4
+
+    pos + frame_size - 1 ≤ length(data) ||
+        throw(ArgumentError("zstd: truncated skippable frame (data)"))
+
+    pos += Int(frame_size)
+    return pos
+end
+
+function _read_frame_header_descriptor(data::Vector{UInt8}, pos::Int)
+    length(data) ≥ pos ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
+
+    fhd = Int(data[pos])
+    fcs_flag = (fhd >> 6) & 0x03
+    single_segment_flag = Bool((fhd >> 5) & 0x01)
+    content_checksum_flag = Bool((fhd >> 2) & 0x01)
+    dict_id_flag = fhd & 0x03
+    (fhd >> 3) & 0x01 == 0 ||
+        throw(ArgumentError("zstd: reserved bit set in frame header descriptor"))
+    fcs_size = (fcs_flag == 0 && !single_segment_flag) ?
+        0 :
+        1 << fcs_flag
+    dict_id_size = (dict_id_flag == 0) ?
+        0 :
+        1 << (dict_id_flag - 1)
+    
+    pos += 1
+
+    return fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos
+end
+
+function _read_and_validate_dict_id(data::Vector{UInt8}, pos::Int, dict_id_size::Int, dict::Union{ZstdDict, Nothing})
+    dict_id_size > 0 ||
+        return pos # no dictionary ID field
+    length(data) ≥ pos + dict_id_size - 1 ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
+
+    dict_id_size != 0 && dict === nothing &&
+        throw(ArgumentError("zstd: frame requires a dictionary but none was provided"))
+    if dict_id_size > 0 && dict !== nothing && dict.id != 0
+        frame_dict_id = (dict_id_size == 1) ? UInt32(data[pos]) :
+                        (dict_id_size == 2) ? UInt32(_le16(data, pos)) :
+                        _le32(data, pos)
+        frame_dict_id == dict.id ||
+            throw(ArgumentError("zstd: dictionary ID mismatch (frame=0x$(string(frame_dict_id, base = 16)), dict=0x$(string(dict.id, base = 16)))"))
+    end
+
+    pos += dict_id_size
+
+    return pos
+end
+
+function _read_frame_content_size(data::Vector{UInt8}, pos::Int, fcs_size::Int)
+    fcs_size > 0 ||
+        return -1, pos # unknown content size
+    length(data) ≥ pos + fcs_size - 1 ||
+        throw(ArgumentError("zstd: truncated frame (FHD)"))
+    
+    fcs_u64 =
+        fcs_size == 0 ? UInt64(0) : # unknown
+        fcs_size == 1 ? UInt64(data[pos]) :
+        fcs_size == 2 ? UInt64(_le16(data, pos)) + 256 :
+        fcs_size == 4 ? UInt64(_le32(data, pos)) :
+                        _le64(data, pos)
+    fcs_u64 ≤ typemax(Int) ||
+        throw(ArgumentError("zstd: frame content size $fcs_u64 exceeds addressable range"))
+
+    pos += fcs_size
+
+    return Int(fcs_u64), pos
+end
+
+function _read_window_descriptor(data::Vector{UInt8}, pos::Int, single_segment_flag::Bool)
+    single_segment_flag && return 0, pos
+    length(data) ≥ pos ||
+        throw(ArgumentError("zstd: truncated frame (WD)"))
+    return Int(data[pos]), pos + 1
+end
+
+function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing})
+    # Frame Header Descriptor (RFC 8878 §3.1.1.1.1)
+    fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos = _read_frame_header_descriptor(data, pos)
+
+    # Dictionary ID (RFC 8878 §3.1.1.1.3)
+    pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
+
+    # Window Descriptor (RFC 8878 §3.1.1.1.2, omitted when Single_Segment_Flag is set)
+    window_descriptor, pos = _read_window_descriptor(data, pos, single_segment_flag)
+
+    # Frame Content Size (RFC 8878 §3.1.1.1.4)
+    frame_content_size, pos = _read_frame_content_size(data, pos, fcs_size)
+
+    # Set Window Size
+    if single_segment_flag
+        frame_content_size ≥ 0 ||
+            throw(ArgumentError("zstd: single-segment frame with unknown content size"))
+        window_size = frame_content_size
+    else
+        exponent = window_descriptor >> 4
+        mantissa = window_descriptor & 0x0f
+        window_base = 1 << (10 + exponent)
+        window_size = window_base + (window_base >> 3) * mantissa
+    end
+
+    return window_size, frame_content_size, content_checksum_flag, pos
+end
+
+"""
+    FrameInfo
+
+Lightweight descriptor for a single non-skippable zstd frame found during
+pre-scan.  `data_start` is the 1-based byte offset of the frame's 4-byte
+magic number in the input vector.  `fcs` is the declared decompressed size
+in bytes, or -1 when the Frame Content Size field is absent from the header.
+"""
+struct FrameInfo
+    data_start ::Int   # 1-based byte offset of the frame's magic number
+    fcs        ::Int   # frame content size in bytes; -1 if absent
+end
+
+"""
+    _scan_frames(data, pos, dict) -> (Vector{FrameInfo}, Int)
+
+Walk `data` starting at byte offset `pos`, reading frame and block headers
+without decompressing, and return a `Vector{FrameInfo}` (one entry per
+non-skippable zstd frame found) together with the position after the last
+consumed byte.
+
+Skippable frames are silently skipped and excluded from the result.
+Throws `ArgumentError` on any structural violation (truncated headers,
+reserved bits, oversized blocks, bad magic numbers) using the same error
+messages as `_decompress_frame!`.
+"""
+function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing})
+    frames = FrameInfo[]
+    while pos ≤ length(data)
+        frame_start = pos
+        magic = _read_magic(data, pos)
+        if _is_skippable(magic)
+            pos = _skip_frame(data, pos)
+        elseif magic == ZSTD_MAGIC
+            pos += 4  # advance past magic number
+
+            # Read frame header fields — validates reserved bits and dict ID
+            fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos =
+                _read_frame_header_descriptor(data, pos)
+            pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
+            # Call _read_window_descriptor solely to advance pos past the
+            # window descriptor byte.  The parsed window size is not needed
+            # for scanning; discard the first return value.
+            _, pos = _read_window_descriptor(data, pos, single_segment_flag)
+            fcs, pos = _read_frame_content_size(data, pos, fcs_size)
+
+            # Scan block headers to advance past the frame without decompressing.
+            # Block header is 3 bytes; block_type distinguishes advance amount:
+            #   0 (raw)        → advance by block_size bytes
+            #   1 (RLE)        → advance by 1 byte (single repeated byte)
+            #   2 (compressed) → advance by block_size bytes
+            #   3 (reserved)   → error; guard here so _scan_frames produces a
+            #                    clean error rather than silently miscomputing
+            #                    frame boundaries for subsequent frames
+            while true
+                length(data) ≥ pos + 2 ||
+                    throw(ArgumentError("zstd: truncated block header"))
+                bh1 = Int(data[pos])
+                bh2 = Int(data[pos + 1])
+                bh3 = Int(data[pos + 2])
+                pos += 3
+                last_block = bh1 & 0x01
+                block_type = (bh1 >> 1) & 0x03
+                block_size = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
+                block_type != 3 ||
+                    throw(ArgumentError("zstd: reserved block type"))
+                block_size ≤ 131072 ||
+                    throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
+                if block_type == 1  # RLE: 1-byte payload regardless of block_size
+                    pos += 1
+                else
+                    pos += block_size
+                end
+                last_block != 0 && break
+            end
+
+            # Skip optional 4-byte content checksum
+            if content_checksum_flag
+                length(data) ≥ pos + 3 ||
+                    throw(ArgumentError("zstd: truncated content checksum"))
+                pos += 4
+            end
+
+            push!(frames, FrameInfo(frame_start, fcs))
+        else
+            throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
+        end
+    end
+    return frames, pos
+end
+
 # RFC 8878 §3.1.1
 function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
                             dict::Union{ZstdDict, Nothing} = nothing)
@@ -320,6 +538,38 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
     return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated)
 end
+
+function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
+                         prev::Union{FSEDistTable, RLEDistTable, Nothing},
+                         mode::Int, max_sym::Int, max_al::Int,
+                         syms::Vector{UInt8}, nb::Vector{UInt8},
+                         base::Vector{UInt32}, occ::Vector{Int},
+                         norm::Vector{Int16})
+    if mode == 0 # Predefined_Mode
+        return default
+    elseif mode == 1 # RLE_Mode
+        sym = read(br, 8)
+        return RLEDistTable(UInt8(sym))
+    elseif mode == 2 # FSE_Compressed_Mode
+        al, dist = read_fse_dist!(br, norm)
+        al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
+        length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
+        return build_fse_table(dist, al, syms, nb, base, occ)
+    else # mode == 3; Repeat_Mode
+        prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous distribution table"))
+        return prev
+    end
+end
+
+function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
+                         prev::Union{FSEDistTable,RLEDistTable,Nothing},
+                         mode::Int, max_sym::Int, max_al::Int,
+                         slot::FSEDistTableSlot, state::DecompressState)
+    return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
+                           slot.syms, slot.nb, slot.base,
+                           state.fse_occ, state.fse_norm)
+end
+
 
 # Execute decoded sequences to produce output bytes.
 # Writes starting at wpos in out; returns the next write position.

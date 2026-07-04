@@ -19,3 +19,24 @@
 
 
 splitbyte(b::UInt8) = b & 0x0F, b >> 4
+
+# Copy n bytes from src to dst using 16-byte SIMD chunks.
+# Modelled on ZSTD_wildcopy in zstd/lib/common/zstd_internal.h: copies always
+# proceed in full 16-byte chunks, deliberately over-reading/over-writing by up
+# to 15 bytes into pre-allocated slack to avoid a branch on the tail.
+# Requires src to have ≥15 bytes of allocated slack past its valid content,
+# and dst to have ≥15 bytes of allocated slack past the write end.
+# Both src and dst must not overlap.
+@inline function _wildcopy16!(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::Int)
+    n == 0 && return
+    if n < 16
+        @inbounds vstore(vload(Vec{16, UInt8}, src), dst)
+        return
+    end
+    k = 0
+    while k + 16 ≤ n
+        @inbounds vstore(vload(Vec{16, UInt8}, src + k), dst + k)
+        k += 16
+    end
+    k < n && @inbounds vstore(vload(Vec{16, UInt8}, src + n - 16), dst + n - 16)
+end
