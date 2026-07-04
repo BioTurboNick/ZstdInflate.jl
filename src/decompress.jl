@@ -1,8 +1,4 @@
-# ============================================================
-# Compressed block reading
-#   Reference: RFC 8878 §3.1.1.3
-# ============================================================
-
+# RFC 8878 §3.1.1
 function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
                             dict::Union{ZstdDict, Nothing} = nothing)
     # Magic number (4 bytes, little-endian)
@@ -118,6 +114,86 @@ function _decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int, stat
     end
 end
 
+# Reference: RFC 8878 §3.1.1.3.1
+function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
+    br = ForwardBitReader(@view data[pos:end])
+    litblock_type = read(br, 2)
+    size_format = peek(br, 2)
+
+    is_raw = litblock_type == 0
+    is_rle = litblock_type == 1
+    is_treeless = litblock_type == 3
+
+    if is_raw || is_rle
+        size_format_nbits = iseven(size_format) ? 1 :
+                                                  2
+        size_nbits, header_nbytes = iseven(size_format) ? ( 5, 1) :
+                                    size_format == 1    ? (12, 2) :
+                                                          (20, 3)
+        skip(br, size_format_nbits)
+        regen_size = Int(read(br, size_nbits))
+        compressed_size = is_raw ? regen_size :
+                                   1
+
+        literals = state.literals_buf
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+
+        block_start = pos + header_nbytes
+
+        if is_raw
+            copyto!(literals, 1, data, block_start, regen_size)
+        else
+            literals[1:regen_size] .= data[block_start]
+        end
+
+        return literals, header_nbytes + compressed_size
+    else # Compressed (2) or Treeless (3)
+        size_nbits, header_nbytes = size_format < 2  ? (10, 3) :
+                                    size_format == 2 ? (14, 4) :
+                                                       (18, 5)
+        num_streams = size_format == 0 ? 1 :
+                                         4
+        
+        skip(br, 2)
+        regen_size = Int(read(br, size_nbits))
+        compressed_size = Int(read(br, size_nbits))
+
+        payload_start = pos + header_nbytes
+        payload_end = payload_start + compressed_size - 1
+
+        if is_treeless
+            state.huffman !== nothing ||
+                throw(ArgumentError("zstd: treeless literals but no prior Huffman table"))
+            ht = state.huffman
+            huf_start = payload_start
+        else # Compressed
+            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
+            state.huffman = ht
+            huf_start = payload_start + hdr_len
+        end
+
+        literals = state.literals_buf
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+
+        if num_streams == 1
+            stream_len = payload_end - huf_start + 1
+            rb = ReverseBitReader(@view data[huf_start:huf_start + stream_len - 1])
+            let p = 1
+                while p ≤ regen_size
+                    p += decode1x2_tail!(rb, ht, literals, p)
+                end
+            end
+        else
+            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
+        end
+
+        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)  # trim dual-symbol slack
+
+        return literals, header_nbytes + compressed_size
+    end
+end
+
+# Reference: RFC 8878 §3.1.1.3.2
 function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
                          state::DecompressState, literals::Vector{UInt8},
                          out::Vector{UInt8}, wpos::Int, preallocated::Bool)
@@ -268,6 +344,8 @@ end
 # eliminate that overhead.  Requires extending the +15 slack on `out` to cover
 # over-writes at the match destination, and capping wildcopy to matches that
 # cannot overlap (offset ≥ 16 would be sufficient for a 16-byte chunk size).
+
+# Reference: RFC 8878 §3.1.1.4
 function execute_sequences!(
         ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
         literals::Vector{UInt8}, state::DecompressState,
@@ -300,7 +378,7 @@ function execute_sequences!(
             lit_pos += ll
         end
 
-        # Determine actual offset from repeat-offset table (RFC 8878 §3.1.1.3.3.5).
+        # Determine actual offset from repeat-offset table
         # of is the raw Offset_Value; 1/2/3 are repeat codes, ≥4 is a new offset.
         rep = state.rep
         local offset::Int
@@ -391,92 +469,6 @@ function execute_sequences!(
         wpos += rem
     end
     return wpos
-end
-
-
-# ============================================================
-# Literals reading
-#   Reference: RFC 8878 §3.1.1.3
-# ============================================================
-
-# Read the literals section starting at data[pos].
-# Returns (literals::Vector{UInt8}, bytes_consumed::Int).
-function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
-    br = ForwardBitReader(@view data[pos:end])
-    litblock_type = read(br, 2)
-    size_format = peek(br, 2)
-
-    is_raw = litblock_type == 0
-    is_rle = litblock_type == 1
-    is_treeless = litblock_type == 3
-
-    if is_raw || is_rle
-        size_format_nbits = iseven(size_format) ? 1 :
-                                                  2
-        size_nbits, header_nbytes = iseven(size_format) ? ( 5, 1) :
-                                    size_format == 1    ? (12, 2) :
-                                                          (20, 3)
-        skip(br, size_format_nbits)
-        regen_size = Int(read(br, size_nbits))
-        compressed_size = is_raw ? regen_size :
-                                   1
-
-        literals = state.literals_buf
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
-
-        block_start = pos + header_nbytes
-
-        if is_raw
-            copyto!(literals, 1, data, block_start, regen_size)
-        else
-            literals[1:regen_size] .= data[block_start]
-        end
-
-        return literals, header_nbytes + compressed_size
-    else # Compressed (2) or Treeless (3)
-        size_nbits, header_nbytes = size_format < 2  ? (10, 3) :
-                                    size_format == 2 ? (14, 4) :
-                                                       (18, 5)
-        num_streams = size_format == 0 ? 1 :
-                                         4
-        
-        skip(br, 2)
-        regen_size = Int(read(br, size_nbits))
-        compressed_size = Int(read(br, size_nbits))
-
-        payload_start = pos + header_nbytes
-        payload_end = payload_start + compressed_size - 1
-
-        if is_treeless
-            state.huffman !== nothing ||
-                throw(ArgumentError("zstd: treeless literals but no prior Huffman table"))
-            ht = state.huffman
-            huf_start = payload_start
-        else # Compressed
-            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
-            state.huffman = ht
-            huf_start = payload_start + hdr_len
-        end
-
-        literals = state.literals_buf
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
-
-        if num_streams == 1
-            stream_len = payload_end - huf_start + 1
-            rb = ReverseBitReader(@view data[huf_start:huf_start + stream_len - 1])
-            let p = 1
-                while p ≤ regen_size
-                    p += decode1x2_tail!(rb, ht, literals, p)
-                end
-            end
-        else
-            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
-        end
-
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)  # trim dual-symbol slack
-
-        return literals, header_nbytes + compressed_size
-    end
 end
 
 
