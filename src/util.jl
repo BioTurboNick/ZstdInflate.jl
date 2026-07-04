@@ -2,12 +2,12 @@
 # becomes slow in tight loops. The shifts in Zstd are guaranteed to be <64 bits, so we can
 # prove to the compiler that the branch is not necessary by masking the shift count. Thus,
 # the compiler can emit a single shift instruction without the guard.
-@inline _shl(x::UInt64,          n::Int64)               = x << (n & 63)
-@inline _shl(x::Vec{X, UInt64}, n::Int64)          where X = x << (n & Int64(63))
-@inline _shl(x::Vec{X, UInt64}, n::Vec{X, Int64})  where X = x << (n & 63)
-@inline _shr(x::UInt64,          n::Int64)               = x >>> (n & 63)
-@inline _shr(x::Vec{X, UInt64}, n::Int64)          where X = x >>> (n & Int64(63))
-@inline _shr(x::Vec{X, UInt64}, n::Vec{X, Int64})  where X = x >>> (n & 63)
+@inline _shl(x::UInt64,         n::Int64)                 = x << (n & 63)
+@inline _shl(x::Vec{X, UInt64}, n::Int64)         where X = x << (n & Int64(63))
+@inline _shl(x::Vec{X, UInt64}, n::Vec{X, Int64}) where X = x << (n & 63)
+@inline _shr(x::UInt64,         n::Int64)                 = x >>> (n & 63)
+@inline _shr(x::Vec{X, UInt64}, n::Int64)         where X = x >>> (n & Int64(63))
+@inline _shr(x::Vec{X, UInt64}, n::Vec{X, Int64}) where X = x >>> (n & 63)
 
 # Little-endian loads
 @inline _le64(d, i) = GC.@preserve d ltoh(unsafe_load(Ptr{UInt64}(pointer(d, i))))
@@ -16,3 +16,6 @@
 
 # floor(log2(n)) for n ≥ 1
 @inline _flog2(n::Int) = 63 - leading_zeros(UInt64(n))
+
+
+splitbyte(b::UInt8) = b & 0x0F, b >> 4

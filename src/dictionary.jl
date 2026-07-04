@@ -6,9 +6,9 @@
 struct ZstdDict
     id      ::UInt32
     huffman ::Union{HuffmanTable, Nothing}
-    of_tab  ::Union{FSETable, Nothing}
-    ml_tab  ::Union{FSETable, Nothing}
-    ll_tab  ::Union{FSETable, Nothing}
+    of_tab  ::Union{FSEDistTable, Nothing}
+    ml_tab  ::Union{FSEDistTable, Nothing}
+    ll_tab  ::Union{FSEDistTable, Nothing}
     rep     ::NTuple{3, Int}
     content ::Vector{UInt8}
 end

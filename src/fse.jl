@@ -1,18 +1,16 @@
 # ============================================================
-# FSE decode table
+# Finite State Entropy (FSE) decode table
 #   Reference: RFC 8878 §4.1
 # ============================================================
 
-struct FSETable
+struct FSEDistTable
     accuracy_log::Int
     symbols  ::Vector{UInt8}
     nb_bits  ::Vector{UInt8}
     baselines::Vector{UInt32}
 end
 
-# Trivial FSE table for RLE mode: every state emits the same symbol with
-# zero extra bits.  Stored as a single byte — no heap allocation.
-struct RLEFSETable
+struct RLEDistTable
     symbol::UInt8
 end
 
@@ -25,27 +23,25 @@ function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
                           base::Vector{UInt32}, occ::Vector{Int})
     table_size = 1 << accuracy_log
     resize!(syms, table_size)
-    resize!(nb,   table_size)
+    resize!(nb, table_size)
     resize!(base, table_size)
-    resize!(occ,  length(norm))
+    resize!(occ, length(norm))
     fill!(occ, 0)
 
     # --- Spread: place -1 symbols at the end, others via step pattern ---
     high = table_size - 1
-    for s in 0:length(norm)-1
-        norm[s+1] == -1 || continue
-        syms[high+1] = UInt8(s)
+    for i in eachindex(norm)
+        norm[i] == -1 || continue
+        syms[high + 1] = UInt8(i - 1)
         high -= 1
     end
 
     step = (table_size >> 1) + (table_size >> 3) + 3
     mask = table_size - 1
     pos  = 0
-    for s in 0:length(norm)-1
-        c = Int(norm[s+1])
-        c > 0 || continue
+    for (i, c) in enumerate(norm)
         for _ in 1:c
-            syms[pos+1] = UInt8(s)
+            syms[pos + 1] = UInt8(i - 1)
             pos = (pos + step) & mask
             while pos > high
                 pos = (pos + step) & mask
@@ -54,17 +50,19 @@ function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
     end
 
     # --- Build per-state decode entries ---
-    for x in 0:table_size-1
-        s  = Int(syms[x+1])
-        c  = Int(norm[s+1]);  c == -1 && (c = 1)
-        i  = occ[s+1];        occ[s+1] += 1
-        ci = c + i
-        n  = accuracy_log - _flog2(ci)
-        nb[x+1]   = UInt8(n)
-        base[x+1] = UInt32((ci << n) - table_size)
+    for i in 1:table_size
+        s = syms[i]
+        c = norm[s + 1]
+        c == -1 && (c = 1)
+        j = occ[s + 1]
+        occ[s + 1] += 1
+        ci = c + j
+        n = accuracy_log - _flog2(ci)
+        nb[i] = UInt8(n)
+        base[i] = UInt32((ci << n) - table_size)
     end
 
-    return FSETable(accuracy_log, syms, nb, base)
+    return FSEDistTable(accuracy_log, syms, nb, base)
 end
 
 # Cold-path: allocates its own backing arrays (used by __init__, parse_dictionary, etc.)
@@ -79,9 +77,9 @@ end
 
 # Read an FSE normalized distribution from the forward bitstream.
 # Returns (accuracy_log, norm_counts).
-# Implements the exact reference zstd sliding-threshold algorithm.
+# Implements the reference zstd sliding-threshold algorithm.
 # Hot-path: caller supplies a reusable norm buffer (emptied on entry).
-function read_fse_dist!(br::ForwardBitReader, max_sym::Int, norm::Vector{Int16})
+function read_fse_dist!(br::ForwardBitReader, norm::Vector{Int16})
     accuracy_log = Int(read(br, 4)) + 5
     table_size   = 1 << accuracy_log
 
@@ -148,67 +146,32 @@ end
 function read_fse_dist!(br::ForwardBitReader, max_sym::Int)
     norm = Int16[]
     sizehint!(norm, max_sym + 1)
-    return read_fse_dist!(br, max_sym, norm)
+    return read_fse_dist!(br, norm)
 end
 
-# ------- FSE state machine helpers -------
+# ------- Dist Table state machine helpers -------
 
-@inline fse_init!(rb::ReverseBitReader, t::FSETable) =
+@inline dist_table_init!(rb::ReverseBitReader, t::FSEDistTable) =
     Int(read(rb, t.accuracy_log))
 
-@inline fse_peek(t::FSETable, state::Int) = Int(t.symbols[state+1])
+@inline dist_table_peek(t::FSEDistTable, state::Int) = Int(t.symbols[state+1])
 
-@inline function fse_update!(rb::ReverseBitReader, t::FSETable, state::Int)
-    nb   = Int(t.nb_bits[state+1])
-    bits = Int(read(rb, nb))
-    return Int(t.baselines[state+1]) + bits
-end
-
-# RLE variants — accuracy_log is always 1, both states emit the same symbol,
-# and transitions consume 0 bits.
-@inline fse_init!(rb::ReverseBitReader, t::RLEFSETable) =
+@inline dist_table_init!(rb::ReverseBitReader, ::RLEDistTable) =
     (read(rb, 1); 0)   # consume the 1-bit state init, state is always 0
 
-@inline fse_peek(t::RLEFSETable, state::Int) = Int(t.symbol)
-
-@inline fse_update!(rb::ReverseBitReader, t::RLEFSETable, state::Int) = 0
+@inline dist_table_peek(t::RLEDistTable, ::Int) = Int(t.symbol)
 
 # Helpers for the batched sequence reader: retrieve the transition width and
 # baseline for the current state without consuming any bits.
-@inline _fse_nb_bits(t::FSETable,    state::Int) = Int(@inbounds t.nb_bits[state + 1])
-@inline _fse_nb_bits(t::RLEFSETable, state::Int) = 0
+@inline _dist_table_nb_bits(t::FSEDistTable,  state::Int) = Int(@inbounds t.nb_bits[state + 1])
+@inline _dist_table_nb_bits(::RLEDistTable, ::Int) = 0
 
-@inline _fse_baseline(t::FSETable,    state::Int) = Int(@inbounds t.baselines[state + 1])
-@inline _fse_baseline(t::RLEFSETable, state::Int) = 0
+@inline _dist_table_baseline(t::FSEDistTable,  state::Int) = Int(@inbounds t.baselines[state + 1])
+@inline _dist_table_baseline(::RLEDistTable, ::Int) = 0
 
 # Update without checking for underflow (allows overflow detection after).
-@inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSETable, state::Int)
+@inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSEDistTable, state::Int)
     nb   = Int(t.nb_bits[state+1])
     bits = Int(_read_bits_unchecked!(rb, nb))
     return Int(t.baselines[state+1]) + bits
-end
-
-# Read an FSE table according to the given mode byte bits.
-# mode: 0=predefined, 1=RLE, 2=FSE_Compressed, 3=Repeat
-# Returns the FSETable and advances br.
-function read_fse_table!(br::ForwardBitReader, default::FSETable,
-                         prev::Union{FSETable,RLEFSETable,Nothing},
-                         mode::Int, max_sym::Int, max_al::Int,
-                         syms::Vector{UInt8}, nb::Vector{UInt8},
-                         base::Vector{UInt32}, occ::Vector{Int},
-                         norm::Vector{Int16})
-    if mode == 0
-        return default
-    elseif mode == 1
-        sym = read(br, 8)   # RLE: single symbol
-        return RLEFSETable(UInt8(sym))
-    elseif mode == 2
-        al, dist = read_fse_dist!(br, max_sym, norm)
-        al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
-        length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
-        return build_fse_table(dist, al, syms, nb, base, occ)
-    else   # mode == 3: repeat previous table (RFC 8878 §3.1.1.3.3.2)
-        prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous FSE table"))
-        return prev
-    end
 end

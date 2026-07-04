@@ -47,22 +47,22 @@ export inflate_zstd, InflateZstdStream, ZstdDict
 # Groups the three backing arrays for one FSE decode table (LL, OF, or ML).
 # Having all three in one object lets callers pass a single slot instead of
 # three separate vectors, and keeps DecompressState compact.
-mutable struct FSETableSlot
+mutable struct FSEDistTableSlot
     syms ::Vector{UInt8}
     nb   ::Vector{UInt8}
     base ::Vector{UInt32}
 end
 
-FSETableSlot(n::Int) = FSETableSlot(Vector{UInt8}(undef, n),
+FSEDistTableSlot(n::Int) = FSEDistTableSlot(Vector{UInt8}(undef, n),
                                      Vector{UInt8}(undef, n),
                                      Vector{UInt32}(undef, n))
 
 mutable struct DecompressState
     rep         ::NTuple{3,Int}
     huffman     ::Union{HuffmanTable,Nothing}
-    ll_tab      ::Union{FSETable,RLEFSETable,Nothing}
-    ml_tab      ::Union{FSETable,RLEFSETable,Nothing}
-    of_tab      ::Union{FSETable,RLEFSETable,Nothing}
+    ll_tab      ::Union{FSEDistTable,RLEDistTable,Nothing}
+    ml_tab      ::Union{FSEDistTable,RLEDistTable,Nothing}
+    of_tab      ::Union{FSEDistTable,RLEDistTable,Nothing}
     dict_content::Vector{UInt8}   # dictionary content prefix for match references
     # Reusable sequence buffers — grown on demand, never shrunk
     ll_vals        ::Vector{Int}
@@ -78,9 +78,9 @@ mutable struct DecompressState
     # Reusable FSE table backing arrays — one slot per table (LL, ML, OF).
     # Slots cannot be shared because all three tables are live simultaneously
     # during sequence decoding.
-    ll_slot ::FSETableSlot
-    ml_slot ::FSETableSlot
-    of_slot ::FSETableSlot
+    ll_slot ::FSEDistTableSlot
+    ml_slot ::FSEDistTableSlot
+    of_slot ::FSEDistTableSlot
     # Shared FSE build scratch — safe to share because LL/ML/OF are built sequentially
     fse_occ  ::Vector{Int}
     fse_norm ::Vector{Int16}
@@ -99,9 +99,9 @@ DecompressState() = DecompressState(
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     UInt8[],
-    FSETableSlot(_FSE_MAX_TABLE),
-    FSETableSlot(_FSE_MAX_TABLE),
-    FSETableSlot(_FSE_MAX_TABLE),
+    FSEDistTableSlot(_FSE_MAX_TABLE),
+    FSEDistTableSlot(_FSE_MAX_TABLE),
+    FSEDistTableSlot(_FSE_MAX_TABLE),
     Int[], Int16[])
 
 function DecompressState(dict::ZstdDict)
@@ -113,19 +113,39 @@ function DecompressState(dict::ZstdDict)
         zeros(Int, HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
         UInt8[],
-        FSETableSlot(_FSE_MAX_TABLE),
-        FSETableSlot(_FSE_MAX_TABLE),
-        FSETableSlot(_FSE_MAX_TABLE),
+        FSEDistTableSlot(_FSE_MAX_TABLE),
+        FSEDistTableSlot(_FSE_MAX_TABLE),
+        FSEDistTableSlot(_FSE_MAX_TABLE),
         Int[], Int16[])
 end
 
-# State-aware overload: routes FSE table backing storage through a slot and state.
-# Defined here (after FSETableSlot and DecompressState) to avoid forward references.
-function read_fse_table!(br::ForwardBitReader, default::FSETable,
-                         prev::Union{FSETable,RLEFSETable,Nothing},
+function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
+                         prev::Union{FSEDistTable, RLEDistTable, Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
-                         slot::FSETableSlot, state::DecompressState)
-    return read_fse_table!(br, default, prev, mode, max_sym, max_al,
+                         syms::Vector{UInt8}, nb::Vector{UInt8},
+                         base::Vector{UInt32}, occ::Vector{Int},
+                         norm::Vector{Int16})
+    if mode == 0 # Predefined_Mode
+        return default
+    elseif mode == 1 # RLE_Mode
+        sym = read(br, 8)
+        return RLEDistTable(UInt8(sym))
+    elseif mode == 2 # FSE_Compressed_Mode
+        al, dist = read_fse_dist!(br, norm)
+        al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
+        length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
+        return build_fse_table(dist, al, syms, nb, base, occ)
+    else # mode == 3; Repeat_Mode
+        prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous distribution table"))
+        return prev
+    end
+end
+
+function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
+                         prev::Union{FSEDistTable,RLEDistTable,Nothing},
+                         mode::Int, max_sym::Int, max_al::Int,
+                         slot::FSEDistTableSlot, state::DecompressState)
+    return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
                            slot.syms, slot.nb, slot.base,
                            state.fse_occ, state.fse_norm)
 end
@@ -155,340 +175,6 @@ end
         k += 16
     end
     k < n && @inbounds vstore(vload(Vec{16, UInt8}, src + n - 16), dst + n - 16)
-end
-
-# Execute decoded sequences to produce output bytes.
-# Writes starting at wpos in out; returns the next write position.
-# When preallocated=true the caller has already resize!'d out to the exact frame size,
-# so the total scan and per-block resize! can be skipped entirely.
-#
-# FUTURE OPTIMISATION — fuse sequence decode and execute:
-#
-# Currently read_sequences! decodes all sequences into three Int arrays
-# (ll_vals, ml_vals, of_vals) and then execute_sequences! replays them.
-# This is two passes: the sequence data is written to and read back from
-# memory.  Fusing the FSE decode loop directly into the execute loop would
-# halve that memory traffic and allow the compiler to interleave FSE state
-# updates with literal copy and match copy, improving ILP.
-#
-# FUTURE OPTIMISATION — wildcopy for short non-overlapping matches:
-#
-# The non-overlapping match path (offset ≥ ml) calls Base.memcpy (a C FFI
-# call) for every match.  For short matches (≤ ~32 bytes), the ccall overhead
-# dominates the actual data movement cost.  Replacing short non-overlapping
-# match copies with _wildcopy16! (same pattern as literal scatter) would
-# eliminate that overhead.  Requires extending the +15 slack on `out` to cover
-# over-writes at the match destination, and capping wildcopy to matches that
-# cannot overlap (offset ≥ 16 would be sufficient for a 16-byte chunk size).
-function execute_sequences!(
-        ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
-        literals::Vector{UInt8}, state::DecompressState,
-        out::Vector{UInt8}, wpos::Int, preallocated::Bool)
-
-    n = length(ll_vals)
-
-    if !preallocated
-        # Pre-size output: every literal byte + every match byte will be written exactly once.
-        # literals has 15 bytes of slack; subtract them so total reflects actual content.
-        # Add 15 bytes of slack at the end for _wildcopy16! over-writes.
-        total = length(literals) - 15
-        @inbounds for i in 1:n
-            total += ml_vals[i]
-        end
-        resize!(out, wpos - 1 + total + 15)
-    end
-
-    lit_pos = 1
-
-    @inbounds for i in 1:n
-        ll = ll_vals[i]
-        ml = ml_vals[i]
-        of = of_vals[i]
-
-        # Copy ll literal bytes.  out and literals are distinct arrays so no overlap is possible.
-        if ll > 0
-            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), ll)
-            wpos    += ll
-            lit_pos += ll
-        end
-
-        # Determine actual offset from repeat-offset table (RFC 8878 §3.1.1.3.3.5).
-        # of is the raw Offset_Value; 1/2/3 are repeat codes, ≥4 is a new offset.
-        rep = state.rep
-        local offset::Int
-        if of > 3
-            offset = of - 3
-            state.rep = (offset, rep[1], rep[2])
-        elseif ll > 0
-            # Normal repeat-offset rules
-            if of == 1
-                offset = rep[1]
-                # no rep update
-            elseif of == 2
-                offset = rep[2]
-                state.rep = (rep[2], rep[1], rep[3])
-            else  # of == 3
-                offset = rep[3]
-                state.rep = (rep[3], rep[1], rep[2])
-            end
-        else
-            # LL==0: repeat-offset references shift up by 1
-            if of == 1
-                offset = rep[2]
-                state.rep = (rep[2], rep[1], rep[3])
-            elseif of == 2
-                offset = rep[3]
-                state.rep = (rep[3], rep[1], rep[2])
-            else  # of == 3
-                offset = rep[1] - 1
-                offset > 0 || throw(ArgumentError("zstd: repeat offset - 1 is zero"))
-                state.rep = (offset, rep[1], rep[2])
-            end
-        end
-
-        # Copy match of length ml from offset back in output.
-        # The match may reach into the dictionary content prefix.
-        # wpos - 1 is the logical end of written output; match_pos is 1-indexed into out.
-        dict     = state.dict_content
-        dict_len = length(dict)
-        match_pos = wpos - offset   # = (wpos - 1) - offset + 1
-        if match_pos < 1
-            # Offset reaches into dictionary content
-            dict_pos = dict_len + match_pos      # 1-indexed into dict
-            dict_pos ≥ 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
-            for _ in 1:ml
-                if dict_pos ≤ dict_len
-                    out[wpos] = dict[dict_pos]
-                    wpos     += 1
-                    dict_pos += 1
-                else
-                    out[wpos]  = out[match_pos]
-                    wpos      += 1
-                    match_pos += 1
-                end
-            end
-        else
-            if offset ≥ ml
-                # Non-overlapping match.  For short copies, _wildcopy16! avoids the
-                # libc memcpy FFI call; for larger copies memcpy wins (wider SIMD).
-                if ml ≤ 64
-                    GC.@preserve out _wildcopy16!(pointer(out, wpos), pointer(out, match_pos), ml)
-                else
-                    GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
-                end
-            elseif offset == 1
-                # Single-byte repeat: fill
-                @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
-            else
-                # Overlapping repeat pattern: copy base pattern once, then
-                # keep doubling by copying already-written output.  Each
-                # memcpy is non-overlapping (filled bytes precede dest).
-                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), offset)
-                filled = offset
-                while filled < ml
-                    to_copy = min(filled, ml - filled)
-                    GC.@preserve out Base.memcpy(pointer(out, wpos + filled), pointer(out, wpos), to_copy)
-                    filled += to_copy
-                end
-            end
-            wpos += ml
-        end
-    end
-
-    # Remaining literals after last sequence.
-    # Use regen_size (stored in literals length - 15 slack) to get true count.
-    rem = length(literals) - 15 - lit_pos + 1
-    if rem > 0
-        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), rem)
-        wpos += rem
-    end
-    return wpos
-end
-
-# Read and decode the sequences section.
-# data[pos:limit] is the sequences payload.
-# Appends decompressed bytes to out.
-function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
-                         state::DecompressState, literals::Vector{UInt8},
-                         out::Vector{UInt8}, wpos::Int, preallocated::Bool)
-    # Read sequence count (RFC 8878 §3.1.1.3.3.1)
-    b0 = Int(data[pos]);  pos += 1
-    local num_seqs::Int
-    if b0 < 128
-        num_seqs = b0
-    elseif b0 < 255
-        num_seqs = ((b0 - 128) << 8) | Int(data[pos]);  pos += 1
-    else
-        num_seqs = Int(data[pos]) + (Int(data[pos+1]) << 8) + 0x7F00;  pos += 2
-    end
-
-    if num_seqs == 0
-        # No sequences: all literals (literals has 15 bytes of slack)
-        lit_len = length(literals) - 15
-        if !preallocated
-            resize!(out, wpos - 1 + lit_len + 15)
-        end
-        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, 1), lit_len)
-        return wpos + lit_len
-    end
-
-    # Symbol Compression Modes byte (RFC 8878 §3.1.1.3.3.2)
-    modes_byte = Int(data[pos]);  pos += 1
-    modes_byte & 0x03 == 0 || throw(ArgumentError("zstd: reserved bits set in Symbol_Compression_Modes"))
-    ll_mode = (modes_byte >> 6) & 0x03
-    of_mode = (modes_byte >> 4) & 0x03
-    ml_mode = (modes_byte >> 2) & 0x03
-
-    br = ForwardBitReader(@view data[pos:limit])
-    ll_tab = read_fse_table!(br, DEFAULT_LITERALS_LENGTH_TABLE, state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
-                             state.ll_slot, state)
-    of_tab = read_fse_table!(br, DEFAULT_OFFSET_TABLE, state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
-                             state.of_slot, state)
-    ml_tab = read_fse_table!(br, DEFAULT_MATCH_LENGTH_TABLE, state.ml_tab, ml_mode, MAX_MATCH_LENGTH, 9,
-                             state.ml_slot, state)
-    state.ll_tab = ll_tab
-    state.of_tab = of_tab
-    state.ml_tab = ml_tab
-
-    # The bitstream for sequences is a reverse bitstream starting right after
-    # the FSE table descriptions.
-    seq_start = byte_pos(br)
-    seq_len   = limit - seq_start + 1
-    seq_len > 0 || throw(ArgumentError("zstd: no data for sequences bitstream"))
-
-    rb = ReverseBitReader(@view data[seq_start:seq_start+seq_len-1])
-
-    # Init FSE states: order is LL, OF, ML (RFC 8878 §3.1.1.3.3.4)
-    ll_state = fse_init!(rb, ll_tab)
-    of_state = fse_init!(rb, of_tab)
-    ml_state = fse_init!(rb, ml_tab)
-
-    resize!(state.ll_vals, num_seqs)
-    resize!(state.ml_vals, num_seqs)
-    resize!(state.of_vals, num_seqs)
-    ll_vals = state.ll_vals
-    ml_vals = state.ml_vals
-    of_vals = state.of_vals
-
-    for i in 1:num_seqs
-        # 1. Peek symbols from all three states (no bits consumed)
-        ll_code = fse_peek(ll_tab, ll_state)
-        ml_code = fse_peek(ml_tab, ml_state)
-        of_code = fse_peek(of_tab, of_state)
-        of_code ≤ MAX_OFFSET_CODE ||
-            throw(ArgumentError("zstd: offset code $of_code exceeds maximum supported value, $MAX_OFFSET_CODE"))
-
-        # 2+3 batched: precompute all six bit widths, then extract all from
-        # the same frozen bit word.  This breaks the 6-deep serial dependency
-        # chain (each read_bits! currently gates the next via rb.bits).
-        #
-        # All widths are known before any bit is consumed, so the CPU can
-        # issue the six extractions and the cumulative-offset additions in
-        # parallel once the single refill is done.
-        of_n  = of_code
-        ml_n  = Int(@inbounds MATCH_LENGTH_EXTRA_BITS[ml_code + 1])
-        ll_n  = Int(@inbounds LITERALS_LENGTH_EXTRA_BITS[ll_code + 1])
-
-        # State-transition widths (skip on last sequence — states not used again)
-        update = i < num_seqs
-        ll_nb = update ? _fse_nb_bits(ll_tab, ll_state) : 0
-        ml_nb = update ? _fse_nb_bits(ml_tab, ml_state) : 0
-        of_nb = update ? _fse_nb_bits(of_tab, of_state) : 0
-
-        total_n = of_n + ml_n + ll_n + ll_nb + ml_nb + of_nb
-
-        if total_n ≤ 57
-            # Fast path: a single refill guarantees ≥ 57 bits available.
-            rb.nbits < total_n && refill!(rb)
-            rb.nbits ≥ total_n || throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
-
-            # Cumulative bit offsets into the frozen snapshot
-            c_ml  = of_n
-            c_ll  = c_ml + ml_n
-            c_llb = c_ll + ll_n
-            c_mlb = c_llb + ll_nb
-            c_ofb = c_mlb + ml_nb
-
-            # All six extractions read from `bits` independently — ILP-friendly.
-            bits     = rb.bits
-            of_extra = Int(bits              >>> (64 - of_n ))
-            ml_extra = Int((bits << c_ml)    >>> (64 - ml_n ))
-            ll_extra = Int((bits << c_ll)    >>> (64 - ll_n ))
-            ll_bits  = Int((bits << c_llb)   >>> (64 - ll_nb))
-            ml_bits  = Int((bits << c_mlb)   >>> (64 - ml_nb))
-            of_bits  = Int((bits << c_ofb)   >>> (64 - of_nb))
-
-            # Single bulk consume
-            rb.bits   = bits << total_n
-            rb.nbits -= total_n
-
-        else
-            # Slow path: large offset (of_code > ~20); sequential reads.
-            of_extra   = Int(read(rb, of_n ))
-            ml_extra   = Int(read(rb, ml_n))
-            ll_extra   = Int(read(rb, ll_n))
-            ll_bits    = Int(read(rb, ll_nb))
-            ml_bits    = Int(read(rb, ml_nb))
-            of_bits    = Int(read(rb, of_nb))
-        end
-
-        of_val64 = (Int64(1) << of_code) + of_extra
-        of_val64 ≤ typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
-        of_vals[i] = Int(of_val64)
-        ml_vals[i] = Int(@inbounds MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
-        ll_vals[i] = Int(@inbounds LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
-
-        if update
-            ll_state = _fse_baseline(ll_tab, ll_state) + ll_bits
-            ml_state = _fse_baseline(ml_tab, ml_state) + ml_bits
-            of_state = _fse_baseline(of_tab, of_state) + of_bits
-        end
-    end
-
-    return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated)
-end
-
-# ============================================================
-# Section 9: Block decompression
-#   Reference: RFC 8878 §3.1.1
-# ============================================================
-
-function decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int,
-                           block_type::Int, state::DecompressState,
-                           out::Vector{UInt8}, wpos::Int, preallocated::Bool)
-    if block_type == 0   # Raw block
-        pos + block_size - 1 ≤ length(data) ||
-            throw(ArgumentError("zstd: truncated raw block"))
-        if !preallocated
-            resize!(out, wpos - 1 + block_size)
-        end
-        GC.@preserve out data Base.memcpy(pointer(out, wpos), pointer(data, pos), block_size)
-        return wpos + block_size
-    elseif block_type == 1   # RLE block
-        # block_size == regen_size; compressed payload is always 1 byte
-        if !preallocated
-            resize!(out, wpos - 1 + block_size)
-        end
-        fill!(view(out, wpos:wpos+block_size-1), data[pos])
-        return wpos + block_size
-    elseif block_type == 2   # Compressed block
-        limit = pos + block_size - 1
-        literals, lit_consumed = read_literals(data, pos, state)
-        seq_pos = pos + lit_consumed
-        if seq_pos ≤ limit
-            return read_sequences!(data, seq_pos, limit, state, literals, out, wpos, preallocated)
-        else
-            # No sequences section: all literals (literals has 15 bytes of slack)
-            lit_len = length(literals) - 15
-            if !preallocated
-                resize!(out, wpos - 1 + lit_len + 15)
-            end
-            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, 1), lit_len)
-            return wpos + lit_len
-        end
-    else
-        throw(ArgumentError("zstd: reserved block type 3"))
-    end
 end
 
 # ============================================================
@@ -709,81 +395,8 @@ function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothi
     return frames, pos
 end
 
-function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
-                            dict::Union{ZstdDict, Nothing} = nothing)
-    # Magic number (4 bytes, little-endian)
-    magic = _read_magic(data, pos)
-    magic == ZSTD_MAGIC ||
-        throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base = 16))"))
-    pos += 4
 
-    # Frame Header Descriptor (FHD)
-    window_size, frame_content_size, content_checksum_flag, pos = _read_frame_header(data, pos, dict)
 
-    # Enforce a maximum window size to prevent memory exhaustion (2 GiB); spec maximum is (1 << 41) + 7 * (1 << 38)
-    window_size ≤ Int64(1) << 31 ||
-        throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
-
-    state = dict !== nothing ? DecompressState(dict) : DecompressState()
-    frame_start = length(out)
-    # When FCS is known, resize to the exact frame size upfront so that all
-    # per-block writes go directly into pre-allocated space — no per-block
-    # resize! or ml_vals total scan needed.  When FCS is unknown, rely on the
-    # caller's one-time sizehint! and fall back to per-block resize!.
-    preallocated = frame_content_size ≥ 0
-    if preallocated
-        resize!(out, frame_start + frame_content_size + 15)
-    end
-    wpos = frame_start + 1
-
-    # Decode blocks
-    while true
-        length(data) ≥ pos + 2 ||
-            throw(ArgumentError("zstd: truncated block header"))
-        # Block header is 3 bytes
-        bh1, bh2, bh3 = Int(data[pos]), Int(data[pos+1]), Int(data[pos+2])
-        pos += 3
-
-        last_block  = bh1 & 0x01
-        block_type  = (bh1 >> 1) & 0x03
-        # block_size for compressed/raw/RLE: 21-bit field in remaining 21 bits
-        block_size  = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
-        block_size ≤ ZSTD_BLOCKSIZE_MAX ||
-            throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
-
-        if block_type == 1   # RLE: 1 compressed byte; block_size = regen size
-            wpos = decompress_block!(data, pos, block_size, block_type, state, out, wpos, preallocated)
-            pos += 1
-        else
-            wpos = decompress_block!(data, pos, block_size, block_type, state, out, wpos, preallocated)
-            pos += block_size
-        end
-
-        last_block != 0 && break
-    end
-
-    # Trim slack bytes added for wildcopy16 over-writes
-    resize!(out, wpos - 1)
-
-    frame_len = wpos - 1 - frame_start
-
-    # Validate Frame Content Size (RFC 8878 §3.1.1.1.4)
-    frame_content_size < 0 || frame_content_size == frame_len ||
-        throw(ArgumentError("zstd: decompressed size $frame_len does not match frame content size $frame_content_size"))
-
-    # Content checksum (optional 4 bytes)
-    if content_checksum_flag
-        length(data) ≥ pos + 3 ||
-            throw(ArgumentError("zstd: truncated content checksum"))
-        stored = _le32(data, pos)
-        pos += 4
-        computed = UInt32(xxhash64(@view(out[frame_start+1:end])) & 0xFFFFFFFF)
-        stored == computed ||
-            throw(ArgumentError("zstd: content checksum mismatch (stored=0x$(string(stored,base=16)), computed=0x$(string(computed,base=16)))"))
-    end
-
-    return pos
-end
 
 # ============================================================
 # Section 11: Public API
