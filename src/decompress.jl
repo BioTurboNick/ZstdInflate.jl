@@ -150,7 +150,7 @@ function inflate_zstd(filename::AbstractString; dict::Union{ZstdDict,Nothing} = 
 end
 
 
-@inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == 0x184D2A50
+@inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == ZSTD_SKIPPABLE_FRAME_MAGIC
 
 # Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
 function _skip_frame(data::Vector{UInt8}, pos::Int)
@@ -186,7 +186,7 @@ function _read_frame_header_descriptor(data::Vector{UInt8}, pos::Int)
     dict_id_size = (dict_id_flag == 0) ?
         0 :
         1 << (dict_id_flag - 1)
-    
+
     pos += 1
 
     return fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos
@@ -218,7 +218,7 @@ function _read_frame_content_size(data::Vector{UInt8}, pos::Int, fcs_size::Int)
         return -1, pos # unknown content size
     length(data) ≥ pos + fcs_size - 1 ||
         throw(ArgumentError("zstd: truncated frame (FHD)"))
-    
+
     fcs_u64 =
         fcs_size == 0 ? UInt64(0) : # unknown
         fcs_size == 1 ? UInt64(data[pos]) :
@@ -334,7 +334,7 @@ function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothi
                 block_size = (bh1 >> 3) | (bh2 << 5) | (bh3 << 13)
                 block_type != 3 ||
                     throw(ArgumentError("zstd: reserved block type"))
-                block_size ≤ 131072 ||
+                block_size ≤ ZSTD_BLOCKSIZE_MAX ||
                     throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
                 if block_type == 1  # RLE: 1-byte payload regardless of block_size
                     pos += 1
@@ -379,12 +379,18 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
     frame_start = length(out)
     # When FCS is known, resize to the exact frame size upfront so that all
     # per-block writes go directly into pre-allocated space — no per-block
-    # resize! or ml_vals total scan needed.  When FCS is unknown, rely on the
-    # caller's one-time sizehint! and fall back to per-block resize!.
+    # resize! needed.  When FCS is unknown, rely on the caller's one-time
+    # sizehint! and fall back to per-block resize!.
+    #
+    # out_limit is the last byte position any block may write.  Every write
+    # path validates against it before touching memory, so a malicious frame
+    # that declares a small FCS but encodes more output cannot write past the
+    # preallocated buffer.
     preallocated = frame_content_size ≥ 0
     if preallocated
-        resize!(out, frame_start + frame_content_size + 15)
+        resize!(out, frame_start + frame_content_size + WILDCOPY_SLACK)
     end
+    out_limit = preallocated ? frame_start + frame_content_size : typemax(Int) - WILDCOPY_SLACK
     wpos = frame_start + 1
 
     # Decode blocks
@@ -409,19 +415,24 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
         if is_raw
             pos + block_size - 1 ≤ length(data) ||
                 throw(ArgumentError("zstd: truncated raw block"))
+            wpos - 1 + block_size ≤ out_limit ||
+                throw(ArgumentError("zstd: block output exceeds declared frame content size"))
             preallocated ||
                 resize!(out, wpos - 1 + block_size)
             GC.@preserve out data Base.memcpy(pointer(out, wpos), pointer(data, pos), block_size)
             wpos += block_size
             pos += block_size
         elseif is_rle
+            wpos - 1 + block_size ≤ out_limit ||
+                throw(ArgumentError("zstd: block output exceeds declared frame content size"))
             preallocated ||
                 resize!(out, wpos - 1 + block_size)
             fill!(view(out, wpos:wpos + block_size - 1), data[pos])
             wpos += block_size
             pos += 1
         elseif is_compressed
-            wpos = _decompress_block!(data, pos, block_size, state, out, wpos, preallocated)
+            wpos = _decompress_block!(data, pos, block_size, state, out, wpos, preallocated,
+                                      frame_start, out_limit)
             pos += block_size
         else
             throw(ArgumentError("zstd: unsupported block type (reserved)"))
@@ -452,7 +463,7 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
 
     return pos
 end
-        
+
 @inline function _read_magic(data::Vector{UInt8}, pos::Int)
     length(data) ≥ pos + 3 ||
         throw(ArgumentError("zstd: truncated frame (magic)"))
@@ -460,19 +471,25 @@ end
 end
 
 function _decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int, state::DecompressState,
-                           out::Vector{UInt8}, wpos::Int, preallocated::Bool)
+                           out::Vector{UInt8}, wpos::Int, preallocated::Bool,
+                           frame_start::Int, out_limit::Int)
     limit = pos + block_size - 1
-    literals, lit_consumed = read_literals(data, pos, state)
+    limit ≤ length(data) ||
+        throw(ArgumentError("zstd: truncated compressed block"))
+    literals, lit_consumed = read_literals(data, pos, limit, state)
     seq_pos = pos + lit_consumed
     nextwpos = wpos
     if seq_pos ≤ limit
-        nextwpos = read_sequences!(data, seq_pos, limit, state, literals, out, wpos, preallocated)
+        nextwpos = read_sequences!(data, seq_pos, limit, state, literals, out, wpos, preallocated,
+                                   frame_start, out_limit)
     end
     if nextwpos == wpos
-        # No sequences section: all literals + literals has 15 bytes of slack
-        lit_len = length(literals) - 15
+        # No sequences section: the block is all literals (plus WILDCOPY_SLACK slack bytes)
+        lit_len = length(literals) - WILDCOPY_SLACK
+        wpos - 1 + lit_len ≤ out_limit ||
+            throw(ArgumentError("zstd: block output exceeds declared frame content size"))
         if !preallocated
-            resize!(out, wpos - 1 + lit_len + 15)
+            resize!(out, wpos - 1 + lit_len + WILDCOPY_SLACK)
         end
         GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, 1), lit_len)
         return wpos + lit_len
@@ -482,7 +499,9 @@ function _decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int, stat
 end
 
 # Reference: RFC 8878 §3.1.1.3.1
-function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
+# `limit` is the last byte of the enclosing block; the literals section must
+# fit entirely within it.
+function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::DecompressState)
     br = ForwardBitReader(@view data[pos:end])
     litblock_type = read(br, 2)
     size_format = peek(br, 2)
@@ -502,8 +521,13 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
         compressed_size = is_raw ? regen_size :
                                    1
 
+        regen_size ≤ ZSTD_BLOCKSIZE_MAX ||
+            throw(ArgumentError("zstd: literals regenerated size $regen_size exceeds maximum block size"))
+        pos + header_nbytes + compressed_size - 1 ≤ limit ||
+            throw(ArgumentError("zstd: literals section exceeds block size"))
+
         literals = state.literals_buf
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+        resize!(literals, regen_size + WILDCOPY_SLACK)
 
         block_start = pos + header_nbytes
 
@@ -520,10 +544,17 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
                                                        (18, 5)
         num_streams = size_format == 0 ? 1 :
                                          4
-        
+
         skip(br, 2)
         regen_size = Int(read(br, size_nbits))
         compressed_size = Int(read(br, size_nbits))
+
+        regen_size ≤ ZSTD_BLOCKSIZE_MAX ||
+            throw(ArgumentError("zstd: literals regenerated size $regen_size exceeds maximum block size"))
+        pos + header_nbytes + compressed_size - 1 ≤ limit ||
+            throw(ArgumentError("zstd: literals section exceeds block size"))
+        compressed_size ≥ 1 ||
+            throw(ArgumentError("zstd: empty compressed literals payload"))
 
         payload_start = pos + header_nbytes
         payload_end = payload_start + compressed_size - 1
@@ -539,12 +570,17 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             huf_start = payload_start + hdr_len
         end
 
+        # Each Huffman stream must be non-empty; the 4-stream layout additionally
+        # needs a 6-byte jump table (RFC 8878 §3.1.1.3.1.6).
+        huf_len = payload_end - huf_start + 1
+        huf_len ≥ (num_streams == 4 ? 10 : 1) ||
+            throw(ArgumentError("zstd: literals section too small for Huffman-coded streams"))
+
         literals = state.literals_buf
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)
+        resize!(literals, regen_size + WILDCOPY_SLACK)
 
         if num_streams == 1
-            stream_len = payload_end - huf_start + 1
-            rb = ReverseBitReader(@view data[huf_start:huf_start + stream_len - 1])
+            rb = ReverseBitReader(@view data[huf_start:payload_end])
             let p = 1
                 while p ≤ regen_size
                     p += decode1x2_tail!(rb, ht, literals, p)
@@ -554,7 +590,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, state::DecompressState)
             _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
         end
 
-        resize!(literals, regen_size + LITERALS_WILDCOPY_SLACK)  # trim dual-symbol slack
+        resize!(literals, regen_size + WILDCOPY_SLACK)  # trim dual-symbol slack
 
         return literals, header_nbytes + compressed_size
     end
@@ -563,7 +599,8 @@ end
 # Reference: RFC 8878 §3.1.1.3.2
 function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
                          state::DecompressState, literals::Vector{UInt8},
-                         out::Vector{UInt8}, wpos::Int, preallocated::Bool)
+                         out::Vector{UInt8}, wpos::Int, preallocated::Bool,
+                         frame_start::Int, out_limit::Int)
     pos > limit && return wpos
 
     # RFC 8878 §3.1.1.3.2
@@ -685,7 +722,8 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         end
     end
 
-    return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated)
+    return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated,
+                              frame_start, out_limit)
 end
 
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
@@ -697,7 +735,11 @@ function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
     if mode == 0 # Predefined_Mode
         return default
     elseif mode == 1 # RLE_Mode
-        sym = read(br, 8)
+        sym = Int(read(br, 8))
+        # Sequence decoding indexes the baseline/extra-bits tables with this
+        # symbol under @inbounds, so it must be range-checked here.
+        sym ≤ max_sym ||
+            throw(ArgumentError("zstd: RLE symbol $sym exceeds maximum $max_sym"))
         return RLEDistTable(UInt8(sym))
     elseif mode == 2 # FSE_Compressed_Mode
         al, dist = read_fse_dist!(br, norm)
@@ -748,19 +790,31 @@ end
 function execute_sequences!(
         ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
         literals::Vector{UInt8}, state::DecompressState,
-        out::Vector{UInt8}, wpos::Int, preallocated::Bool)
+        out::Vector{UInt8}, wpos::Int, preallocated::Bool,
+        frame_start::Int, out_limit::Int)
 
     n = length(ll_vals)
+    lit_len = length(literals) - WILDCOPY_SLACK
+
+    # Validate the block's total output before writing anything: every literal
+    # byte + every match byte is written exactly once, so the totals fully
+    # determine it.  Checking here means the copy loops below can run without
+    # per-write bounds checks, even on malicious input whose declared
+    # Frame_Content_Size is smaller than what the sequences actually produce.
+    total_ll = 0
+    total = lit_len
+    @inbounds for i in 1:n
+        total_ll += ll_vals[i]
+        total    += ml_vals[i]
+    end
+    total_ll ≤ lit_len ||
+        throw(ArgumentError("zstd: sequences reference more literals than the block provides"))
+    wpos - 1 + total ≤ out_limit ||
+        throw(ArgumentError("zstd: block output exceeds declared frame content size"))
 
     if !preallocated
-        # Pre-size output: every literal byte + every match byte will be written exactly once.
-        # literals has 15 bytes of slack; subtract them so total reflects actual content.
-        # Add 15 bytes of slack at the end for _wildcopy16! over-writes.
-        total = length(literals) - 15
-        @inbounds for i in 1:n
-            total += ml_vals[i]
-        end
-        resize!(out, wpos - 1 + total + 15)
+        # Pre-size output, adding slack at the end for _wildcopy16! over-writes.
+        resize!(out, wpos - 1 + total + WILDCOPY_SLACK)
     end
 
     lit_pos = 1
@@ -812,25 +866,28 @@ function execute_sequences!(
         end
 
         # Copy match of length ml from offset back in output.
-        # The match may reach into the dictionary content prefix.
+        # The match may reach behind the current frame's start, in which case
+        # the bytes come from the dictionary content prefix — never from a
+        # preceding frame's output (RFC 8878 §3.1.1.4).
         # wpos - 1 is the logical end of written output; match_pos is 1-indexed into out.
         dict     = state.dict_content
         dict_len = length(dict)
         match_pos = wpos - offset   # = (wpos - 1) - offset + 1
-        if match_pos < 1
-            # Offset reaches into dictionary content
-            dict_pos = dict_len + match_pos      # 1-indexed into dict
+        if match_pos ≤ frame_start
+            # Offset reaches into dictionary content.  match_pos advances in
+            # lockstep with dict_pos so that when the copy crosses back into
+            # frame output it continues from out[frame_start + 1].
+            dict_pos = dict_len + (match_pos - frame_start)   # 1-indexed into dict
             dict_pos ≥ 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
             for _ in 1:ml
                 if dict_pos ≤ dict_len
                     out[wpos] = dict[dict_pos]
-                    wpos     += 1
                     dict_pos += 1
                 else
-                    out[wpos]  = out[match_pos]
-                    wpos      += 1
-                    match_pos += 1
+                    out[wpos] = out[match_pos]
                 end
+                wpos      += 1
+                match_pos += 1
             end
         else
             if offset ≥ ml
@@ -860,9 +917,8 @@ function execute_sequences!(
         end
     end
 
-    # Remaining literals after last sequence.
-    # Use regen_size (stored in literals length - 15 slack) to get true count.
-    rem = length(literals) - 15 - lit_pos + 1
+    # Remaining literals after the last sequence.
+    rem = lit_len - lit_pos + 1
     if rem > 0
         GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), rem)
         wpos += rem

@@ -58,6 +58,8 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
     end
     for w ∈ weights
         w > 0 || continue
+        w ≤ L ||
+            throw(ArgumentError("zstd: Huffman weight $w exceeds table log ($L)"))
         rank_count[w] += 1
     end
     next_rank_start[2:end] .= cumsum(ntuple(w -> rank_count[w] * (1 << (w - 1)), Val(L - 1)))
@@ -96,16 +98,22 @@ end
 # ============================================================
 
 function read_huffman_description(data::AbstractVector{UInt8}; scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}}} = nothing)
+    length(data) ≥ 1 ||
+        throw(ArgumentError("zstd: truncated Huffman table description"))
     headerByte = Int(data[1]) # RFC 8878 §4.2.1.1
     weights = scratch_buffers !== nothing ? scratch_buffers[1] : UInt8[]
     is_fse_encoded = headerByte < 128
     if is_fse_encoded
         nbytes = headerByte
+        length(data) ≥ nbytes + 1 ||
+            throw(ArgumentError("zstd: truncated Huffman table description"))
         br = ForwardBitReader(@view data[2:nbytes + 1])
         _, table_log = _read_fse_weights!(weights, br, nbytes)
     else
         nsyms = headerByte - 127
         nbytes = (nsyms + 1) >> 1
+        length(data) ≥ nbytes + 1 ||
+            throw(ArgumentError("zstd: truncated Huffman table description"))
         weightdata = @view data[2:nbytes + 1]
         _, table_log = _read_direct_weights!(weights, weightdata, nsyms)
     end
@@ -188,17 +196,27 @@ end
 #   Reference: RFC 8878 §4.2.2
 # ============================================================
 
+# @noinline throw helper keeps the cold error path out of _decode_4streams!'s
+# codegen (guarded by an instruction/call-count regression test).
+@noinline _throw_invalid_stream_sizes() =
+    throw(ArgumentError("zstd: invalid literals stream sizes"))
+
 # Decode the four Huffman streams stored in `data` using the lookup table `ht` and store
 # the result in `literals`. This code is tuned to promote LLVM SIMD instructions; changes
 # in it or the functions it calls could break this. Use caution.
 function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
                             literals::Vector{UInt8}, regen_size::Int) where L
-    # Read stream-start indexes
+    # Read stream-start indexes from the 6-byte jump table (RFC 8878 §3.1.1.3.1.6).
+    # The caller guarantees length(data) ≥ 10 (jump table + four non-empty
+    # streams); the stream boundaries themselves are attacker-controlled and
+    # must be validated before use.
     s1_start = 7
     s2_start = s1_start + Int(_le16(data, 1))
     s3_start = s2_start + Int(_le16(data, 3))
     s4_start = s3_start + Int(_le16(data, 5))
     s4_end = length(data)
+    (s1_start < s2_start < s3_start < s4_start ≤ s4_end) ||
+        _throw_invalid_stream_sizes()
 
     seg_n = (regen_size + 3) >> 2
     safe_n = 57 ÷ L

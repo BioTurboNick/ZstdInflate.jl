@@ -18,20 +18,35 @@ Pkg.add("ZstdInflate")
 ```julia
 using ZstdInflate
 
-data = inflate_zstd(compressed::Vector{UInt8})  # decompress bytes
-data = inflate_zstd(filename::AbstractString)   # decompress a file
+data = inflate_zstd(compressed::Vector{UInt8})  # decompress bytes → Vector{UInt8}
+text = inflate_zstd(filename::AbstractString)   # decompress a .zst file → String
 ```
 
-### Streaming decompression
+Multiple concatenated frames are decompressed and concatenated; skippable
+frames are ignored. When the input contains two or more frames, they can be
+decompressed in parallel by passing `nthreads` (defaults to
+`Threads.nthreads()`):
+
+```julia
+data = inflate_zstd(compressed; nthreads=4)
+```
+
+### Stream interface
 
 ```julia
 open(filename) do io
     stream = InflateZstdStream(io)
-    data = read(stream)
+    for line in eachline(stream)
+        # ...
+    end
 end
 ```
 
-`ZstandardStream` wraps any readable `IO` object and decompresses on the fly.
+`InflateZstdStream` wraps any readable `IO` object and exposes the
+decompressed bytes through the standard `IO` reading interface (`read`,
+`readline`, `eof`, ...). Note that it reads and decompresses the entire
+input eagerly at construction time; it is a convenience wrapper, not an
+incremental decoder.
 
 ### Dictionaries
 
@@ -66,6 +81,13 @@ This package was inspired by [Inflate.jl](https://github.com/GunnarFarneback/Inf
 - Want a TranscodingStreams-compatible interface.
 - Want a battle-tested C library backing.
 
-# Performance Comparison
+Benchmark scripts comparing the two are in
+[`test/performance/`](test/performance/).
 
-TODO
+## Scope and limitations
+
+- Decompression only; no compression support.
+- The maximum supported window size is 2 GiB (the format allows more, but
+  larger windows are rejected to bound memory use).
+- `InflateZstdStream` decompresses eagerly rather than incrementally, so the
+  full decompressed content is held in memory.

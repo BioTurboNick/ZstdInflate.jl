@@ -9,7 +9,7 @@ const ZSTD_DICT_MAGIC = 0xEC30A437            # (RFC 8878 §5; identifies the st
 
 const MAX_LITERALS_LENGTH = 35
 const LITERALS_LENGTH_BASELINE = UInt32[
-       0,     1,     2,     3,     4,     5,     6,     7,     8, 
+       0,     1,     2,     3,     4,     5,     6,     7,     8,
        9,    10,    11,    12,    13,    14,    15,    16,    18,
       20,    22,    24,    28,    32,    40,    48,    64,   128,
      256,   512,  1024,  2048,  4096,  8192, 16384, 32768, 65536
@@ -22,9 +22,9 @@ const LITERALS_LENGTH_EXTRA_BITS = UInt8[
 
 const MAX_MATCH_LENGTH = 52
 const MATCH_LENGTH_BASELINE = UInt32[
-       3,      4,     5,     6,     7,     8,     9,    10,    11,    12,    13,    14,    15, 
-       16,    17,    18,    19,    20,    21,    22,    23,    24,    25,    26,    27,    28,    
-       29,    30,    31,    32,    33,    34,    35,    37,    39,    41,    43,    47,    51, 
+       3,      4,     5,     6,     7,     8,     9,    10,    11,    12,    13,    14,    15,
+       16,    17,    18,    19,    20,    21,    22,    23,    24,    25,    26,    27,    28,
+       29,    30,    31,    32,    33,    34,    35,    37,    39,    41,    43,    47,    51,
        59,    67,    83,    99,   131,   259,   515,  1027,  2051,  4099,  8195, 16387, 32771, 65539
 ]
 const MATCH_LENGTH_EXTRA_BITS = UInt8[
@@ -70,7 +70,8 @@ const INIT_REPEAT_OFFSETS = (1, 4, 8)
 # Maximum Huffman table log (RFC 8878 §4.2.1)
 const HUFTABLE_LOG_MAX = 11
 
-# Slack bytes appended to the literals buffer beyond regen_size.
-# wildcopy16 copies in 16-byte chunks; a copy starting at the last valid byte
-# can over-read 15 bytes past regen_size, so those bytes must be allocated.
-const LITERALS_WILDCOPY_SLACK = 15
+# Slack bytes appended beyond the valid content of the literals and output
+# buffers.  wildcopy16 copies in 16-byte chunks; a copy starting at the last
+# valid byte can over-read/over-write 15 bytes past the end, so those bytes
+# must be allocated.
+const WILDCOPY_SLACK = 15

@@ -1,14 +1,14 @@
 name = "ZstdInflate"
 uuid = "357b4dbe-ca3e-425f-8b58-c37fe13fa826"
 version = "0.1.0"
-authors = []
+authors = ["Nicholas Bauer <nicholasbauer@outlook.com>"]
 
 [deps]
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
 
 [compat]
 SIMD = "3.7.2"
-julia = "1"
+julia = "1.10"
 
 [extras]
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"

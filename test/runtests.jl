@@ -1,4 +1,4 @@
-# Tests for Zstandard.jl pure Julia Zstd decompressor.
+# Tests for ZstdInflate.jl, a pure Julia Zstd decompressor.
 # Compression is provided by CodecZstd (wraps libzstd) for test vector generation.
 
 using Test
@@ -278,6 +278,14 @@ end
     # Error: dict required but not provided
     compressed = compress_with_dict(data, dict_buf)
     @test_throws Exception inflate_zstd(compressed)
+
+    # Multi-frame stream where every frame uses the dictionary: matches that
+    # reach behind a frame's start must resolve against the dictionary, not
+    # the previous frame's output.
+    fa = compress_with_dict(data, dict_buf)
+    fb = compress_with_dict(big_data, dict_buf)
+    @test inflate_zstd(vcat(fa, fb); dict=d) == vcat(data, big_data)
+    @test inflate_zstd(vcat(fb, fa); dict=d) == vcat(big_data, data)
 end
 
 # ------------------------------------------------------------------
@@ -354,6 +362,29 @@ end
         0x50, 0x2A, 0x4D, 0x18,           # skippable magic
         0x00, 0x00, 0x00, 0x80]            # size = 2^31 (no payload → truncated)
     @test_throws Exception inflate_zstd(skip_big)
+end
+
+# ------------------------------------------------------------------
+# Output-bound enforcement: a frame whose declared Frame_Content_Size is
+# smaller than the output its blocks encode must throw, not write past the
+# preallocated output buffer.
+# ------------------------------------------------------------------
+@testset "Block output exceeding declared FCS" begin
+    # FHD 0x20: single_segment=1, fcs_flag=0 → 1-byte FCS field; FCS = 0.
+    header = UInt8[0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x00]
+
+    # Raw last block of 4 bytes (block header: last=1, type=0, size=4)
+    raw_frame = vcat(header, UInt8[0x21, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD])
+    @test_throws ArgumentError inflate_zstd(raw_frame)
+
+    # RLE last block of 4 bytes (block header: last=1, type=1, size=4)
+    rle_frame = vcat(header, UInt8[0x23, 0x00, 0x00, 0xAA])
+    @test_throws ArgumentError inflate_zstd(rle_frame)
+
+    # Compressed last block, raw literals of 4 bytes, 0 sequences
+    # (block header: last=1, type=2, size=6; literals header 0x20: raw, regen=4)
+    lit_frame = vcat(header, UInt8[0x35, 0x00, 0x00, 0x20, 0xAA, 0xBB, 0xCC, 0xDD, 0x00])
+    @test_throws ArgumentError inflate_zstd(lit_frame)
 end
 
 # ------------------------------------------------------------------
