@@ -71,7 +71,7 @@ const INIT_REPEAT_OFFSETS = (1, 4, 8)
 const HUFTABLE_LOG_MAX = 11
 
 # Slack bytes appended beyond the valid content of the literals and output
-# buffers.  wildcopy16 copies in 16-byte chunks; a copy starting at the last
+# buffers. wildcopy16 copies in 16-byte chunks; a copy starting at the last
 # valid byte can over-read/over-write 15 bytes past the end, so those bytes
 # must be allocated.
 const WILDCOPY_SLACK = 15

@@ -3,21 +3,17 @@
 #   InflateZstdStream decompresses incrementally: compressed
 #   bytes are read from the source IO one block at a time as
 #   output is consumed, and decompressed output is discarded
-#   once it has been read and can no longer be reached by
-#   match back-references.
+#   once it has been read.
 # ============================================================
 
 """
     InflateZstdStream(io::IO; dict = nothing)
 
 Create a readable stream that incrementally decompresses Zstandard data
-from `io`.  Compressed bytes are read from `io` one block at a time as
+from `io`. Compressed bytes are read from `io` one block at a time as
 output is consumed, and decompressed output is discarded once it has been
 read and has aged past the frame's window, so memory use is bounded by the
 frame's declared window size plus one block (128 KiB).
-
-Note: frames written in single-segment mode declare a window equal to the
-full decompressed frame size, which forces the whole frame to be retained.
 
 If the data was compressed with a dictionary, pass a `ZstdDict` as `dict`.
 Use `Base.parse(ZstdDict, bytes)` to construct one from raw bytes.
@@ -56,7 +52,7 @@ function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing)
     return s
 end
 
-# Read exactly n bytes from s.io into buf (resized to n).
+# Read exactly n bytes from io into buf (resized to n).
 function _read_exact!(io::IO, buf::Vector{UInt8}, n::Int, what::String)
     resize!(buf, n)
     readbytes!(io, buf, n) == n ||
@@ -78,7 +74,7 @@ function _discard!(io::IO, scratch::Vector{UInt8}, n::Int)
 end
 
 # Advance past skippable frames and begin the next zstd frame, parsing its
-# header and initialising per-frame state.  Returns false if the source ended
+# header and initialising per-frame state. Returns false if the source ended
 # cleanly at a frame boundary.
 function _start_frame!(s::InflateZstdStream)
     while true
@@ -157,10 +153,9 @@ end
 
 # Drop retained output that the consumer has read (or that is pinned by an
 # active mark) and that has aged past the window (no future match can
-# reference it).  Compaction runs only when the droppable prefix is at least
+# reference it). Compaction runs only when the droppable prefix is at least
 # as large as the retained tail, so the total cost of all copies is O(total
-# output).  A held mark pins memory the same way TranscodingStreams' does:
-# nothing between the mark and the current position can be discarded.
+# output).
 function _compact!(s::InflateZstdStream)
     consumer_floor = ismarked(s) ? s.mark_pos : s.read_pos
     keep_from = min(consumer_floor, s.wpos - s.window_size)
@@ -176,7 +171,7 @@ function _compact!(s::InflateZstdStream)
     if s.frame_start < 0
         # In-frame history older than the window has been dropped; conformant
         # matches can no longer reach the frame start, so the dictionary is
-        # unreachable too.  Clearing it makes the dict_pos ≥ 1 guard in
+        # unreachable too. Clearing it makes the dict_pos ≥ 1 guard in
         # execute_sequences! reject any (malformed) offset that tries.
         s.frame_start = 0
         empty!(s.state.dict_content)
@@ -235,8 +230,8 @@ Base.ismarked(s::InflateZstdStream) = s.mark_pos != -1
 """
     mark(s::InflateZstdStream) -> Int64
 
-Mark the current position in the decompressed output.  A later `reset(s)`
-rewinds to this position.  While a mark is held, decompressed output back to
+Mark the current position in the decompressed output. A later `reset(s)`
+rewinds to this position. While a mark is held, decompressed output back to
 the mark is retained even past the frame's window, so an outstanding mark
 disables the usual bounded-memory compaction until it is cleared by `reset`
 or `unmark`.
@@ -249,7 +244,7 @@ end
 """
     unmark(s::InflateZstdStream) -> Bool
 
-Remove any mark on `s` without resetting to it.  Returns whether a mark was
+Remove any mark on `s` without resetting to it. Returns whether a mark was
 present.
 """
 function Base.unmark(s::InflateZstdStream)
@@ -261,7 +256,7 @@ end
 """
     reset(s::InflateZstdStream) -> Int64
 
-Rewind `s` to its last `mark`ed position and remove the mark.  Throws
+Rewind `s` to its last `mark`ed position and remove the mark. Throws
 `ArgumentError` if `s` is not marked.
 """
 function Base.reset(s::InflateZstdStream)

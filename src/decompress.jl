@@ -75,11 +75,11 @@ DecompressState(dict::ZstdDict) =
     inflate_zstd(data::Vector{UInt8}; dict = nothing, nthreads = Threads.nthreads()) -> Vector{UInt8}
 
 Decompress one or more concatenated Zstandard frames from `data` and return
-the raw bytes.  Skippable frames (RFC 8878 §3.1.2) are silently ignored.
+the raw bytes. Skippable frames (RFC 8878 §3.1.2) are silently ignored.
 
 When `nthreads ≥ 2` and `data` contains two or more independent zstd frames,
 each frame is decompressed in a separate Julia task (capped at `nthreads`
-concurrent tasks).  Results are concatenated in frame order.  With `nthreads=1`
+concurrent tasks). Results are concatenated in frame order. With `nthreads=1`
 or a single-frame input the existing serial path is taken unchanged.
 
 `nthreads` must be ≥ 1; passing 0 or negative throws `ArgumentError`.
@@ -152,7 +152,7 @@ end
 
 @inline _is_skippable(magic::UInt32) = (magic & 0xFFFFFFF0) == ZSTD_SKIPPABLE_FRAME_MAGIC
 
-# Skip a skippable frame (RFC 8878 §3.1.2).  Returns the position after the frame.
+# Skip a skippable frame (RFC 8878 §3.1.2). Returns the position after the frame.
 function _skip_frame(data::Vector{UInt8}, pos::Int)
     pos += 4 # past magic
 
@@ -272,8 +272,8 @@ end
     FrameInfo
 
 Lightweight descriptor for a single non-skippable zstd frame found during
-pre-scan.  `data_start` is the 1-based byte offset of the frame's 4-byte
-magic number in the input vector.  `fcs` is the declared decompressed size
+pre-scan. `data_start` is the 1-based byte offset of the frame's 4-byte
+magic number in the input vector. `fcs` is the declared decompressed size
 in bytes, or -1 when the Frame Content Size field is absent from the header.
 """
 struct FrameInfo
@@ -309,7 +309,7 @@ function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothi
                 _read_frame_header_descriptor(data, pos)
             pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
             # Call _read_window_descriptor solely to advance pos past the
-            # window descriptor byte.  The parsed window size is not needed
+            # window descriptor byte. The parsed window size is not needed
             # for scanning; discard the first return value.
             _, pos = _read_window_descriptor(data, pos, single_segment_flag)
             fcs, pos = _read_frame_content_size(data, pos, fcs_size)
@@ -379,10 +379,10 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
     frame_start = length(out)
     # When FCS is known, resize to the exact frame size upfront so that all
     # per-block writes go directly into pre-allocated space — no per-block
-    # resize! needed.  When FCS is unknown, rely on the caller's one-time
+    # resize! needed. When FCS is unknown, rely on the caller's one-time
     # sizehint! and fall back to per-block resize!.
     #
-    # out_limit is the last byte position any block may write.  Every write
+    # out_limit is the last byte position any block may write. Every write
     # path validates against it before touching memory, so a malicious frame
     # that declares a small FCS but encodes more output cannot write past the
     # preallocated buffer.
@@ -445,7 +445,7 @@ end
 end
 
 # Decode one block's payload (starting at data[pos]) into out at wpos and
-# return the new write position.  Shared by the in-memory frame decoder
+# return the new write position. Shared by the in-memory frame decoder
 # (_decompress_frame!) and the incremental stream decoder (streaming.jl).
 function _apply_block!(block_type::Int, data::Vector{UInt8}, pos::Int, block_size::Int,
                        state::DecompressState, out::Vector{UInt8}, wpos::Int,
@@ -778,17 +778,17 @@ end
 # Currently read_sequences! decodes all sequences into three Int arrays
 # (ll_vals, ml_vals, of_vals) and then execute_sequences! replays them.
 # This is two passes: the sequence data is written to and read back from
-# memory.  Fusing the FSE decode loop directly into the execute loop would
+# memory. Fusing the FSE decode loop directly into the execute loop would
 # halve that memory traffic and allow the compiler to interleave FSE state
 # updates with literal copy and match copy, improving ILP.
 #
 # FUTURE OPTIMISATION — wildcopy for short non-overlapping matches:
 #
 # The non-overlapping match path (offset ≥ ml) calls Base.memcpy (a C FFI
-# call) for every match.  For short matches (≤ ~32 bytes), the ccall overhead
-# dominates the actual data movement cost.  Replacing short non-overlapping
+# call) for every match. For short matches (≤ ~32 bytes), the ccall overhead
+# dominates the actual data movement cost. Replacing short non-overlapping
 # match copies with _wildcopy16! (same pattern as literal scatter) would
-# eliminate that overhead.  Requires extending the +15 slack on `out` to cover
+# eliminate that overhead. Requires extending the +15 slack on `out` to cover
 # over-writes at the match destination, and capping wildcopy to matches that
 # cannot overlap (offset ≥ 16 would be sufficient for a 16-byte chunk size).
 
@@ -802,11 +802,9 @@ function execute_sequences!(
     n = length(ll_vals)
     lit_len = length(literals) - WILDCOPY_SLACK
 
-    # Validate the block's total output before writing anything: every literal
-    # byte + every match byte is written exactly once, so the totals fully
-    # determine it.  Checking here means the copy loops below can run without
-    # per-write bounds checks, even on malicious input whose declared
-    # Frame_Content_Size is smaller than what the sequences actually produce.
+    # Validate the block's total output before writing anything. Checking here means the copy loops can run without
+    # per-write bounds checks, even on malicious input whose declared Frame_Content_Size is smaller than what the
+    # sequences actually produce.
     total_ll = 0
     total = lit_len
     @inbounds for i in 1:n
@@ -830,7 +828,7 @@ function execute_sequences!(
         ml = ml_vals[i]
         of = of_vals[i]
 
-        # Copy ll literal bytes.  out and literals are distinct arrays so no overlap is possible.
+        # Copy ll literal bytes. out and literals are distinct arrays so no overlap is possible.
         if ll > 0
             GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), ll)
             wpos    += ll
@@ -880,7 +878,7 @@ function execute_sequences!(
         dict_len = length(dict)
         match_pos = wpos - offset   # = (wpos - 1) - offset + 1
         if match_pos ≤ frame_start
-            # Offset reaches into dictionary content.  match_pos advances in
+            # Offset reaches into dictionary content. match_pos advances in
             # lockstep with dict_pos so that when the copy crosses back into
             # frame output it continues from out[frame_start + 1].
             dict_pos = dict_len + (match_pos - frame_start)   # 1-indexed into dict
@@ -897,7 +895,7 @@ function execute_sequences!(
             end
         else
             if offset ≥ ml
-                # Non-overlapping match.  For short copies, _wildcopy16! avoids the
+                # Non-overlapping match. For short copies, _wildcopy16! avoids the
                 # libc memcpy FFI call; for larger copies memcpy wins (wider SIMD).
                 if ml ≤ 64
                     GC.@preserve out _wildcopy16!(pointer(out, wpos), pointer(out, match_pos), ml)
@@ -909,7 +907,7 @@ function execute_sequences!(
                 @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
             else
                 # Overlapping repeat pattern: copy base pattern once, then
-                # keep doubling by copying already-written output.  Each
+                # keep doubling by copying already-written output. Each
                 # memcpy is non-overlapping (filled bytes precede dest).
                 GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), offset)
                 filled = offset

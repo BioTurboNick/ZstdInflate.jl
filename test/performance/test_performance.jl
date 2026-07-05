@@ -40,20 +40,20 @@ end
 #
 # The source file is ~62 KB, which shapes three structurally different workloads:
 #
-#   small  (1 KB)   — 1.6% of one copy.  Output is almost entirely Huffman literals;
+#   small  (1 KB)   — 1.6% of one copy. Output is almost entirely Huffman literals;
 #                     CodecZstd's FFI overhead dominates, so we win.
 #
-#   medium (100 KB) — ~1.6 copies (~61 KB unique + ~39 KB repeat).  The Huffman
+#   medium (100 KB) — ~1.6 copies (~61 KB unique + ~39 KB repeat). The Huffman
 #                     decoder handles the full unique first pass (~61% of output),
-#                     then sequence execution handles the repeat.  This maximises
+#                     then sequence execution handles the repeat. This maximises
 #                     the Huffman-decode fraction and is our worst relative case.
 #
-#   large  (10 MB)  — ~162 copies.  Compressed size is only ~17 KB (≈ one copy +
+#   large  (10 MB)  — ~162 copies. Compressed size is only ~17 KB (≈ one copy +
 #                     minimal bookkeeping), so >99% of output comes from sequence
 #                     execution (copyto! back-references), which approaches C speeds.
 #
 # Consequence: performance against CodecZstd tracks Huffman-decode fraction, not
-# total output size.  Improving Huffman throughput (e.g. wider table lookups) would
+# total output size. Improving Huffman throughput (e.g. wider table lookups) would
 # close the medium-text gap more than any other change.
 function text(n)
     src = read(pathof(ZstdInflate))

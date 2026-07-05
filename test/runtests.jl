@@ -732,7 +732,7 @@ end
 # ------------------------------------------------------------------
 # _decode_4streams! codegen properties
 # Guards against structural regressions to instruction count, call
-# density, and register pressure.  Thresholds are baseline + 10%
+# density, and register pressure. Thresholds are baseline + 10%
 # (measured 2026-04-14: instrs=1986, calls=108, spills=102) so any
 # meaningful structural change — lost inlining, new dynamic dispatch,
 # or register pressure explosion — triggers an immediate failure.
