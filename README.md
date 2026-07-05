@@ -92,6 +92,3 @@ Benchmark scripts comparing the two are in
 - Decompression only; no compression support.
 - The maximum supported window size is 2 GiB (the format allows more, but
   larger windows are rejected to bound memory use).
-- Frames written in single-segment mode declare a window equal to the full
-  decompressed frame size, so `InflateZstdStream` must retain the whole
-  frame for such inputs.
