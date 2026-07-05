@@ -638,6 +638,74 @@ end
 end
 
 # ------------------------------------------------------------------
+# mark/reset/unmark/position/seekstart (TranscodingStreams parity)
+# ------------------------------------------------------------------
+@testset "Stream mark/reset/seekstart" begin
+    Random.seed!(14)
+    data = rand(UInt8, 20_000)
+    s = InflateZstdStream(IOBuffer(compress(data)))
+
+    @test position(s) == 0
+    @test !ismarked(s)
+
+    a = read(s, 100)
+    @test position(s) == 100
+    mpos = mark(s)
+    @test mpos == 100
+    @test ismarked(s)
+
+    b = read(s, 500)
+    @test position(s) == 600
+    rpos = reset(s)
+    @test rpos == 100
+    @test !ismarked(s)
+    @test position(s) == 100
+
+    # Replayed bytes must match the original read
+    c = read(s, 500)
+    @test c == b
+
+    # unmark without resetting leaves position unchanged
+    @test !unmark(s)   # nothing marked right now
+    mark(s)
+    @test unmark(s)
+    @test !ismarked(s)
+    @test_throws ArgumentError reset(s)
+
+    # Full roundtrip after interleaved mark/reset still matches original data
+    rest = read(s)
+    @test vcat(a, c, rest) == data
+
+    # Marking pins memory: retained buffer must not shrink while marked, even
+    # past a small window, then must shrink again after unmark + compaction.
+    Random.seed!(15)
+    big = rand(UInt8, 3_000_000) .& 0x07
+    c2 = compress_opts(big; windowlog=10)
+    s2 = InflateZstdStream(IOBuffer(c2))
+    read(s2, 1000)
+    mark(s2)
+    chunk = Vector{UInt8}(undef, 8192)
+    while position(s2) < 2_000_000
+        readbytes!(s2, chunk, 8192)
+    end
+    @test length(s2.out) > 1_500_000   # nothing dropped since the mark
+    unmark(s2)
+    while !eof(s2)
+        readbytes!(s2, chunk, 8192)
+    end
+    @test length(s2.out) < 500_000     # compaction resumes once unmarked
+
+    # seekstart rewinds and replays identically
+    s3 = InflateZstdStream(IOBuffer(compress(data)))
+    first_pass = read(s3)
+    @test first_pass == data
+    seekstart(s3)
+    @test position(s3) == 0
+    second_pass = read(s3)
+    @test second_pass == data
+end
+
+# ------------------------------------------------------------------
 # Incremental XXH64 must match the one-shot implementation
 # ------------------------------------------------------------------
 @testset "Incremental XXH64" begin

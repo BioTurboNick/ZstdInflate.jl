@@ -40,12 +40,14 @@ mutable struct InflateZstdStream{T <: IO} <: IO
     check_flag  ::Bool
     hasher      ::XXH64Stream
     source_done ::Bool               # source IO exhausted at a frame boundary
+    mark_pos    ::Int                # out-coordinate of the active mark; -1 if unmarked
+    dropped     ::Int                # total bytes ever discarded from out by compaction
 end
 
 function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing)
     s = InflateZstdStream{typeof(io)}(io, dict, UInt8[], 1, 1, UInt8[], UInt8[],
                                       DecompressState(), false, 0, 0, -1, 0, false,
-                                      XXH64Stream(), false)
+                                      XXH64Stream(), false, -1, 0)
     # Parse the first frame header eagerly so structural errors (empty input,
     # bad magic, missing dictionary) surface at construction time.
     eof(io) &&
@@ -153,19 +155,24 @@ function _decode_next_block!(s::InflateZstdStream)
     return
 end
 
-# Drop retained output that the consumer has read and that has aged past the
-# window (no future match can reference it).  Compaction runs only when the
-# droppable prefix is at least as large as the retained tail, so the total
-# cost of all copies is O(total output).
+# Drop retained output that the consumer has read (or that is pinned by an
+# active mark) and that has aged past the window (no future match can
+# reference it).  Compaction runs only when the droppable prefix is at least
+# as large as the retained tail, so the total cost of all copies is O(total
+# output).  A held mark pins memory the same way TranscodingStreams' does:
+# nothing between the mark and the current position can be discarded.
 function _compact!(s::InflateZstdStream)
-    keep_from = min(s.read_pos, s.wpos - s.window_size)
+    consumer_floor = ismarked(s) ? s.mark_pos : s.read_pos
+    keep_from = min(consumer_floor, s.wpos - s.window_size)
     drop = keep_from - 1
     (drop ≥ 1 << 16 && drop ≥ s.wpos - keep_from) ||
         return
     copyto!(s.out, 1, s.out, keep_from, s.wpos - keep_from)
-    s.wpos       -= drop
-    s.read_pos   -= drop
+    s.wpos        -= drop
+    s.read_pos    -= drop
     s.frame_start -= drop
+    s.dropped     += drop
+    ismarked(s) && (s.mark_pos -= drop)
     if s.frame_start < 0
         # In-frame history older than the window has been dropped; conformant
         # matches can no longer reach the frame start, so the dictionary is
@@ -215,3 +222,73 @@ end
 
 # Decoded-but-unconsumed bytes only; does not trigger further decoding.
 Base.bytesavailable(s::InflateZstdStream) = s.wpos - s.read_pos
+
+Base.close(s::InflateZstdStream) = close(s.io)
+Base.isopen(s::InflateZstdStream) = isopen(s.io)
+
+# Absolute count of decompressed bytes consumed so far, stable across
+# internal buffer compaction.
+Base.position(s::InflateZstdStream) = s.dropped + s.read_pos - 1
+
+Base.ismarked(s::InflateZstdStream) = s.mark_pos != -1
+
+"""
+    mark(s::InflateZstdStream) -> Int64
+
+Mark the current position in the decompressed output.  A later `reset(s)`
+rewinds to this position.  While a mark is held, decompressed output back to
+the mark is retained even past the frame's window, so an outstanding mark
+disables the usual bounded-memory compaction until it is cleared by `reset`
+or `unmark`.
+"""
+function Base.mark(s::InflateZstdStream)
+    s.mark_pos = s.read_pos
+    return position(s)
+end
+
+"""
+    unmark(s::InflateZstdStream) -> Bool
+
+Remove any mark on `s` without resetting to it.  Returns whether a mark was
+present.
+"""
+function Base.unmark(s::InflateZstdStream)
+    had = ismarked(s)
+    s.mark_pos = -1
+    return had
+end
+
+"""
+    reset(s::InflateZstdStream) -> Int64
+
+Rewind `s` to its last `mark`ed position and remove the mark.  Throws
+`ArgumentError` if `s` is not marked.
+"""
+function Base.reset(s::InflateZstdStream)
+    ismarked(s) || throw(ArgumentError("InflateZstdStream not marked"))
+    s.read_pos = s.mark_pos
+    s.mark_pos = -1
+    return position(s)
+end
+
+"""
+    seekstart(s::InflateZstdStream) -> s
+
+Rewind `s` to the beginning of the decompressed output by seeking the
+underlying `io` back to its start and restarting decoding from there.
+Requires that `io` itself supports `seekstart`.
+"""
+function Base.seekstart(s::InflateZstdStream)
+    seekstart(s.io)
+    eof(s.io) &&
+        throw(ArgumentError("zstd: empty input"))
+    resize!(s.out, 0)
+    s.read_pos    = 1
+    s.wpos        = 1
+    s.dropped     = 0
+    s.mark_pos    = -1
+    s.in_frame    = false
+    s.source_done = false
+    _start_frame!(s)
+    return s
+end
