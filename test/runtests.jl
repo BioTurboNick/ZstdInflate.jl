@@ -12,12 +12,13 @@ using CodecZstd.LibZstd
 compress(data::Vector{UInt8}) = read(ZstdCompressorStream(IOBuffer(data)))
 compress(s::AbstractString)   = compress(Vector{UInt8}(s))
 
-# Compress with libzstd options (checksum, compression level).
-function compress_opts(data::Vector{UInt8}; level=3, checksum=false)
+# Compress with libzstd options (checksum, compression level, window log).
+function compress_opts(data::Vector{UInt8}; level=3, checksum=false, windowlog=0)
     cctx = LibZstd.ZSTD_createCStream()
     try
         LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_compressionLevel, level)
         checksum && LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_checksumFlag, 1)
+        windowlog > 0 && LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_windowLog, windowlog)
         out = Vector{UInt8}(undef, LibZstd.ZSTD_compressBound(length(data)))
         inbuf  = LibZstd.ZSTD_inBuffer_s(pointer(data), length(data), 0)
         outbuf = LibZstd.ZSTD_outBuffer_s(pointer(out), length(out), 0)
@@ -108,6 +109,19 @@ end
         end
         @test inflate_zstd(compress(x)) == x
     end
+end
+
+# ------------------------------------------------------------------
+# RLE sequence tables (small window forces 1 KiB blocks with few sequence
+# codes, which libzstd encodes with RLE-mode LL/ML/OF tables — regression
+# for the RLE state-init bit-count bug)
+# ------------------------------------------------------------------
+@testset "RLE sequence tables" begin
+    Random.seed!(21)
+    data = rand(UInt8, 100_000) .& 0x07
+    @test inflate_zstd(compress_opts(data; windowlog=10)) == data
+    data2 = repeat(UInt8[9, 8, 7, 6, 5], 20_000)
+    @test inflate_zstd(compress_opts(data2; windowlog=10)) == data2
 end
 
 # ------------------------------------------------------------------
@@ -286,6 +300,9 @@ end
     fb = compress_with_dict(big_data, dict_buf)
     @test inflate_zstd(vcat(fa, fb); dict=d) == vcat(data, big_data)
     @test inflate_zstd(vcat(fb, fa); dict=d) == vcat(big_data, data)
+
+    # Dictionary decompression through the incremental stream interface
+    @test read(InflateZstdStream(IOBuffer(vcat(fa, fb)); dict=d)) == vcat(data, big_data)
 end
 
 # ------------------------------------------------------------------
@@ -556,8 +573,92 @@ end
         @test Vector{UInt8}(inflate_zstd(path; nthreads=2)) == expected_two
     end
 
-    # AC4.2: InflateZstdStream(io; nthreads=N) produces correct parallel output
-    @test read(InflateZstdStream(IOBuffer(two_frames); nthreads=2)) == expected_two
+    # AC4.2: InflateZstdStream over a multi-frame source produces correct output
+    @test read(InflateZstdStream(IOBuffer(two_frames))) == expected_two
+end
+
+# ------------------------------------------------------------------
+# Incremental streaming decode
+# ------------------------------------------------------------------
+@testset "Incremental streaming" begin
+    # Chunked reads across all data shapes must match in-memory decode
+    Random.seed!(11)
+    for data in [Vector{UInt8}(long_string), rand(UInt8, 100_000),
+                 rand(UInt8, 200_000) .& 0x1f, repeat(UInt8[1, 2, 3, 4, 5, 6, 7, 8], 20_000)]
+        s = InflateZstdStream(IOBuffer(compress(data)))
+        acc = UInt8[]
+        chunk = Vector{UInt8}(undef, 4096)
+        while !eof(s)
+            n = readbytes!(s, chunk, 4096)
+            append!(acc, @view chunk[1:n])
+        end
+        @test acc == data
+    end
+
+    # Bounded memory: with a small window (2^10), retained output must stay
+    # far below the total decompressed size.
+    Random.seed!(12)
+    data = rand(UInt8, 4_000_000) .& 0x07
+    c = compress_opts(data; windowlog=10)
+    s = InflateZstdStream(IOBuffer(c))
+    acc = UInt8[]
+    chunk = Vector{UInt8}(undef, 8192)
+    max_retained = 0
+    while !eof(s)
+        n = readbytes!(s, chunk, 8192)
+        append!(acc, @view chunk[1:n])
+        max_retained = max(max_retained, length(s.out))
+    end
+    @test acc == data
+    @test max_retained < 1_000_000   # window (1 KiB) + block (128 KiB) + compaction hysteresis
+
+    # Content checksum verified incrementally
+    data = rand(UInt8, 300_000)
+    good = compress_opts(data; checksum=true)
+    @test read(InflateZstdStream(IOBuffer(good))) == data
+    bad = copy(good); bad[end] ⊻= 0xFF
+    @test_throws ArgumentError read(InflateZstdStream(IOBuffer(bad)))
+
+    # Construction errors surface eagerly
+    @test_throws ArgumentError InflateZstdStream(IOBuffer(UInt8[]))
+    @test_throws ArgumentError InflateZstdStream(IOBuffer(UInt8[0xDE, 0xAD, 0xBE, 0xEF, 0x00]))
+
+    # Trailing garbage after a frame is rejected when reached
+    frame = compress(UInt8[1, 2, 3])
+    s = InflateZstdStream(IOBuffer(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD])))
+    @test_throws ArgumentError read(s)
+
+    # Skippable-only source yields empty output without error
+    skip_only = UInt8[0x50, 0x2A, 0x4D, 0x18, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB]
+    @test read(InflateZstdStream(IOBuffer(vcat(skip_only, compress(UInt8[7])))))== UInt8[7]
+
+    # FCS-absent frames stream correctly
+    data = rand(UInt8, 50_000) .& 0x3f
+    @test read(InflateZstdStream(IOBuffer(compress_no_fcs(data)))) == data
+end
+
+# ------------------------------------------------------------------
+# Incremental XXH64 must match the one-shot implementation
+# ------------------------------------------------------------------
+@testset "Incremental XXH64" begin
+    Random.seed!(13)
+    for n in [0, 1, 4, 8, 31, 32, 33, 63, 64, 100, 1_000, 100_000]
+        data = rand(UInt8, n)
+        expected = ZstdInflate.xxhash64(data)
+        # Single-shot update
+        st = ZstdInflate.XXH64Stream()
+        ZstdInflate.xxh_update!(st, data)
+        @test ZstdInflate.xxh_finalize(st) == expected
+        # Random chunked updates
+        st = ZstdInflate.XXH64Stream()
+        i = 1
+        while i ≤ n
+            k = min(rand(1:40), n - i + 1)
+            ZstdInflate.xxh_update!(st, @view data[i:i + k - 1])
+            i += k
+        end
+        @test ZstdInflate.xxh_finalize(st) == expected
+    end
 end
 
 # ------------------------------------------------------------------

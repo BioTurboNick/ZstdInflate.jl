@@ -153,8 +153,9 @@ end
 
 @inline dist_table_peek(t::FSEDistTable, state::Int) = Int(t.symbols[state+1])
 
-@inline dist_table_init!(rb::ReverseBitReader, ::RLEDistTable) =
-    (read(rb, 1); 0)   # consume the 1-bit state init, state is always 0
+# RLE tables have table log 0, so state init consumes 0 bits (the reference
+# decoder's FSE_initDState reads tableLog bits) and the state is always 0.
+@inline dist_table_init!(::ReverseBitReader, ::RLEDistTable) = 0
 
 @inline dist_table_peek(t::RLEDistTable, ::Int) = Int(t.symbol)
 

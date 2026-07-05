@@ -408,35 +408,9 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
         block_size ≤ ZSTD_BLOCKSIZE_MAX ||
             throw(ArgumentError("zstd: block size $block_size exceeds maximum (128 KB)"))
 
-        is_raw = block_type == 0
-        is_rle = block_type == 1
-        is_compressed = block_type == 2
-
-        if is_raw
-            pos + block_size - 1 ≤ length(data) ||
-                throw(ArgumentError("zstd: truncated raw block"))
-            wpos - 1 + block_size ≤ out_limit ||
-                throw(ArgumentError("zstd: block output exceeds declared frame content size"))
-            preallocated ||
-                resize!(out, wpos - 1 + block_size)
-            GC.@preserve out data Base.memcpy(pointer(out, wpos), pointer(data, pos), block_size)
-            wpos += block_size
-            pos += block_size
-        elseif is_rle
-            wpos - 1 + block_size ≤ out_limit ||
-                throw(ArgumentError("zstd: block output exceeds declared frame content size"))
-            preallocated ||
-                resize!(out, wpos - 1 + block_size)
-            fill!(view(out, wpos:wpos + block_size - 1), data[pos])
-            wpos += block_size
-            pos += 1
-        elseif is_compressed
-            wpos = _decompress_block!(data, pos, block_size, state, out, wpos, preallocated,
-                                      frame_start, out_limit)
-            pos += block_size
-        else
-            throw(ArgumentError("zstd: unsupported block type (reserved)"))
-        end
+        wpos = _apply_block!(block_type, data, pos, block_size, state, out, wpos,
+                             preallocated, frame_start, out_limit)
+        pos += block_type == 1 ? 1 : block_size  # RLE payload is a single byte
 
         last_block != 0 && break
     end
@@ -468,6 +442,38 @@ end
     length(data) ≥ pos + 3 ||
         throw(ArgumentError("zstd: truncated frame (magic)"))
     _le32(data, pos)
+end
+
+# Decode one block's payload (starting at data[pos]) into out at wpos and
+# return the new write position.  Shared by the in-memory frame decoder
+# (_decompress_frame!) and the incremental stream decoder (streaming.jl).
+function _apply_block!(block_type::Int, data::Vector{UInt8}, pos::Int, block_size::Int,
+                       state::DecompressState, out::Vector{UInt8}, wpos::Int,
+                       preallocated::Bool, frame_start::Int, out_limit::Int)
+    if block_type == 0      # raw
+        pos + block_size - 1 ≤ length(data) ||
+            throw(ArgumentError("zstd: truncated raw block"))
+        wpos - 1 + block_size ≤ out_limit ||
+            throw(ArgumentError("zstd: block output exceeds declared frame content size"))
+        preallocated ||
+            resize!(out, wpos - 1 + block_size)
+        GC.@preserve out data Base.memcpy(pointer(out, wpos), pointer(data, pos), block_size)
+        return wpos + block_size
+    elseif block_type == 1  # RLE: 1-byte payload repeated block_size times
+        pos ≤ length(data) ||
+            throw(ArgumentError("zstd: truncated RLE block"))
+        wpos - 1 + block_size ≤ out_limit ||
+            throw(ArgumentError("zstd: block output exceeds declared frame content size"))
+        preallocated ||
+            resize!(out, wpos - 1 + block_size)
+        fill!(view(out, wpos:wpos + block_size - 1), data[pos])
+        return wpos + block_size
+    elseif block_type == 2  # compressed
+        return _decompress_block!(data, pos, block_size, state, out, wpos, preallocated,
+                                  frame_start, out_limit)
+    else
+        throw(ArgumentError("zstd: unsupported block type (reserved)"))
+    end
 end
 
 function _decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int, state::DecompressState,

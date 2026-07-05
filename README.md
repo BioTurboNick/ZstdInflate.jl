@@ -31,7 +31,7 @@ decompressed in parallel by passing `nthreads` (defaults to
 data = inflate_zstd(compressed; nthreads=4)
 ```
 
-### Stream interface
+### Streaming decompression
 
 ```julia
 open(filename) do io
@@ -44,9 +44,12 @@ end
 
 `InflateZstdStream` wraps any readable `IO` object and exposes the
 decompressed bytes through the standard `IO` reading interface (`read`,
-`readline`, `eof`, ...). Note that it reads and decompresses the entire
-input eagerly at construction time; it is a convenience wrapper, not an
-incremental decoder.
+`readline`, `eof`, ...). Decompression is incremental: compressed bytes are
+read from the source one block at a time as output is consumed, and
+decompressed output is discarded once it has been read and has aged past
+the frame's back-reference window. Memory use is bounded by the frame's
+declared window size plus one block (128 KiB), independent of the total
+decompressed size.
 
 ### Dictionaries
 
@@ -89,5 +92,6 @@ Benchmark scripts comparing the two are in
 - Decompression only; no compression support.
 - The maximum supported window size is 2 GiB (the format allows more, but
   larger windows are rejected to bound memory use).
-- `InflateZstdStream` decompresses eagerly rather than incrementally, so the
-  full decompressed content is held in memory.
+- Frames written in single-segment mode declare a window equal to the full
+  decompressed frame size, so `InflateZstdStream` must retain the whole
+  frame for such inputs.
