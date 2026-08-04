@@ -132,7 +132,7 @@ function _read_direct_weights!(weights::Vector{UInt8}, data::AbstractVector{UInt
         j + 1 ≤ nsyms &&
             (weights[j + 1] = lowbits)
     end
-    last_w, table_log = _infer_last_weight(weights)
+    last_w, table_log = _infer_last_weight(weights, nsyms)
     weights[end] = last_w
     return weights, table_log
 end
@@ -177,8 +177,15 @@ function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_l
     return weights, table_log
 end
 
-function _infer_last_weight(weights::Vector{UInt8})
-    total = Int(sum(w -> UInt64(1) << (Int(w) - 1), weights))
+# `n` is the number of weights to sum. It is an explicit argument because the
+# direct-weight path reserves a trailing slot in `weights` for the weight this
+# function infers; that slot must not be summed.
+function _infer_last_weight(weights::AbstractVector{UInt8}, n::Int = length(weights))
+    total = 0
+    @inbounds for i in 1:n
+        w = Int(weights[i])
+        w > 0 && (total += 1 << (w - 1))
+    end
     total > 0 || return (1, 1)  # single symbol edge case
     table_log = _flog2(total) + 1
     p = UInt64(1) << table_log

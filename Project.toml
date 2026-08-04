@@ -1,6 +1,6 @@
 name = "ZstdInflate"
 uuid = "357b4dbe-ca3e-425f-8b58-c37fe13fa826"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Nicholas Bauer <nicholasbauer@outlook.com>"]
 
 [deps]

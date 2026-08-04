@@ -728,3 +728,109 @@ end
         @test ZstdInflate.xxh_finalize(st) == expected
     end
 end
+
+# ------------------------------------------------------------------
+# Heterogeneous-entropy payloads
+# ------------------------------------------------------------------
+
+# Define a fixed, simple PRNG to keep tests deterministic.
+mutable struct SplitMix64; s::UInt64; end
+function _nextbyte!(r::SplitMix64)
+    r.s += 0x9e3779b97f4a7c15
+    z = r.s
+    z = (z ⊻ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ⊻ (z >> 27)) * 0x94d049bb133111eb
+    UInt8((z ⊻ (z >> 31)) >> 56)
+end
+
+# Payload whose alphabet size changes across `nseg` equal segments, so the four
+# Huffman streams of a literals block get very different compressed lengths.
+function mixed_entropy(n::Int, alphabets, seed::Integer)
+    r = SplitMix64(UInt64(seed))
+    d = Vector{UInt8}(undef, n)
+    ns = length(alphabets)
+    @inbounds for i in 1:n
+        d[i] = _nextbyte!(r) % alphabets[min(ns, 1 + (i - 1) * ns ÷ n)]
+    end
+    d
+end
+
+@testset "Mixed-entropy payloads (skewed Huffman streams)" begin
+    # Small, fast cases to guard against refill over-read
+    for (n, alphabets, seed, level) in [(600, (8,8,8,250), 7, 1),
+                                        (600, (8,8,8,250), 8, 1),
+                                        (1_500, (8,8,8,250), 10, 1),
+                                        (1_500, (8,8,8,250), 2, 3),
+                                        (3_000, (8,8,8,250), 6, 1),
+                                        (5_000, (8,8,8,250), 4, 1),
+                                        (8_000, (250,8,8,8), 5, 1)]
+        data = mixed_entropy(n, alphabets, seed)
+        @test inflate_zstd(compress_opts(data; level=level)) == data
+    end
+
+    # Larger / higher-level cases to guard against weight-buffer uninitialization
+    for (n, alphabets, seed, level) in [(70_000, (4,64,255,8), 1, 17),
+                                        (70_000, (250,3,250,3), 2, 17),
+                                        (70_000, (4,255), 2, 19),
+                                        (131_071, (2,255,2,255), 1, 17),
+                                        (140_000, (2,2,2,255), 2, 17)]
+        data = mixed_entropy(n, alphabets, seed)
+        @test inflate_zstd(compress_opts(data; level=level, windowlog=18)) == data
+    end
+
+    let data = mixed_entropy(70_000, (4,64,255,8), 1)
+        frame = compress_opts(data; level=17, windowlog=18)
+        @test all(inflate_zstd(frame) == data for _ in 1:8)
+    end
+end
+
+# ------------------------------------------------------------------
+# refill_unchecked! (the SIMD multi-stream refill) must agree exactly with the
+# scalar refill! for every reachable (pos, nbits) state, including pos < 8 where
+# fewer than 8 bytes remain before the start of the stream.
+# ------------------------------------------------------------------
+@testset "SIMD refill matches scalar refill" begin
+    par = UInt8[((i * 37 + 11) % 251) + 1 for i in 1:400]   # all bytes nonzero
+    for X in (2, 4)
+        slices = ntuple(k -> (@view par[(k-1)*80 + 1 : k*80]), X)
+        for pos in 0:12, nbits in (0, 5, 13, 24, 32, 40, 48, 56)
+            # Lane 1 sits near the start of its stream; the others are deep in
+            # theirs, so the fast path cannot simply be skipped for all lanes.
+            st = ntuple(i -> (i == 1 ? pos : 60, nbits), X)
+            xr = ZstdInflate.ReverseBitReaderX(slices...)
+            xr.bits  = ntuple(i -> UInt64(0), X)
+            xr.nbits = ntuple(i -> Int64(st[i][2]), X)
+            xr.pos   = ntuple(i -> Int64(st[i][1]), X)
+            refs = ntuple(i -> begin
+                r = ZstdInflate.ReverseBitReader(slices[i])
+                r.bits = UInt64(0); r.nbits = st[i][2]; r.pos = st[i][1]
+                r
+            end, X)
+            ZstdInflate.refill_unchecked!(xr)
+            for i in 1:X
+                ZstdInflate.refill!(refs[i])
+                @test (xr.bits[i], Int(xr.nbits[i]), Int(xr.pos[i])) ==
+                      (refs[i].bits, refs[i].nbits, refs[i].pos)
+            end
+            # A refill must never consume more bytes than the stream holds.
+            @test all(≥(0), Tuple(xr.pos))
+        end
+    end
+end
+
+# ------------------------------------------------------------------
+# _infer_last_weight must depend only on the weights it is told to sum, never on
+# whatever the reused scratch buffer happened to contain past that point.
+# ------------------------------------------------------------------
+@testset "Huffman weight inference ignores scratch tail" begin
+    base = UInt8[4, 3, 2, 2]                     # sums to 8+4+2+2 = 16
+    @test ZstdInflate._infer_last_weight(base) == ZstdInflate._infer_last_weight(base, 4)
+    for junk in (0x00, 0x01, 0x04, 0x08, 0x0b)
+        padded = vcat(base, junk, junk)          # simulates a dirty scratch tail
+        @test ZstdInflate._infer_last_weight(padded, 4) ==
+              ZstdInflate._infer_last_weight(base, 4)
+    end
+    # A weight of 0 means "symbol absent" and must contribute nothing.
+    @test ZstdInflate._infer_last_weight(UInt8[4, 3, 2, 2, 0, 0]) ==
+          ZstdInflate._infer_last_weight(base, 4)
+end

@@ -215,7 +215,16 @@ end
                                Vec{2, Int64}, Vec{2, UInt64}}) =
     ~((UInt64(1) << ((8 - nread) * 8)) - UInt64(1))
 
-function refill_unchecked!(rb::ReverseBitReaderX)
+function refill_unchecked!(rb::ReverseBitReaderX{X}) where X
+    # Any stream within 8 bytes of its start must take the scalar path
+    if any(Tuple(rb.pos) .< 8)
+        r = ntuple(i -> _refill_stream(rb.data[i], rb.bits[i], Int(rb.nbits[i]), Int(rb.pos[i])), Val(X))
+        rb.bits = ntuple(i -> r[i][1], Val(X))
+        rb.nbits = ntuple(i -> Int64(r[i][2]), Val(X))
+        rb.pos  = ntuple(i -> Int64(r[i][3]), Val(X))
+        return
+    end
+
     nread    = (64 .- rb.nbits) .>>> 3             # logical shift: value always ≥ 0, avoids vpsrad emulation
     raw      = _le64.(rb.data, rb.pos .- 7)        # NTuple{X,UInt64}, 8-byte loads
     readmask = _readmask.(nread)                   # NTuple{X,UInt64}, top 8*nread bits
