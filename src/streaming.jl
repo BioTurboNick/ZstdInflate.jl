@@ -172,7 +172,7 @@ function _compact!(s::InflateZstdStream)
         # In-frame history older than the window has been dropped; conformant
         # matches can no longer reach the frame start, so the dictionary is
         # unreachable too. Clearing it makes the dict_pos ≥ 1 guard in
-        # execute_sequences! reject any (malformed) offset that tries.
+        # _run_sequences! reject any (malformed) offset that tries.
         s.frame_start = 0
         empty!(s.state.dict_content)
     end
