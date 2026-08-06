@@ -834,3 +834,36 @@ end
     @test ZstdInflate._infer_last_weight(UInt8[4, 3, 2, 2, 0, 0]) ==
           ZstdInflate._infer_last_weight(base, 4)
 end
+
+# ------------------------------------------------------------------
+# Frame header: Window_Descriptor layout and streaming window retention.
+#
+# Window_Descriptor is a 5-bit exponent in bits 7-3 plus a 3-bit mantissa in bits
+# 2-0 (RFC 8878 §3.1.1.1.2). Splitting it 4/4 silently understates the window —
+# 0x58 reads as 64 KiB rather than 2 MiB. The in-memory decoder tolerates that
+# because it retains all output, so only the streaming decoder breaks: _compact!
+# uses window_size to decide what history may be dropped, and then discards bytes
+# that later matches still reference.
+# ------------------------------------------------------------------
+@testset "Window descriptor" begin
+    # Reference formula straight from the RFC.
+    wsize(wd) = (b = 1 << (10 + (wd >> 3)); b + (b >> 3) * (wd & 0x07))
+
+    # Header-only frames: construction parses the header, so window_size can be
+    # checked without decoding any blocks. FHD 0x00 = not single-segment, no
+    # dictionary ID, no content size, so the byte after it is the descriptor.
+    for wd in UInt8[0x00, 0x0f, 0x38, 0x40, 0x58, 0x59, 0x7f]
+        s = InflateZstdStream(IOBuffer(UInt8[0x28, 0xB5, 0x2F, 0xFD, 0x00, wd]))
+        @test s.window_size == wsize(wd)
+    end
+
+    # End to end. An exact 200 KiB period forces matches at 200 KiB, which is
+    # conformant for an 18-bit (256 KiB) window but far outside the 16 KiB a 4/4
+    # split would compute — and the frame is long enough to force compaction.
+    Random.seed!(7)
+    data = repeat(rand(UInt8, 200_000), 6)
+    c = compress_opts(data; windowlog=18)
+    @test InflateZstdStream(IOBuffer(c)).window_size == 1 << 18
+    @test read(InflateZstdStream(IOBuffer(c))) == data
+    @test inflate_zstd(c) == data
+end
