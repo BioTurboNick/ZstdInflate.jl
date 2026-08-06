@@ -664,6 +664,17 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         length(out) < need && resize!(out, need)
     end
 
+    # The three tables are each Union{FSEDistTable,RLEDistTable}: eight possible
+    # signature combinations, past Julia's union-splitting budget, so the call below
+    # is dispatched dynamically — and a dynamic call boxes every unboxed argument,
+    # i.e. one heap allocation per Int per block. Narrow the (overwhelmingly common)
+    # all-FSE case by hand so it compiles to a static call with unboxed arguments.
+    if ll_tab isa FSEDistTable && of_tab isa FSEDistTable && ml_tab isa FSEDistTable
+        return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                               num_seqs, literals, lit_len, state, out, wpos,
+                               frame_start, block_limit, out_limit)
+    end
+
     # Function barrier: the three distribution tables are each
     # Union{FSEDistTable,RLEDistTable}, so calling the accessors through the union
     # costs a split dispatch on every one of the ~9 table reads per sequence. Passing
