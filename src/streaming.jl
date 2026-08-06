@@ -111,6 +111,22 @@ function _start_frame!(s::InflateZstdStream)
     s.window_size = window_size
     s.fcs         = frame_content_size
     s.frame_len   = 0
+
+    # Reserve the output up front when the frame declares its size. Otherwise
+    # read_sequences! grows `out` by up to a block's worth on every block, and since a
+    # fresh stream (so an empty `out`) is created per frame, that reallocates and copies
+    # repeatedly for every frame.
+    #
+    # The reservation is capped by the window plus one block: that is the decoder's
+    # steady-state working set, which `_compact!` already keeps `out` near, so reserving
+    # it cannot raise peak memory. Reserving the whole frame instead would break the
+    # bounded-memory contract streaming exists to provide — a 4 MB frame would allocate
+    # 4 MB up front (caught by the max_retained assertion in "Incremental streaming").
+    if frame_content_size ≥ 0
+        cap  = s.window_size + ZSTD_BLOCKSIZE_MAX
+        want = s.frame_start + min(frame_content_size, cap) + WILDCOPY_SLACK
+        length(s.out) < want && resize!(s.out, want)
+    end
     s.check_flag  = content_checksum_flag
     s.check_flag && xxh_reset!(s.hasher)
     return true
