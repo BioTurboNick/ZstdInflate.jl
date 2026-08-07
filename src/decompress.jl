@@ -649,36 +649,40 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
     lit_len = length(literals) - WILDCOPY_SLACK
 
-    # Upper bound on where this block may write. A single block never decompresses
-    # to more than ZSTD_BLOCKSIZE_MAX (RFC 8878 §3.1.1.2.3, Block_Maximum_Decompressed_Size),
-    # so that bound is known before decoding even when Frame_Content_Size is not.
-    # Having a constant bound is what lets the fused loop below check each sequence
-    # with a single compare instead of pre-scanning every sequence length.
+    # Upper bound on where this block may write. Having a constant bound lets the fused
+    # loop below check each sequence with a single compare instead of pre-scanning every
+    # sequence length.
     block_limit = min(out_limit, wpos - 1 + ZSTD_BLOCKSIZE_MAX)
 
     # When the frame size is unknown the caller has not pre-sized `out`; reserve a
-    # whole block's worth (plus wildcopy slack) once, here, rather than growing per
-    # sequence. Only ever grows: `_decompress_frame!` trims to wpos-1 at frame end.
+    # whole block once, here, rather than growing per sequence. Only ever grows; trimmed
+    # at the end.
     if !preallocated
         need = block_limit + WILDCOPY_SLACK
         length(out) < need && resize!(out, need)
     end
 
-    # The three tables are each Union{FSEDistTable,RLEDistTable}: eight possible
-    # signature combinations, past Julia's union-splitting budget, so the call below
-    # is dispatched dynamically — and a dynamic call boxes every unboxed argument,
-    # i.e. one heap allocation per Int per block. Narrow the (overwhelmingly common)
-    # all-FSE case by hand so it compiles to a static call with unboxed arguments.
-    if ll_tab isa FSEDistTable && of_tab isa FSEDistTable && ml_tab isa FSEDistTable
-        return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
-                               num_seqs, literals, lit_len, state, out, wpos,
-                               frame_start, block_limit, out_limit)
+    # Each table being a union makes this call dynamic due to too many combinations.
+    # The dynamic call leads to boxing of the three Int arguments. By manually type
+    # checking the most common combinations (FFF, FFR, FRF), these calls can be made static.
+    if ll_tab isa FSEDistTable
+        if of_tab isa FSEDistTable && ml_tab isa FSEDistTable
+            # Empirically overwhelming case
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        elseif of_tab isa FSEDistTable && ml_tab isa RLEDistTable
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        elseif of_tab isa RLEDistTable && ml_tab isa FSEDistTable
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        end
     end
 
-    # Function barrier: the three distribution tables are each
-    # Union{FSEDistTable,RLEDistTable}, so calling the accessors through the union
-    # costs a split dispatch on every one of the ~9 table reads per sequence. Passing
-    # them as type parameters compiles the loop monomorphically (≤ 2^3 specialisations).
+    # Dynamic dispatch for all other combinations
     return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
                            num_seqs, literals, lit_len, state, out, wpos,
                            frame_start, block_limit, out_limit)
@@ -696,17 +700,14 @@ end
     throw(ArgumentError("zstd: repeat offset - 1 is zero"))
 @noinline _throw_dict_offset(offset) =
     throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
-# Cold path: distinguishes the two bounds folded into block_limit so the message
-# still names the constraint that was actually violated.
 @noinline function _throw_block_output(needed::Int, out_limit::Int)
     needed > out_limit &&
         throw(ArgumentError("zstd: block output exceeds declared frame content size"))
     throw(ArgumentError("zstd: block decompressed size exceeds maximum (128 KB)"))
 end
 
-# Decode and execute the sequences section in a single pass: each sequence's
-# literal-length/match-length/offset codes are decoded and immediately consumed to
-# emit output, so the sequence values never reach memory.
+# Decode and execute the sequences section in a single pass, so the sequence values never
+# reach memory.
 #
 # Reference: RFC 8878 §3.1.1.3.2 (decode) and §3.1.1.4 (execute)
 function _run_sequences!(ll_tab::T1, of_tab::T2, ml_tab::T3,
@@ -781,9 +782,8 @@ function _run_sequences!(ll_tab::T1, of_tab::T2, ml_tab::T3,
         ml = Int(MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
         ll = Int(LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
 
-        # Advance the distribution-table states before emitting output: the next
-        # iteration's peeks depend on them, so issuing these first lets the loads for
-        # iteration i+1 start while this iteration's copies are still retiring.
+        # Advance the distribution-table states before emitting output; allows the CPU
+        # to issue loads for the next sequence while the current sequence is being executed.
         if update
             ll_state = _dist_table_baseline(ll_tab, ll_state) + ll_bits
             ml_state = _dist_table_baseline(ml_tab, ml_state) + ml_bits

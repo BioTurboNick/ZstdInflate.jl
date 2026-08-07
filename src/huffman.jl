@@ -61,11 +61,8 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
             throw(ArgumentError("zstd: Huffman weight $w exceeds table log ($L)"))
         rank_count[w] += 1
     end
-    # Running total of the entries claimed by each rank, written as a plain loop.
-    # An `ntuple(w -> rank_count[w] * ..., Val(L-1))` closure here would capture
-    # `rank_count`, and because that variable is assigned in both branches above,
-    # closure conversion boxes it — making every `rank_count[w]` access a dynamically
-    # dispatched load through `Core.Box`, including the increment in the loop above.
+    # Running total of the entries claimed by each rank. Using for loop to avoid
+    # capturing and boxing `rank_count`.
     acc = 0
     for w in 1:(L - 1)
         acc += rank_count[w] * (1 << (w - 1))
