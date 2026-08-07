@@ -75,3 +75,14 @@ const HUFTABLE_LOG_MAX = 11
 # valid byte can over-read/over-write 15 bytes past the end, so those bytes
 # must be allocated.
 const WILDCOPY_SLACK = 15
+
+# Ceiling for window_size before it is narrowed to a native Int. The spec allows windows
+# up to (1 << 41) + 7 * (1 << 38), and on a 32-bit build (Int == Int32) that is many orders
+# of magnitude more than an Int can hold, so a value past this bound must be rejected
+# here or its later narrowing would silently wrap.
+const WINDOW_SIZE_MAX = Int64(typemax(Int))
+
+# Maximum window size for streaming API to protect against excessive memory allocation from
+# a potential malformed file. The spec recommends at least 8 MiB, and 128 MiB matches libzstd's
+# default limit; intentional choice would be required to exceed it.
+const STREAM_WINDOW_SIZE_MAX = Int64(1) << 27 # 128 MiB

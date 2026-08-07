@@ -237,7 +237,16 @@ function _read_window_descriptor(data::Vector{UInt8}, pos::Int, single_segment_f
     single_segment_flag && return 0, pos
     length(data) ≥ pos ||
         throw(ArgumentError("zstd: truncated frame (WD)"))
-    return Int(data[pos]), pos + 1
+    window_descriptor = Int(data[pos])
+    # Exponent is bits 7-3, mantissa bits 2-0
+    exponent = window_descriptor >> 3
+    mantissa = window_descriptor & 0x07
+    # Widened deliberately to Int64 to avoid overflow on 32-bit builds
+    window_base = Int64(1) << (10 + exponent)
+    window_size = window_base + (window_base >> 3) * mantissa
+    window_size ≤ WINDOW_SIZE_MAX ||
+        throw(ArgumentError("zstd: window size $window_size exceeds maximum representable"))
+    return Int(window_size), pos + 1
 end
 
 function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothing})
@@ -245,9 +254,7 @@ function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict,
     fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos = _read_frame_header_descriptor(data, pos)
 
     # Window Descriptor (RFC 8878 §3.1.1.1.2, omitted when Single_Segment_Flag is set).
-    # Must be read before Dictionary_ID: the frame header field order is
-    # Frame_Header_Descriptor, Window_Descriptor, Dictionary_ID, Frame_Content_Size.
-    window_descriptor, pos = _read_window_descriptor(data, pos, single_segment_flag)
+    window_size, pos = _read_window_descriptor(data, pos, single_segment_flag)
 
     # Dictionary ID (RFC 8878 §3.1.1.1.3)
     pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
@@ -255,21 +262,10 @@ function _read_frame_header(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict,
     # Frame Content Size (RFC 8878 §3.1.1.1.4)
     frame_content_size, pos = _read_frame_content_size(data, pos, fcs_size)
 
-    # Set Window Size
     if single_segment_flag
         frame_content_size ≥ 0 ||
             throw(ArgumentError("zstd: single-segment frame with unknown content size"))
         window_size = frame_content_size
-    else
-        # Window_Descriptor is a 5-bit exponent in bits 7-3 and a 3-bit mantissa in
-        # bits 2-0 (RFC 8878 §3.1.1.1.2) — not a 4/4 split. Getting this wrong
-        # understates the window (e.g. 0x58 reads as 64 KiB instead of 2 MiB), which
-        # the in-memory decoder tolerates because it retains all output, but which
-        # makes the streaming decoder discard history that later matches still need.
-        exponent = window_descriptor >> 3
-        mantissa = window_descriptor & 0x07
-        window_base = 1 << (10 + exponent)
-        window_size = window_base + (window_base >> 3) * mantissa
     end
 
     return window_size, frame_content_size, content_checksum_flag, pos
@@ -312,12 +308,7 @@ function _scan_frames(data::Vector{UInt8}, pos::Int, dict::Union{ZstdDict, Nothi
             pos += 4  # advance past magic number
 
             # Read frame header fields — validates reserved bits and dict ID
-            fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos =
-                _read_frame_header_descriptor(data, pos)
-            # Call _read_window_descriptor solely to advance pos past the
-            # window descriptor byte. The parsed window size is not needed
-            # for scanning; discard the first return value. It still has to come
-            # before Dictionary_ID, or the wrong byte is validated as the dict ID.
+            fcs_size, single_segment_flag, content_checksum_flag, dict_id_size, pos = _read_frame_header_descriptor(data, pos)
             _, pos = _read_window_descriptor(data, pos, single_segment_flag)
             pos = _read_and_validate_dict_id(data, pos, dict_id_size, dict)
             fcs, pos = _read_frame_content_size(data, pos, fcs_size)
@@ -378,10 +369,6 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
 
     # Frame Header Descriptor (FHD)
     window_size, frame_content_size, content_checksum_flag, pos = _read_frame_header(data, pos, dict)
-
-    # Enforce a maximum window size to prevent memory exhaustion (2 GiB); spec maximum is (1 << 41) + 7 * (1 << 38)
-    window_size ≤ Int64(1) << 31 ||
-        throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
 
     state = dict !== nothing ? DecompressState(dict) : DecompressState()
     frame_start = length(out)
