@@ -203,13 +203,6 @@ function Base.read(s::InflateZstdStream, ::Type{UInt8})
     return b
 end
 
-# Bulk read into raw memory, copying whole decoded runs.
-#
-# Without this method Base's generic IO fallback applies, and that fetches one byte
-# at a time via `read(s, UInt8)` (see `unsafe_read(::IO, ::Ptr{UInt8}, ::UInt)` in
-# Base). Every `read!(stream, array)`, `read(stream, n)` and anything else layered on
-# unsafe_read then pays a `_fill!` call, a bounds-checked load and a field increment
-# per byte, which measured 1.77x slower than the chunked path on a 1 GB decode.
 function Base.unsafe_read(s::InflateZstdStream, p::Ptr{UInt8}, n::UInt)
     nread = 0
     want  = Int(n)
