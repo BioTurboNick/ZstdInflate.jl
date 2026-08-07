@@ -1,7 +1,7 @@
 # Groups the three backing arrays for one FSE decode table (LL, OF, or ML).
 # Having all three in one object lets callers pass a single slot instead of
 # three separate vectors, and keeps DecompressState compact.
-mutable struct FSEDistTableSlot
+struct FSEDistTableSlot
     syms ::Vector{UInt8}
     nb   ::Vector{UInt8}
     base ::Vector{UInt32}
@@ -21,7 +21,6 @@ mutable struct DecompressState
     # Reusable literals buffer — holds decoded literals for the current block
     literals_buf   ::Vector{UInt8}
     # Reusable Huffman build scratch — pre-sized to maximum, never shrunk
-    huf_dtable     ::Vector{UInt32}  # full 2^max_bits decode table
     huf_rank_count ::Vector{Int}
     huf_rank_start ::Vector{Int}
     huf_weights    ::Vector{UInt8}
@@ -42,7 +41,6 @@ const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single blo
 DecompressState() = DecompressState(
     INIT_REPEAT_OFFSETS, nothing, nothing, nothing, nothing, UInt8[],
     UInt8[],
-    Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     UInt8[],
@@ -55,7 +53,6 @@ DecompressState(dict::ZstdDict) =
     DecompressState(
         dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
         UInt8[],
-        Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
         UInt8[],
