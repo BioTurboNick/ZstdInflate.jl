@@ -18,10 +18,6 @@ mutable struct DecompressState
     ml_tab      ::Union{FSEDistTable,RLEDistTable,Nothing}
     of_tab      ::Union{FSEDistTable,RLEDistTable,Nothing}
     dict_content::Vector{UInt8}   # dictionary content prefix for match references
-    # Reusable sequence buffers — grown on demand, never shrunk
-    ll_vals        ::Vector{Int}
-    ml_vals        ::Vector{Int}
-    of_vals        ::Vector{Int}
     # Reusable literals buffer — holds decoded literals for the current block
     literals_buf   ::Vector{UInt8}
     # Reusable Huffman build scratch — pre-sized to maximum, never shrunk
@@ -45,7 +41,6 @@ const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single blo
 
 DecompressState() = DecompressState(
     INIT_REPEAT_OFFSETS, nothing, nothing, nothing, nothing, UInt8[],
-    Int[], Int[], Int[],
     UInt8[],
     Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
@@ -59,7 +54,6 @@ DecompressState() = DecompressState(
 DecompressState(dict::ZstdDict) =
     DecompressState(
         dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
-        Int[], Int[], Int[],
         UInt8[],
         Vector{UInt32}(undef, 1 << HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
@@ -648,20 +642,87 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     of_state = dist_table_init!(rb, of_tab)
     ml_state = dist_table_init!(rb, ml_tab)
 
-    resize!(state.ll_vals, num_seqs)
-    resize!(state.ml_vals, num_seqs)
-    resize!(state.of_vals, num_seqs)
-    ll_vals = state.ll_vals
-    ml_vals = state.ml_vals
-    of_vals = state.of_vals
+    lit_len = length(literals) - WILDCOPY_SLACK
 
-    for i in 1:num_seqs
+    # Upper bound on where this block may write. Having a constant bound lets the fused
+    # loop below check each sequence with a single compare instead of pre-scanning every
+    # sequence length.
+    block_limit = min(out_limit, wpos - 1 + ZSTD_BLOCKSIZE_MAX)
+
+    # When the frame size is unknown the caller has not pre-sized `out`; reserve a
+    # whole block once, here, rather than growing per sequence. Only ever grows; trimmed
+    # at the end.
+    if !preallocated
+        need = block_limit + WILDCOPY_SLACK
+        length(out) < need && resize!(out, need)
+    end
+
+    # Each table being a union makes this call dynamic due to too many combinations.
+    # The dynamic call leads to boxing of the three Int arguments. By manually type
+    # checking the most common combinations (FFF, FFR, FRF), these calls can be made static.
+    if ll_tab isa FSEDistTable
+        if of_tab isa FSEDistTable && ml_tab isa FSEDistTable
+            # Empirically overwhelming case
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        elseif of_tab isa FSEDistTable && ml_tab isa RLEDistTable
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        elseif of_tab isa RLEDistTable && ml_tab isa FSEDistTable
+            return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                                num_seqs, literals, lit_len, state, out, wpos,
+                                frame_start, block_limit, out_limit)
+        end
+    end
+
+    # Dynamic dispatch for all other combinations
+    return _run_sequences!(ll_tab, of_tab, ml_tab, rb, ll_state, of_state, ml_state,
+                           num_seqs, literals, lit_len, state, out, wpos,
+                           frame_start, block_limit, out_limit)
+end
+
+@noinline _throw_offset_code(c) =
+    throw(ArgumentError("zstd: offset code $c exceeds maximum supported value, $MAX_OFFSET_CODE"))
+@noinline _throw_seq_bitstream() =
+    throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
+@noinline _throw_offset_range(v) =
+    throw(ArgumentError("zstd: offset value $v exceeds addressable range"))
+@noinline _throw_literals_overrun() =
+    throw(ArgumentError("zstd: sequences reference more literals than the block provides"))
+@noinline _throw_repeat_offset_zero() =
+    throw(ArgumentError("zstd: repeat offset - 1 is zero"))
+@noinline _throw_dict_offset(offset) =
+    throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
+@noinline function _throw_block_output(needed::Int, out_limit::Int)
+    needed > out_limit &&
+        throw(ArgumentError("zstd: block output exceeds declared frame content size"))
+    throw(ArgumentError("zstd: block decompressed size exceeds maximum (128 KB)"))
+end
+
+# Decode and execute the sequences section in a single pass, so the sequence values never
+# reach memory.
+#
+# Reference: RFC 8878 §3.1.1.3.2 (decode) and §3.1.1.4 (execute)
+function _run_sequences!(ll_tab::T1, of_tab::T2, ml_tab::T3,
+                         rb::ReverseBitReader, ll_state::Int, of_state::Int, ml_state::Int,
+                         num_seqs::Int, literals::Vector{UInt8}, lit_len::Int,
+                         state::DecompressState, out::Vector{UInt8}, wpos::Int,
+                         frame_start::Int, block_limit::Int, out_limit::Int) where {T1, T2, T3}
+    lit_pos = 1
+    # Repeat offsets and dictionary content are loop-invariant; keeping `rep` in a
+    # local tuple avoids a load and store through the mutable state per sequence.
+    rep      = state.rep
+    dict     = state.dict_content
+    dict_len = length(dict)
+
+    @inbounds for i in 1:num_seqs
         # Peek symbols from all three states (no bits consumed)
         ll_code = dist_table_peek(ll_tab, ll_state)
         ml_code = dist_table_peek(ml_tab, ml_state)
         of_code = dist_table_peek(of_tab, of_state)
-        of_code ≤ MAX_OFFSET_CODE ||
-            throw(ArgumentError("zstd: offset code $of_code exceeds maximum supported value, $MAX_OFFSET_CODE"))
+        of_code ≤ MAX_OFFSET_CODE || _throw_offset_code(of_code)
 
         of_n  = of_code
         ml_n  = Int(@inbounds MATCH_LENGTH_EXTRA_BITS[ml_code + 1])
@@ -679,7 +740,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         if total_n ≤ 57
             # Fast path: a single refill guarantees ≥ 57 bits available.
             rb.nbits < total_n && refill!(rb)
-            rb.nbits ≥ total_n || throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
+            rb.nbits ≥ total_n || _throw_seq_bitstream()
 
             # Cumulative bit offsets into the frozen snapshot
             c_ml  = of_n
@@ -711,20 +772,125 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
         end
 
         of_val64 = (Int64(1) << of_code) + of_extra
-        of_val64 ≤ typemax(Int) || throw(ArgumentError("zstd: offset value $of_val64 exceeds addressable range"))
-        of_vals[i] = Int(of_val64)
-        ml_vals[i] = Int(@inbounds MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
-        ll_vals[i] = Int(@inbounds LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
+        of_val64 ≤ typemax(Int) || _throw_offset_range(of_val64)
+        of = Int(of_val64)
+        ml = Int(MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
+        ll = Int(LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
 
+        # Advance the distribution-table states before emitting output; allows the CPU
+        # to issue loads for the next sequence while the current sequence is being executed.
         if update
             ll_state = _dist_table_baseline(ll_tab, ll_state) + ll_bits
             ml_state = _dist_table_baseline(ml_tab, ml_state) + ml_bits
             of_state = _dist_table_baseline(of_tab, of_state) + of_bits
         end
+
+        # Bounds, in place of the pre-scan the two-pass version used to do. Both are
+        # loop-carried compares against values already in registers.
+        lit_pos + ll - 1 ≤ lit_len       || _throw_literals_overrun()
+        wpos - 1 + ll + ml ≤ block_limit || _throw_block_output(wpos - 1 + ll + ml, out_limit)
+
+        # Copy ll literal bytes. out and literals are distinct arrays so no overlap is possible.
+        if ll > 0
+            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), ll)
+            wpos    += ll
+            lit_pos += ll
+        end
+
+        # Determine actual offset from repeat-offset table
+        # of is the raw Offset_Value; 1/2/3 are repeat codes, ≥4 is a new offset.
+        local offset::Int
+        if of > 3
+            offset = of - 3
+            rep = (offset, rep[1], rep[2])
+        elseif ll > 0
+            # Normal repeat-offset rules
+            if of == 1
+                offset = rep[1]
+                # no rep update
+            elseif of == 2
+                offset = rep[2]
+                rep = (rep[2], rep[1], rep[3])
+            else  # of == 3
+                offset = rep[3]
+                rep = (rep[3], rep[1], rep[2])
+            end
+        else
+            # LL==0: repeat-offset references shift up by 1
+            if of == 1
+                offset = rep[2]
+                rep = (rep[2], rep[1], rep[3])
+            elseif of == 2
+                offset = rep[3]
+                rep = (rep[3], rep[1], rep[2])
+            else  # of == 3
+                offset = rep[1] - 1
+                offset > 0 || _throw_repeat_offset_zero()
+                rep = (offset, rep[1], rep[2])
+            end
+        end
+
+        # Copy match of length ml from offset back in output.
+        # The match may reach behind the current frame's start, in which case
+        # the bytes come from the dictionary content prefix — never from a
+        # preceding frame's output (RFC 8878 §3.1.1.4).
+        # wpos - 1 is the logical end of written output; match_pos is 1-indexed into out.
+        match_pos = wpos - offset   # = (wpos - 1) - offset + 1
+        if match_pos ≤ frame_start
+            # Offset reaches into dictionary content. match_pos advances in
+            # lockstep with dict_pos so that when the copy crosses back into
+            # frame output it continues from out[frame_start + 1].
+            dict_pos = dict_len + (match_pos - frame_start)   # 1-indexed into dict
+            dict_pos ≥ 1 || _throw_dict_offset(offset)
+            for _ in 1:ml
+                if dict_pos ≤ dict_len
+                    out[wpos] = dict[dict_pos]
+                    dict_pos += 1
+                else
+                    out[wpos] = out[match_pos]
+                end
+                wpos      += 1
+                match_pos += 1
+            end
+        else
+            if offset ≥ ml
+                # Non-overlapping match. For short copies, _wildcopy16! avoids the
+                # libc memcpy FFI call; for larger copies memcpy wins (wider SIMD).
+                if ml ≤ 64
+                    GC.@preserve out _wildcopy16!(pointer(out, wpos), pointer(out, match_pos), ml)
+                else
+                    GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
+                end
+            elseif offset == 1
+                # Single-byte repeat: fill
+                fill!(view(out, wpos:wpos+ml-1), out[match_pos])
+            else
+                # Overlapping repeat pattern: copy base pattern once, then
+                # keep doubling by copying already-written output. Each
+                # memcpy is non-overlapping (filled bytes precede dest).
+                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), offset)
+                filled = offset
+                while filled < ml
+                    to_copy = min(filled, ml - filled)
+                    GC.@preserve out Base.memcpy(pointer(out, wpos + filled), pointer(out, wpos), to_copy)
+                    filled += to_copy
+                end
+            end
+            wpos += ml
+        end
     end
 
-    return execute_sequences!(ll_vals, ml_vals, of_vals, literals, state, out, wpos, preallocated,
-                              frame_start, out_limit)
+    # Publish the repeat offsets once, after the whole block.
+    state.rep = rep
+
+    # Remaining literals after the last sequence.
+    rem = lit_len - lit_pos + 1
+    if rem > 0
+        wpos - 1 + rem ≤ block_limit || _throw_block_output(wpos - 1 + rem, out_limit)
+        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), rem)
+        wpos += rem
+    end
+    return wpos
 end
 
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
@@ -760,167 +926,4 @@ function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
     return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
                            slot.syms, slot.nb, slot.base,
                            state.fse_occ, state.fse_norm)
-end
-
-
-# Execute decoded sequences to produce output bytes.
-# Writes starting at wpos in out; returns the next write position.
-# When preallocated=true the caller has already resize!'d out to the exact frame size,
-# so the total scan and per-block resize! can be skipped entirely.
-#
-# FUTURE OPTIMISATION — fuse sequence decode and execute:
-#
-# Currently read_sequences! decodes all sequences into three Int arrays
-# (ll_vals, ml_vals, of_vals) and then execute_sequences! replays them.
-# This is two passes: the sequence data is written to and read back from
-# memory. Fusing the FSE decode loop directly into the execute loop would
-# halve that memory traffic and allow the compiler to interleave FSE state
-# updates with literal copy and match copy, improving ILP.
-#
-# FUTURE OPTIMISATION — wildcopy for short non-overlapping matches:
-#
-# The non-overlapping match path (offset ≥ ml) calls Base.memcpy (a C FFI
-# call) for every match. For short matches (≤ ~32 bytes), the ccall overhead
-# dominates the actual data movement cost. Replacing short non-overlapping
-# match copies with _wildcopy16! (same pattern as literal scatter) would
-# eliminate that overhead. Requires extending the +15 slack on `out` to cover
-# over-writes at the match destination, and capping wildcopy to matches that
-# cannot overlap (offset ≥ 16 would be sufficient for a 16-byte chunk size).
-
-# Reference: RFC 8878 §3.1.1.4
-function execute_sequences!(
-        ll_vals::Vector{Int}, ml_vals::Vector{Int}, of_vals::Vector{Int},
-        literals::Vector{UInt8}, state::DecompressState,
-        out::Vector{UInt8}, wpos::Int, preallocated::Bool,
-        frame_start::Int, out_limit::Int)
-
-    n = length(ll_vals)
-    lit_len = length(literals) - WILDCOPY_SLACK
-
-    # Validate the block's total output before writing anything. Checking here means the copy loops can run without
-    # per-write bounds checks, even on malicious input whose declared Frame_Content_Size is smaller than what the
-    # sequences actually produce.
-    total_ll = 0
-    total = lit_len
-    @inbounds for i in 1:n
-        total_ll += ll_vals[i]
-        total    += ml_vals[i]
-    end
-    total_ll ≤ lit_len ||
-        throw(ArgumentError("zstd: sequences reference more literals than the block provides"))
-    wpos - 1 + total ≤ out_limit ||
-        throw(ArgumentError("zstd: block output exceeds declared frame content size"))
-
-    if !preallocated
-        # Pre-size output, adding slack at the end for _wildcopy16! over-writes.
-        resize!(out, wpos - 1 + total + WILDCOPY_SLACK)
-    end
-
-    lit_pos = 1
-
-    @inbounds for i in 1:n
-        ll = ll_vals[i]
-        ml = ml_vals[i]
-        of = of_vals[i]
-
-        # Copy ll literal bytes. out and literals are distinct arrays so no overlap is possible.
-        if ll > 0
-            GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), ll)
-            wpos    += ll
-            lit_pos += ll
-        end
-
-        # Determine actual offset from repeat-offset table
-        # of is the raw Offset_Value; 1/2/3 are repeat codes, ≥4 is a new offset.
-        rep = state.rep
-        local offset::Int
-        if of > 3
-            offset = of - 3
-            state.rep = (offset, rep[1], rep[2])
-        elseif ll > 0
-            # Normal repeat-offset rules
-            if of == 1
-                offset = rep[1]
-                # no rep update
-            elseif of == 2
-                offset = rep[2]
-                state.rep = (rep[2], rep[1], rep[3])
-            else  # of == 3
-                offset = rep[3]
-                state.rep = (rep[3], rep[1], rep[2])
-            end
-        else
-            # LL==0: repeat-offset references shift up by 1
-            if of == 1
-                offset = rep[2]
-                state.rep = (rep[2], rep[1], rep[3])
-            elseif of == 2
-                offset = rep[3]
-                state.rep = (rep[3], rep[1], rep[2])
-            else  # of == 3
-                offset = rep[1] - 1
-                offset > 0 || throw(ArgumentError("zstd: repeat offset - 1 is zero"))
-                state.rep = (offset, rep[1], rep[2])
-            end
-        end
-
-        # Copy match of length ml from offset back in output.
-        # The match may reach behind the current frame's start, in which case
-        # the bytes come from the dictionary content prefix — never from a
-        # preceding frame's output (RFC 8878 §3.1.1.4).
-        # wpos - 1 is the logical end of written output; match_pos is 1-indexed into out.
-        dict     = state.dict_content
-        dict_len = length(dict)
-        match_pos = wpos - offset   # = (wpos - 1) - offset + 1
-        if match_pos ≤ frame_start
-            # Offset reaches into dictionary content. match_pos advances in
-            # lockstep with dict_pos so that when the copy crosses back into
-            # frame output it continues from out[frame_start + 1].
-            dict_pos = dict_len + (match_pos - frame_start)   # 1-indexed into dict
-            dict_pos ≥ 1 || throw(ArgumentError("zstd: match offset $offset beyond dictionary and output"))
-            for _ in 1:ml
-                if dict_pos ≤ dict_len
-                    out[wpos] = dict[dict_pos]
-                    dict_pos += 1
-                else
-                    out[wpos] = out[match_pos]
-                end
-                wpos      += 1
-                match_pos += 1
-            end
-        else
-            if offset ≥ ml
-                # Non-overlapping match. For short copies, _wildcopy16! avoids the
-                # libc memcpy FFI call; for larger copies memcpy wins (wider SIMD).
-                if ml ≤ 64
-                    GC.@preserve out _wildcopy16!(pointer(out, wpos), pointer(out, match_pos), ml)
-                else
-                    GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), ml)
-                end
-            elseif offset == 1
-                # Single-byte repeat: fill
-                @inbounds fill!(view(out, wpos:wpos+ml-1), out[match_pos])
-            else
-                # Overlapping repeat pattern: copy base pattern once, then
-                # keep doubling by copying already-written output. Each
-                # memcpy is non-overlapping (filled bytes precede dest).
-                GC.@preserve out Base.memcpy(pointer(out, wpos), pointer(out, match_pos), offset)
-                filled = offset
-                while filled < ml
-                    to_copy = min(filled, ml - filled)
-                    GC.@preserve out Base.memcpy(pointer(out, wpos + filled), pointer(out, wpos), to_copy)
-                    filled += to_copy
-                end
-            end
-            wpos += ml
-        end
-    end
-
-    # Remaining literals after the last sequence.
-    rem = lit_len - lit_pos + 1
-    if rem > 0
-        GC.@preserve out literals _wildcopy16!(pointer(out, wpos), pointer(literals, lit_pos), rem)
-        wpos += rem
-    end
-    return wpos
 end

@@ -42,12 +42,11 @@ function build_huffman_table!(weights::Vector{UInt8}, max_bits::Int; kwargs...)
 
     table_size = 1 << max_bits
     v = fill(HuffmanTableEntry{max_bits}(), table_size)
+    # Keep a function barrier between the runtime value and function working on the concrete type
     return build_huffman_table!(v, weights; kwargs...)
 end
 
 function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}, weights::Vector{UInt8}; scratch_buffers::Union{Nothing, NTuple{2, AbstractVector{Int}}} = nothing) where L
-    fill!(decode_table, HuffmanTableEntry{L}())
-
     # Pass 1: Populate single-symbol entries for all symbols
     if isa(scratch_buffers, NTuple{2, AbstractVector{Int}})
         rank_count = resize!(fill!(scratch_buffers[1], 0x00), L)
@@ -62,7 +61,13 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
             throw(ArgumentError("zstd: Huffman weight $w exceeds table log ($L)"))
         rank_count[w] += 1
     end
-    next_rank_start[2:end] .= cumsum(ntuple(w -> rank_count[w] * (1 << (w - 1)), Val(L - 1)))
+    # Running total of the entries claimed by each rank. Using for loop to avoid
+    # capturing and boxing `rank_count`.
+    acc = 0
+    for w in 1:(L - 1)
+        acc += rank_count[w] * (1 << (w - 1))
+        next_rank_start[w + 1] = acc
+    end
     for (i, w) ∈ enumerate(weights)
         w > 0 || continue
         sym = UInt8(i - 1)

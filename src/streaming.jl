@@ -112,6 +112,14 @@ function _start_frame!(s::InflateZstdStream)
     s.window_size = window_size
     s.fcs         = frame_content_size
     s.frame_len   = 0
+
+    # Reserve the output up front when the frame declares its size. The reservation is capped
+    # by the window plus one block.
+    if frame_content_size ≥ 0
+        cap  = s.window_size + ZSTD_BLOCKSIZE_MAX
+        want = s.frame_start + min(frame_content_size, cap) + WILDCOPY_SLACK
+        length(s.out) < want && resize!(s.out, want)
+    end
     s.check_flag  = content_checksum_flag
     s.check_flag && xxh_reset!(s.hasher)
     return true
@@ -173,7 +181,7 @@ function _compact!(s::InflateZstdStream)
         # In-frame history older than the window has been dropped; conformant
         # matches can no longer reach the frame start, so the dictionary is
         # unreachable too. Clearing it makes the dict_pos ≥ 1 guard in
-        # execute_sequences! reject any (malformed) offset that tries.
+        # _run_sequences! reject any (malformed) offset that tries.
         s.frame_start = 0
         empty!(s.state.dict_content)
     end
