@@ -1,8 +1,6 @@
 # Groups the three backing arrays for one FSE decode table (LL, OF, or ML).
 # Having all three in one object lets callers pass a single slot instead of
 # three separate vectors, and keeps DecompressState compact.
-# Immutable: the three vectors are resized in place, never reassigned, so the slot
-# needs no identity and is stored inline in DecompressState rather than boxed.
 struct FSEDistTableSlot
     syms ::Vector{UInt8}
     nb   ::Vector{UInt8}
