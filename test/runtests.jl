@@ -834,3 +834,77 @@ end
     @test ZstdInflate._infer_last_weight(UInt8[4, 3, 2, 2, 0, 0]) ==
           ZstdInflate._infer_last_weight(base, 4)
 end
+
+# ------------------------------------------------------------------
+# Frame header: Window_Descriptor layout, and the two separate window bounds.
+#
+# Window_Descriptor is a 5-bit exponent in bits 7-3 plus a 3-bit mantissa in bits
+# 2-0 (RFC 8878 §3.1.1.1.2). Splitting it 4/4 silently understates the window —
+# 0x58 reads as 64 KiB rather than 2 MiB. The in-memory decoder tolerates that
+# because it retains all output, so only the streaming decoder breaks: _compact!
+# uses window_size to decide what history may be dropped, and then discards bytes
+# that later matches still reference.
+#
+# The two APIs enforce different bounds on the parsed value, matching libzstd's own
+# split between its one-shot decompressor (no windowLogMax at all) and its streaming
+# decoder (a conservative, much smaller default): WINDOW_SIZE_MAX is a correctness
+# bound (window_size must fit in Int) applied by the bulk API; STREAM_WINDOW_SIZE_MAX
+# is a tighter memory-safety policy applied only by the streaming API, which actually
+# retains history according to window_size.
+# ------------------------------------------------------------------
+@testset "Window descriptor" begin
+    # Reference formula straight from the RFC. Int64 because the exponent reaches 31,
+    # so the shift reaches 1 << 41.
+    wsize(wd) = (b = Int64(1) << (10 + (wd >> 3)); b + (b >> 3) * (wd & 0x07))
+
+    hdr(wd) = UInt8[0x28, 0xB5, 0x2F, 0xFD, 0x00, wd]
+
+    # A single raw last-block frame (1 payload byte), for exercising the bulk API's
+    # window bound end to end without depending on frame_content_size or checksums.
+    # Same hand-crafted-frame technique as "Block output exceeding declared FCS" above.
+    minimal_frame(wd) = vcat(hdr(wd), UInt8[0x09, 0x00, 0x00, 0xAA])   # block: last=1,raw,size=1
+
+    # Header-only frames: construction parses the header, so window_size can be
+    # checked without decoding any blocks. FHD 0x00 = not single-segment, no
+    # dictionary ID, no content size, so the byte after it is the descriptor. Kept
+    # under STREAM_WINDOW_SIZE_MAX so InflateZstdStream construction itself succeeds.
+    for wd in UInt8[0x00, 0x0f, 0x38, 0x40, 0x58, 0x59, 0x7f]
+        @test InflateZstdStream(IOBuffer(hdr(wd))).window_size == wsize(wd)
+        @test wsize(wd) ≤ ZstdInflate.STREAM_WINDOW_SIZE_MAX
+    end
+
+    # Windows above STREAM_WINDOW_SIZE_MAX (128 MiB) but still comfortably below
+    # WINDOW_SIZE_MAX — every descriptor byte reaches at most (1<<41) + 7*(1<<38)
+    # (wd=0xff, the spec maximum, checked below), far under typemax(Int) on any
+    # platform this decoder actually runs on — are the split's whole point: the bulk
+    # API decodes them, the streaming API rejects them at header-parse time, before
+    # touching the block that follows.
+    for wd in UInt8[0xa8, 0xa9, 0xb0, 0xff]
+        @test wsize(wd) ≤ ZstdInflate.WINDOW_SIZE_MAX
+        @test wsize(wd) > ZstdInflate.STREAM_WINDOW_SIZE_MAX
+        @test inflate_zstd(minimal_frame(wd)) == UInt8[0xAA]
+        @test_throws ArgumentError InflateZstdStream(IOBuffer(minimal_frame(wd)))
+    end
+    @test wsize(0xff) == (Int64(1) << 41) + 7 * (Int64(1) << 38)   # spec maximum
+
+    # WINDOW_SIZE_MAX itself cannot be tripped through the descriptor on any platform
+    # this decoder runs on (no WD byte reaches typemax(Int)), nor independently through
+    # the single-segment path, where window_size is the frame content size: that field
+    # is already bounded to the identical typemax(Int) by _read_frame_content_size
+    # before _read_frame_header even returns. _read_window_descriptor's own check
+    # against WINDOW_SIZE_MAX is exactly this value for exactly this reason — narrowing
+    # safety, not an independent policy choice — and is what actually matters on a
+    # 32-bit build, where typemax(Int32) is smaller than the spec maximum and a
+    # descriptor byte can reach past it — untestable in-process here.
+    @test ZstdInflate.WINDOW_SIZE_MAX == typemax(Int)
+
+    # End to end. An exact 200 KiB period forces matches at 200 KiB, which is
+    # conformant for an 18-bit (256 KiB) window but far outside the 16 KiB a 4/4
+    # split would compute — and the frame is long enough to force compaction.
+    Random.seed!(7)
+    data = repeat(rand(UInt8, 200_000), 6)
+    c = compress_opts(data; windowlog=18)
+    @test InflateZstdStream(IOBuffer(c)).window_size == 1 << 18
+    @test read(InflateZstdStream(IOBuffer(c))) == data
+    @test inflate_zstd(c) == data
+end

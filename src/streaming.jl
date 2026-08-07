@@ -102,8 +102,9 @@ function _start_frame!(s::InflateZstdStream)
     rest > 0 && copyto!(hdr, 2, _read_exact!(s.io, s.hdrbuf, rest, "frame (header)"), 1, rest)
 
     window_size, frame_content_size, content_checksum_flag, _ = _read_frame_header(hdr, 1, s.dict)
-    window_size ≤ Int64(1) << 31 ||
-        throw(ArgumentError("zstd: window size $window_size exceeds maximum supported (2 GiB)"))
+    window_size ≤ STREAM_WINDOW_SIZE_MAX ||
+        throw(ArgumentError("zstd: window size $window_size exceeds maximum supported for " *
+                            "streaming ($STREAM_WINDOW_SIZE_MAX bytes)"))
 
     s.state       = s.dict !== nothing ? DecompressState(s.dict) : DecompressState()
     s.in_frame    = true
