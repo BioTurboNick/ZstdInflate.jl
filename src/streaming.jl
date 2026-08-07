@@ -212,6 +212,21 @@ function Base.read(s::InflateZstdStream, ::Type{UInt8})
     return b
 end
 
+function Base.unsafe_read(s::InflateZstdStream, p::Ptr{UInt8}, n::UInt)
+    nread = 0
+    want  = Int(n)
+    while nread < want
+        # _fill! returns true only once read_pos < wpos, so k ≥ 1 and this terminates.
+        _fill!(s) || throw(EOFError())
+        out = s.out
+        k   = min(want - nread, s.wpos - s.read_pos)
+        GC.@preserve out unsafe_copyto!(p + nread, pointer(out, s.read_pos), k)
+        s.read_pos += k
+        nread      += k
+    end
+    return nothing
+end
+
 function Base.readbytes!(s::InflateZstdStream, b::AbstractVector{UInt8}, nb = length(b))
     n = 0
     while n < nb && _fill!(s)
