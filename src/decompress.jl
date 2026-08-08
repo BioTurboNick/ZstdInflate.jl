@@ -72,6 +72,12 @@ const _HUF_MAX_TABLE = 1 << HUFTABLE_LOG_MAX  # largest possible Huffman decode 
 const _HUF_MAX_SYMBOLS = 256  # one weight per possible byte value
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
+# Ceiling on the compression ratio used to size the output buffer when a frame
+# declares no Frame_Content_Size (see _decompress_frame!). Bounds how far a
+# misleading prefix can inflate the reservation; ratios above it just grow the
+# buffer again, as before.
+const _GROWTH_RATIO_CLAMP = 8
+
 # Placeholder data for scratch readers, overwritten by `reinit!` before real
 # use. Must be a valid (non-empty, sentinel-terminated) reverse bitstream.
 _dummy_rbr_view() = @view UInt8[0x01][1:1]
@@ -438,9 +444,47 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
     end
     out_limit = preallocated ? frame_start + frame_content_size : typemax(Int) - WILDCOPY_SLACK
     wpos = frame_start + 1
+    data_start = pos
 
     # Decode blocks
     while true
+        # With no Frame_Content_Size to size `out` up front, the fallback is
+        # read_sequences!'s per-block resize!, which asks for one block more
+        # than it has. Julia's geometric over-allocation absorbs most of that,
+        # but stepping to 10 MB a block at a time still costs 10 allocations and
+        # 40 MB of copying where knowing the size costs 2 and 9.5 MB.
+        #
+        # Once a block or two has been decoded the frame's own compression ratio
+        # is known, so extrapolate the rest of the buffer from it in one step.
+        # `remaining` counts every byte left in `data`; for concatenated frames
+        # that includes bytes belonging to later frames, but those append to
+        # this same `out`, so extrapolating over all of them estimates the final
+        # length rather than overshooting it.
+        #
+        # The guess is only as good as the ratio, and a degenerate opening block
+        # (an RLE block is 128 KB of output from three bytes of input) would
+        # extrapolate to something absurd, so the ratio is clamped. Real data
+        # sits well under the clamp, so it does not bind; input that genuinely
+        # exceeds it merely falls back to growing again, which is what would
+        # have happened anyway. Only ever grows, and read_sequences! keeps its
+        # own resize! as the correctness backstop.
+        if !preallocated
+            produced = wpos - 1 - frame_start
+            consumed = pos - data_start
+            if produced ≥ ZSTD_BLOCKSIZE_MAX && consumed > 0
+                remaining = length(data) - pos + 1
+                # Multiply before dividing: the ratio is usually between 1 and 2,
+                # so computing it as an integer first would floor it to 1 and
+                # collapse the estimate back to plain growth. widemul keeps the
+                # product exact for inputs where it would otherwise overflow.
+                rest   = min(widemul(remaining, produced) ÷ consumed,
+                             widemul(remaining, _GROWTH_RATIO_CLAMP))
+                target = frame_start + produced +
+                         Int(min(rest, typemax(Int) ÷ 4)) + WILDCOPY_SLACK
+                length(out) < target && resize!(out, target)
+            end
+        end
+
         length(data) ≥ pos + 2 ||
             throw(ArgumentError("zstd: truncated block header"))
         # Block header is 3 bytes
