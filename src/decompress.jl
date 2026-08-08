@@ -63,6 +63,14 @@ mutable struct DecompressState
     rb_seq  ::ReverseBitReader{RBRView}
     rb_lit1 ::ReverseBitReader{RBRView}
     huf4    ::Huffman4StreamScratch{RBRView}
+    # Shared forward-bitstream reader for the three header-parsing readers
+    # that used to be constructed fresh each time: read_literals's own
+    # literals-section header, read_sequences!'s Symbol_Compression_Modes +
+    # distribution-table header, and (via read_huffman_description's
+    # fbr_scratch) _read_fse_weights!'s FSE-encoded-weights header. All three
+    # run to completion and are discarded before the next one is ever
+    # constructed within one block's processing, so one shared field is safe.
+    fbr ::ForwardBitReader{RBRView}
 end
 
 const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
@@ -99,7 +107,8 @@ DecompressState() = DecompressState(
     _new_fse_scratch()...,
     ReverseBitReader(_dummy_rbr_view()),
     ReverseBitReader(_dummy_rbr_view()),
-    Huffman4StreamScratch(_dummy_rbr_view()))
+    Huffman4StreamScratch(_dummy_rbr_view()),
+    ForwardBitReader(_dummy_rbr_view()))
 
 DecompressState(dict::ZstdDict) =
     DecompressState(
@@ -115,7 +124,8 @@ DecompressState(dict::ZstdDict) =
         _new_fse_scratch()...,
         ReverseBitReader(_dummy_rbr_view()),
         ReverseBitReader(_dummy_rbr_view()),
-        Huffman4StreamScratch(_dummy_rbr_view()))
+        Huffman4StreamScratch(_dummy_rbr_view()),
+        ForwardBitReader(_dummy_rbr_view()))
 
 
 """
@@ -550,7 +560,7 @@ end
 # `limit` is the last byte of the enclosing block; the literals section must
 # fit entirely within it.
 function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::DecompressState)
-    br = ForwardBitReader(@view data[pos:end])
+    br = reinit!(state.fbr, @view data[pos:end])
     litblock_type = read(br, 2)
     size_format = peek(br, 2)
 
@@ -619,7 +629,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::Decompr
             # A dedicated field for this alone was measured to cost more in
             # per-frame construction overhead than it saves at the call site
             # (see the "Reuse ReverseBitReader in _read_fse_weights!" work).
-            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start, state.huf_nbits_sym1), rb_scratch = state.rb_lit1)
+            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start, state.huf_nbits_sym1), rb_scratch = state.rb_lit1, fbr_scratch = state.fbr)
             state.huffman = ht
             huf_start = payload_start + hdr_len
         end
@@ -677,7 +687,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     of_mode = (modes_byte >> 4) & 0x03
     ml_mode = (modes_byte >> 2) & 0x03
 
-    br = ForwardBitReader(@view data[pos:limit])
+    br = reinit!(state.fbr, @view data[pos:limit])
     ll_tab = read_distribution_table!(br, DEFAULT_LITERALS_LENGTH_TABLE, state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
                              state.ll_slot, state)
     of_tab = read_distribution_table!(br, DEFAULT_OFFSET_TABLE, state.of_tab, of_mode, MAX_OFFSET_CODE, 8,

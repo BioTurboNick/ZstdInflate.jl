@@ -114,7 +114,8 @@ end
 
 function read_huffman_description(data::AbstractVector{UInt8};
                                    scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing,
-                                   rb_scratch::Union{Nothing, ReverseBitReader} = nothing)
+                                   rb_scratch::Union{Nothing, ReverseBitReader} = nothing,
+                                   fbr_scratch::Union{Nothing, ForwardBitReader} = nothing)
     length(data) ≥ 1 ||
         throw(ArgumentError("zstd: truncated Huffman table description"))
     headerByte = Int(data[1]) # RFC 8878 §4.2.1.1
@@ -124,7 +125,8 @@ function read_huffman_description(data::AbstractVector{UInt8};
         nbytes = headerByte
         length(data) ≥ nbytes + 1 ||
             throw(ArgumentError("zstd: truncated Huffman table description"))
-        br = ForwardBitReader(@view data[2:nbytes + 1])
+        view = @view data[2:nbytes + 1]
+        br = fbr_scratch !== nothing ? reinit!(fbr_scratch, view) : ForwardBitReader(view)
         _, table_log = _read_fse_weights!(weights, br, nbytes, rb_scratch)
     else
         nsyms = headerByte - 127
