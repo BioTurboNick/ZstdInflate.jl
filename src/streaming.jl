@@ -140,9 +140,20 @@ function _decode_next_block!(s::InflateZstdStream)
     payload_len = block_type == 1 ? 1 : block_size  # RLE payload is a single byte
     payload_len > 0 && _read_exact!(s.io, s.inbuf, payload_len, "block payload")
 
+    # When the frame declares its size, tell the block-decode functions the
+    # true remaining bound instead of leaving them to assume "up to one more
+    # full block" every time. Without this, read_sequences!'s own reservation
+    # math (wpos + ZSTD_BLOCKSIZE_MAX) routinely overshoots what _start_frame!
+    # already correctly reserved from fcs, forcing a spurious regrow on
+    # nearly every block. It also makes the "block output exceeds declared
+    # frame content size" check in _apply_block! actually enforce per-block
+    # under streaming, rather than only being caught after the fact once the
+    # last block's frame_len mismatch is checked below.
+    out_limit = s.fcs ≥ 0 ? s.frame_start + s.fcs : typemax(Int) - WILDCOPY_SLACK
+
     wpos0 = s.wpos
     s.wpos = _apply_block!(block_type, s.inbuf, 1, block_size, s.state, s.out, s.wpos,
-                           false, s.frame_start, typemax(Int) - WILDCOPY_SLACK)
+                           false, s.frame_start, out_limit)
     s.frame_len += s.wpos - wpos0
     s.check_flag && xxh_update!(s.hasher, @view s.out[wpos0:s.wpos - 1])
 
