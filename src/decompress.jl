@@ -1,32 +1,26 @@
-# Groups the three backing arrays for one FSE decode table (LL, OF, or ML),
-# plus a persistent `FSEDistTable` wrapper aliasing those same arrays. Having
-# all three arrays in one object lets callers pass a single slot instead of
-# three separate vectors, and keeps DecompressState compact. `table`'s array
-# fields never change identity after construction (resize! mutates syms/nb/base
-# in place); only its `accuracy_log` needs updating per call, in
-# `build_fse_table!` below — so reusing `table` across blocks needs no
-# resynchronization beyond that.
+# Owns the backing entry array for one FSE decode table (LL, OF, or ML), plus a
+# persistent `FSEDistTable` wrapper aliasing that same array. `table`'s array
+# field never changes identity after construction (resize! in
+# `_fill_fse_table!` mutates the vector in place); only its `accuracy_log`
+# needs updating per call, in `build_fse_table!` below — so reusing `table`
+# across blocks needs no resynchronization beyond that.
 struct FSEDistTableSlot
-    syms ::Vector{UInt8}
-    nb   ::Vector{UInt8}
-    base ::Vector{UInt32}
-    table::FSEDistTable
+    entries::Vector{UInt64}
+    table  ::FSEDistTable
 end
 
 function FSEDistTableSlot(n::Int)
-    syms = Vector{UInt8}(undef, n)
-    nb   = Vector{UInt8}(undef, n)
-    base = Vector{UInt32}(undef, n)
-    FSEDistTableSlot(syms, nb, base, FSEDistTable(0, syms, nb, base))
+    entries = Vector{UInt64}(undef, n)
+    FSEDistTableSlot(entries, FSEDistTable(0, entries))
 end
 
 # Hot path: mutate the slot's persistent FSEDistTable in place instead of
 # allocating a fresh wrapper every FSE_Compressed-mode block. The backing
-# arrays are already reused (resize! in `_fill_fse_table!`); this reuses the
+# array is already reused (resize! in `_fill_fse_table!`); this reuses the
 # small wrapper object too.
 function build_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
-                           slot::FSEDistTableSlot, occ::Vector{Int})
-    _fill_fse_table!(norm, accuracy_log, slot.syms, slot.nb, slot.base, occ)
+                           slot::FSEDistTableSlot, occ::Vector{Int}, kind)
+    _fill_fse_table!(norm, accuracy_log, slot.entries, occ, kind)
     slot.table.accuracy_log = accuracy_log
     return slot.table
 end
@@ -689,11 +683,11 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
 
     br = reinit!(state.fbr, @view data[pos:limit])
     ll_tab = read_distribution_table!(br, DEFAULT_LITERALS_LENGTH_TABLE, state.ll_tab, ll_mode, MAX_LITERALS_LENGTH, 9,
-                             state.ll_slot, state)
+                             state.ll_slot, state, SeqLL())
     of_tab = read_distribution_table!(br, DEFAULT_OFFSET_TABLE, state.of_tab, of_mode, MAX_OFFSET_CODE, 8,
-                             state.of_slot, state)
+                             state.of_slot, state, SeqOF())
     ml_tab = read_distribution_table!(br, DEFAULT_MATCH_LENGTH_TABLE, state.ml_tab, ml_mode, MAX_MATCH_LENGTH, 9,
-                             state.ml_slot, state)
+                             state.ml_slot, state, SeqML())
     state.ll_tab = ll_tab
     state.of_tab = of_tab
     state.ml_tab = ml_tab
@@ -752,12 +746,8 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
                            frame_start, block_limit, out_limit)
 end
 
-@noinline _throw_offset_code(c) =
-    throw(ArgumentError("zstd: offset code $c exceeds maximum supported value, $MAX_OFFSET_CODE"))
 @noinline _throw_seq_bitstream() =
     throw(ArgumentError("zstd: unexpected end of sequence bitstream"))
-@noinline _throw_offset_range(v) =
-    throw(ArgumentError("zstd: offset value $v exceeds addressable range"))
 @noinline _throw_literals_overrun() =
     throw(ArgumentError("zstd: sequences reference more literals than the block provides"))
 @noinline _throw_repeat_offset_zero() =
@@ -787,21 +777,24 @@ function _run_sequences!(ll_tab::T1, of_tab::T2, ml_tab::T3,
     dict_len = length(dict)
 
     @inbounds for i in 1:num_seqs
-        # Peek symbols from all three states (no bits consumed)
-        ll_code = dist_table_peek(ll_tab, ll_state)
-        ml_code = dist_table_peek(ml_tab, ml_state)
-        of_code = dist_table_peek(of_tab, of_state)
-        of_code ≤ MAX_OFFSET_CODE || _throw_offset_code(of_code)
+        # One packed entry per table carries this state's value baseline, its
+        # extra-bit count, and its state transition, so each table is a single
+        # bounds-checked load. Nothing here depends on a symbol first, which is
+        # the point: `total_n` below used to sit behind a second, dependent
+        # lookup into the baseline/extra-bits tables.
+        ll_e = dist_table_entry(ll_tab, ll_state)
+        ml_e = dist_table_entry(ml_tab, ml_state)
+        of_e = dist_table_entry(of_tab, of_state)
 
-        of_n  = of_code
-        ml_n  = Int(@inbounds MATCH_LENGTH_EXTRA_BITS[ml_code + 1])
-        ll_n  = Int(@inbounds LITERALS_LENGTH_EXTRA_BITS[ll_code + 1])
+        of_n  = _fse_add(of_e)     # offset codes are their own extra-bit count
+        ml_n  = _fse_add(ml_e)
+        ll_n  = _fse_add(ll_e)
 
         # State-transition widths (skip on last sequence)
         update = i < num_seqs
-        ll_nb = update ? _dist_table_nb_bits(ll_tab, ll_state) : 0
-        ml_nb = update ? _dist_table_nb_bits(ml_tab, ml_state) : 0
-        of_nb = update ? _dist_table_nb_bits(of_tab, of_state) : 0
+        ll_nb = update ? _fse_nb(ll_e) : 0
+        ml_nb = update ? _fse_nb(ml_e) : 0
+        of_nb = update ? _fse_nb(of_e) : 0
 
         total_n = of_n + ml_n + ll_n + ll_nb + ml_nb + of_nb
 
@@ -840,18 +833,19 @@ function _run_sequences!(ll_tab::T1, of_tab::T2, ml_tab::T3,
             of_bits  = Int(read(rb, of_nb))
         end
 
-        of_val64 = (Int64(1) << of_code) + of_extra
-        of_val64 ≤ typemax(Int) || _throw_offset_range(of_val64)
-        of = Int(of_val64)
-        ml = Int(MATCH_LENGTH_BASELINE[ml_code + 1]) + ml_extra
-        ll = Int(LITERALS_LENGTH_BASELINE[ll_code + 1]) + ll_extra
+        # Baselines come straight out of the entries. The offset baseline is
+        # 1 << of_code, baked at build time, and of_code ≤ MAX_OFFSET_CODE (31)
+        # is enforced there too, so the sum cannot overflow Int.
+        of = _fse_base(of_e) + of_extra
+        ml = _fse_base(ml_e) + ml_extra
+        ll = _fse_base(ll_e) + ll_extra
 
         # Advance the distribution-table states before emitting output; allows the CPU
         # to issue loads for the next sequence while the current sequence is being executed.
         if update
-            ll_state = _dist_table_baseline(ll_tab, ll_state) + ll_bits
-            ml_state = _dist_table_baseline(ml_tab, ml_state) + ml_bits
-            of_state = _dist_table_baseline(of_tab, of_state) + of_bits
+            ll_state = _fse_next(ll_e) + ll_bits
+            ml_state = _fse_next(ml_e) + ml_bits
+            of_state = _fse_next(of_e) + of_bits
         end
 
         # Bounds, in place of the pre-scan the two-pass version used to do. Both are
@@ -966,21 +960,19 @@ function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          prev::Union{FSEDistTable, RLEDistTable, Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
                          slot::FSEDistTableSlot, occ::Vector{Int},
-                         norm::Vector{Int16})
+                         norm::Vector{Int16}, kind)
     if mode == 0 # Predefined_Mode
         return default
     elseif mode == 1 # RLE_Mode
         sym = Int(read(br, 8))
-        # Sequence decoding indexes the baseline/extra-bits tables with this
-        # symbol under @inbounds, so it must be range-checked here.
-        sym ≤ max_sym ||
-            throw(ArgumentError("zstd: RLE symbol $sym exceeds maximum $max_sym"))
-        return RLEDistTable(UInt8(sym))
+        # `_rle_table` range-checks the symbol against the kind before baking
+        # its baseline and extra-bit count into the entry.
+        return _rle_table(kind, sym)
     elseif mode == 2 # FSE_Compressed_Mode
         al, dist = read_fse_dist!(br, norm)
         al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
         length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
-        return build_fse_table!(dist, al, slot, occ)
+        return build_fse_table!(dist, al, slot, occ, kind)
     else # mode == 3; Repeat_Mode
         prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous distribution table"))
         return prev
@@ -990,7 +982,7 @@ end
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          prev::Union{FSEDistTable,RLEDistTable,Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
-                         slot::FSEDistTableSlot, state::DecompressState)
+                         slot::FSEDistTableSlot, state::DecompressState, kind)
     return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
-                           slot, state.fse_occ, state.fse_norm)
+                           slot, state.fse_occ, state.fse_norm, kind)
 end

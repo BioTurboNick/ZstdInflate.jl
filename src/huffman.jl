@@ -160,7 +160,7 @@ end
 function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_limit::Int,
                              rb_scratch::Union{Nothing, ReverseBitReader} = nothing)
     al, dist = read_fse_dist!(br, HUFTABLE_LOG_MAX)
-    t = build_fse_table(dist, al)
+    t = build_fse_table(dist, al, RawSym())
 
     pos_after = byte_pos(br)
     n_remain = byte_limit - pos_after + 1
