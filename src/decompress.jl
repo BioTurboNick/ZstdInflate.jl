@@ -71,6 +71,18 @@ const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single blo
 # use. Must be a valid (non-empty, sentinel-terminated) reverse bitstream.
 _dummy_rbr_view() = @view UInt8[0x01][1:1]
 
+# fse_occ/fse_norm are shared scratch for read_distribution_table! (LL/OF/ML,
+# built sequentially, see DecompressState's field comment). For any input
+# that doesn't get rejected by read_distribution_table!'s own
+# length(dist) ≤ max_sym+1 check, norm can never exceed MAX_MATCH_LENGTH+1
+# (53) entries -- the largest of the three real max_sym+1 values (LL: 36,
+# OF: 32, ML: 53). Pre-sizing to that bound means the push! loop in
+# read_fse_dist! never has to grow the buffer for any input that will
+# actually succeed; a fresh DecompressState is constructed per frame, so
+# without this every LL/OF/ML call on every frame would otherwise re-grow
+# from empty via several reallocations to reach the same ~53 elements.
+_new_fse_scratch() = (sizehint!(Int[], MAX_MATCH_LENGTH + 1), sizehint!(Int16[], MAX_MATCH_LENGTH + 1))
+
 DecompressState() = DecompressState(
     INIT_REPEAT_OFFSETS, nothing, nothing, nothing, nothing, UInt8[],
     UInt8[],
@@ -80,7 +92,7 @@ DecompressState() = DecompressState(
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
-    Int[], Int16[],
+    _new_fse_scratch()...,
     ReverseBitReader(_dummy_rbr_view()),
     ReverseBitReader(_dummy_rbr_view()),
     Huffman4StreamScratch(_dummy_rbr_view()))
@@ -95,7 +107,7 @@ DecompressState(dict::ZstdDict) =
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
-        Int[], Int16[],
+        _new_fse_scratch()...,
         ReverseBitReader(_dummy_rbr_view()),
         ReverseBitReader(_dummy_rbr_view()),
         Huffman4StreamScratch(_dummy_rbr_view()))
