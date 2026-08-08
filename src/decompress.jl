@@ -1,15 +1,35 @@
-# Groups the three backing arrays for one FSE decode table (LL, OF, or ML).
-# Having all three in one object lets callers pass a single slot instead of
-# three separate vectors, and keeps DecompressState compact.
+# Groups the three backing arrays for one FSE decode table (LL, OF, or ML),
+# plus a persistent `FSEDistTable` wrapper aliasing those same arrays. Having
+# all three arrays in one object lets callers pass a single slot instead of
+# three separate vectors, and keeps DecompressState compact. `table`'s array
+# fields never change identity after construction (resize! mutates syms/nb/base
+# in place); only its `accuracy_log` needs updating per call, in
+# `build_fse_table!` below — so reusing `table` across blocks needs no
+# resynchronization beyond that.
 struct FSEDistTableSlot
     syms ::Vector{UInt8}
     nb   ::Vector{UInt8}
     base ::Vector{UInt32}
+    table::FSEDistTable
 end
 
-FSEDistTableSlot(n::Int) = FSEDistTableSlot(Vector{UInt8}(undef, n),
-                                     Vector{UInt8}(undef, n),
-                                     Vector{UInt32}(undef, n))
+function FSEDistTableSlot(n::Int)
+    syms = Vector{UInt8}(undef, n)
+    nb   = Vector{UInt8}(undef, n)
+    base = Vector{UInt32}(undef, n)
+    FSEDistTableSlot(syms, nb, base, FSEDistTable(0, syms, nb, base))
+end
+
+# Hot path: mutate the slot's persistent FSEDistTable in place instead of
+# allocating a fresh wrapper every FSE_Compressed-mode block. The backing
+# arrays are already reused (resize! in `_fill_fse_table!`); this reuses the
+# small wrapper object too.
+function build_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
+                           slot::FSEDistTableSlot, occ::Vector{Int})
+    _fill_fse_table!(norm, accuracy_log, slot.syms, slot.nb, slot.base, occ)
+    slot.table.accuracy_log = accuracy_log
+    return slot.table
+end
 
 mutable struct DecompressState
     rep         ::NTuple{3,Int}
@@ -33,10 +53,23 @@ mutable struct DecompressState
     # Shared FSE build scratch — safe to share because LL/ML/OF are built sequentially
     fse_occ  ::Vector{Int}
     fse_norm ::Vector{Int16}
+    # Reusable reverse-bitstream readers. Each frame decode gets its own
+    # DecompressState (frames run on separate tasks under nthreads > 1), so
+    # reusing these across blocks within one frame's decode is safe: the
+    # sequences reader and the single-stream literals reader are never live
+    # at the same time as each other, and `huf4` bundles the 4-stream
+    # Huffman decoder's own internal pool (see reversebitreader.jl).
+    rb_seq  ::ReverseBitReader{RBRView}
+    rb_lit1 ::ReverseBitReader{RBRView}
+    huf4    ::Huffman4StreamScratch{RBRView}
 end
 
 const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
+
+# Placeholder data for scratch readers, overwritten by `reinit!` before real
+# use. Must be a valid (non-empty, sentinel-terminated) reverse bitstream.
+_dummy_rbr_view() = @view UInt8[0x01][1:1]
 
 DecompressState() = DecompressState(
     INIT_REPEAT_OFFSETS, nothing, nothing, nothing, nothing, UInt8[],
@@ -47,7 +80,10 @@ DecompressState() = DecompressState(
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
-    Int[], Int16[])
+    Int[], Int16[],
+    ReverseBitReader(_dummy_rbr_view()),
+    ReverseBitReader(_dummy_rbr_view()),
+    Huffman4StreamScratch(_dummy_rbr_view()))
 
 DecompressState(dict::ZstdDict) =
     DecompressState(
@@ -59,7 +95,10 @@ DecompressState(dict::ZstdDict) =
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
-        Int[], Int16[])
+        Int[], Int16[],
+        ReverseBitReader(_dummy_rbr_view()),
+        ReverseBitReader(_dummy_rbr_view()),
+        Huffman4StreamScratch(_dummy_rbr_view()))
 
 
 """
@@ -572,14 +611,14 @@ function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::Decompr
         resize!(literals, regen_size + WILDCOPY_SLACK)
 
         if num_streams == 1
-            rb = ReverseBitReader(@view data[huf_start:payload_end])
+            rb = reinit!(state.rb_lit1, @view data[huf_start:payload_end])
             let p = 1
                 while p ≤ regen_size
                     p += decode1x2_tail!(rb, ht, literals, p)
                 end
             end
         else
-            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size)
+            _decode_4streams!((@view data[huf_start:payload_end]), ht, literals, regen_size, state.huf4)
         end
 
         resize!(literals, regen_size + WILDCOPY_SLACK)  # trim dual-symbol slack
@@ -632,7 +671,7 @@ function read_sequences!(data::Vector{UInt8}, pos::Int, limit::Int,
     seq_len = limit - seq_start + 1
     seq_len > 0 || throw(ArgumentError("zstd: no data for sequences bitstream"))
 
-    rb = ReverseBitReader(@view data[seq_start:seq_start + seq_len - 1])
+    rb = reinit!(state.rb_seq, @view data[seq_start:seq_start + seq_len - 1])
 
     # Init distribution table states
     ll_state = dist_table_init!(rb, ll_tab)
@@ -893,8 +932,7 @@ end
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          prev::Union{FSEDistTable, RLEDistTable, Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
-                         syms::Vector{UInt8}, nb::Vector{UInt8},
-                         base::Vector{UInt32}, occ::Vector{Int},
+                         slot::FSEDistTableSlot, occ::Vector{Int},
                          norm::Vector{Int16})
     if mode == 0 # Predefined_Mode
         return default
@@ -909,7 +947,7 @@ function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
         al, dist = read_fse_dist!(br, norm)
         al ≤ max_al || throw(ArgumentError("zstd: accuracy log $al exceeds maximum $max_al"))
         length(dist) ≤ max_sym + 1 || throw(ArgumentError("zstd: FSE distribution has $(length(dist)) symbols, maximum is $(max_sym + 1)"))
-        return build_fse_table(dist, al, syms, nb, base, occ)
+        return build_fse_table!(dist, al, slot, occ)
     else # mode == 3; Repeat_Mode
         prev !== nothing || throw(ArgumentError("zstd: repeat mode but no previous distribution table"))
         return prev
@@ -921,6 +959,5 @@ function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          mode::Int, max_sym::Int, max_al::Int,
                          slot::FSEDistTableSlot, state::DecompressState)
     return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
-                           slot.syms, slot.nb, slot.base,
-                           state.fse_occ, state.fse_norm)
+                           slot, state.fse_occ, state.fse_norm)
 end

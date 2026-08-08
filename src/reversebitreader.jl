@@ -3,6 +3,13 @@
 #   Used for encoded data bitstreams (literals, sequences)
 # ============================================================
 
+# Concrete type of every `@view data[a:b]` slice these readers are built
+# from (frame bytes are always a plain Vector{UInt8}, and nested views over a
+# UnitRange flatten to this same type rather than nesting SubArrays). Scratch
+# fields reused across calls (DecompressState) need a concrete, matching
+# type parameter to reinitialize in place without reallocating.
+const RBRView = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int64}}, true}
+
 mutable struct ReverseBitReader{T <: AbstractVector{UInt8}}
     data::T
     pos::Int     # next byte to load (decreasing, 1-indexed)
@@ -10,8 +17,10 @@ mutable struct ReverseBitReader{T <: AbstractVector{UInt8}}
     nbits::Int   # number of valid bits currently in buffer
 end
 
-# Expects the last byte to contain at least one set bit, which indicates the end of the bitstream.
-function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
+# Parse the sentinel bit at the end of a reverse bitstream, returning the
+# pre-initial-refill (pos, bits, nbits). Shared by the allocating constructor
+# and `reinit!` below.
+@inline function _rbr_sentinel(data::AbstractVector{UInt8})
     isempty(data) &&
         throw(ArgumentError("zstd: empty reverse bitstream"))
     lastbyte = data[end]
@@ -24,13 +33,35 @@ function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
 
     # Pack into the MSB region of the 64-bit container
     bits = UInt64(valid_bits) << (64 - nbits)
+    return length(data) - 1, bits, nbits
+end
 
-    rb = ReverseBitReader{T}(data, length(data) - 1, bits, nbits)
-    if length(rb.data) ≤ 8
-        _refill_bytewise!(rb)
-    else
-        refill!(rb)
-    end
+# Full initial state (post-first-refill) for a fresh reverse bitstream, with
+# no reader object involved. `_refill_stream` already unifies the fast
+# (pos ≥ 8), padded (pos < 8), and bytewise (length(data) ≤ 8) cases that
+# `refill!`/`_refill_bytewise!` otherwise dispatch between, so this is a
+# drop-in replacement for "construct + do the initial refill" that never
+# needs a temporary reader to get there.
+@inline function _rbr_init_state(data::AbstractVector{UInt8})
+    pos, bits, nbits = _rbr_sentinel(data)
+    bits, nbits, pos = _refill_stream(data, bits, nbits, pos)
+    return pos, bits, nbits
+end
+
+# Expects the last byte to contain at least one set bit, which indicates the end of the bitstream.
+function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
+    pos, bits, nbits = _rbr_init_state(data)
+    return ReverseBitReader{T}(data, pos, bits, nbits)
+end
+
+# Reinitialize an existing reader for a new bitstream in place, instead of
+# allocating a fresh one. `data` must share `rb`'s existing type parameter.
+function reinit!(rb::ReverseBitReader{T}, data::T) where T <: AbstractVector{UInt8}
+    pos, bits, nbits = _rbr_init_state(data)
+    rb.data = data
+    rb.pos = pos
+    rb.bits = bits
+    rb.nbits = nbits
     return rb
 end
 
@@ -161,26 +192,47 @@ mutable struct ReverseBitReaderX{X, T <: AbstractVector{UInt8}}
     pos  ::NTuple{X, Int64}
 end
 
-# Construct from four data slices, delegating per-stream init (sentinel handling,
-# initial refill) to the existing ReverseBitReader constructor.
+# Construct from four data slices. Uses `_rbr_init_state` directly rather than
+# building and discarding four temporary `ReverseBitReader`s.
 function ReverseBitReaderX(d1::T, d2::T, d3::T, d4::T) where T <: AbstractVector{UInt8}
-    rb1 = ReverseBitReader(d1)
-    rb2 = ReverseBitReader(d2)
-    rb3 = ReverseBitReader(d3)
-    rb4 = ReverseBitReader(d4)
-    bits  = (rb1.bits,         rb2.bits,         rb3.bits,         rb4.bits)
-    nbits = (Int64(rb1.nbits), Int64(rb2.nbits), Int64(rb3.nbits), Int64(rb4.nbits))
-    pos   = (Int64(rb1.pos),   Int64(rb2.pos),   Int64(rb3.pos),   Int64(rb4.pos))
-    ReverseBitReaderX{4, T}((d1, d2, d3, d4), bits, nbits, pos)
+    p1, b1, n1 = _rbr_init_state(d1)
+    p2, b2, n2 = _rbr_init_state(d2)
+    p3, b3, n3 = _rbr_init_state(d3)
+    p4, b4, n4 = _rbr_init_state(d4)
+    ReverseBitReaderX{4, T}((d1, d2, d3, d4),
+                            (b1, b2, b3, b4),
+                            (Int64(n1), Int64(n2), Int64(n3), Int64(n4)),
+                            (Int64(p1), Int64(p2), Int64(p3), Int64(p4)))
+end
+
+# Reinitialize an existing 4-lane reader in place for four new data slices.
+function reinit!(rb::ReverseBitReaderX{4, T}, d1::T, d2::T, d3::T, d4::T) where T <: AbstractVector{UInt8}
+    p1, b1, n1 = _rbr_init_state(d1)
+    p2, b2, n2 = _rbr_init_state(d2)
+    p3, b3, n3 = _rbr_init_state(d3)
+    p4, b4, n4 = _rbr_init_state(d4)
+    rb.data  = (d1, d2, d3, d4)
+    rb.bits  = (b1, b2, b3, b4)
+    rb.nbits = (Int64(n1), Int64(n2), Int64(n3), Int64(n4))
+    rb.pos   = (Int64(p1), Int64(p2), Int64(p3), Int64(p4))
+    return rb
 end
 
 function ReverseBitReaderX(d1::T, d2::T) where T <: AbstractVector{UInt8}
-    rb1 = ReverseBitReader(d1)
-    rb2 = ReverseBitReader(d2)
-    bits  = (rb1.bits,         rb2.bits)
-    nbits = (Int64(rb1.nbits), Int64(rb2.nbits))
-    pos   = (Int64(rb1.pos),   Int64(rb2.pos))
-    ReverseBitReaderX{2, T}((d1, d2), bits, nbits, pos)
+    p1, b1, n1 = _rbr_init_state(d1)
+    p2, b2, n2 = _rbr_init_state(d2)
+    ReverseBitReaderX{2, T}((d1, d2), (b1, b2), (Int64(n1), Int64(n2)), (Int64(p1), Int64(p2)))
+end
+
+# Reinitialize an existing 2-lane reader in place for two new data slices.
+function reinit!(rb::ReverseBitReaderX{2, T}, d1::T, d2::T) where T <: AbstractVector{UInt8}
+    p1, b1, n1 = _rbr_init_state(d1)
+    p2, b2, n2 = _rbr_init_state(d2)
+    rb.data  = (d1, d2)
+    rb.bits  = (b1, b2)
+    rb.nbits = (Int64(n1), Int64(n2))
+    rb.pos   = (Int64(p1), Int64(p2))
+    return rb
 end
 
 function ReverseBitReaderX(rb1::ReverseBitReader{T}, rb2::ReverseBitReader{T}) where T <: AbstractVector{UInt8}
@@ -188,6 +240,16 @@ function ReverseBitReaderX(rb1::ReverseBitReader{T}, rb2::ReverseBitReader{T}) w
     nbits = (Int64(rb1.nbits), Int64(rb2.nbits))
     pos   = (Int64(rb1.pos),   Int64(rb2.pos))
     ReverseBitReaderX{2, T}((rb1.data, rb2.data), bits, nbits, pos)
+end
+
+# Reinitialize an existing 2-lane reader in place from two already-live
+# single readers (repackaging, no new initial refill).
+function reinit!(rb::ReverseBitReaderX{2, T}, rb1::ReverseBitReader{T}, rb2::ReverseBitReader{T}) where T <: AbstractVector{UInt8}
+    rb.data  = (rb1.data, rb2.data)
+    rb.bits  = (rb1.bits, rb2.bits)
+    rb.nbits = (Int64(rb1.nbits), Int64(rb2.nbits))
+    rb.pos   = (Int64(rb1.pos), Int64(rb2.pos))
+    return rb
 end
 
 # Refill all four streams.
@@ -244,12 +306,60 @@ end
     return
 end
 
-# Extract one stream as an individual ReverseBitReader (used for tail phases).
-@inline function _extract_stream(rb2x::ReverseBitReaderX{2, T}, ::Val{I}) where {T, I}
-    ReverseBitReader{T}(rb2x.data[I], Int(rb2x.pos[I]), rb2x.bits[I], Int(rb2x.nbits[I]))
+# Extract one stream into an existing ReverseBitReader (used for tail phases).
+# Writes into `dst` in place instead of allocating a fresh reader.
+@inline function _extract_stream!(dst::ReverseBitReader{T}, rb2x::ReverseBitReaderX{2, T}, ::Val{I}) where {T, I}
+    dst.data  = rb2x.data[I]
+    dst.pos   = Int(rb2x.pos[I])
+    dst.bits  = rb2x.bits[I]
+    dst.nbits = Int(rb2x.nbits[I])
+    return dst
 end
 
-@inline function _extract_stream(rb4x::ReverseBitReaderX{4, T}, ::Val{I}) where {T, I}
+@inline function _extract_stream!(dst::ReverseBitReader{T}, rb4x::ReverseBitReaderX{4, T}, ::Val{I}) where {T, I}
     data = I == 1 ? rb4x.data[1] : I == 2 ? rb4x.data[2] : I == 3 ? rb4x.data[3] : rb4x.data[4]
-    ReverseBitReader{T}(data, Int(rb4x.pos[I]), rb4x.bits[I], Int(rb4x.nbits[I]))
+    dst.data  = data
+    dst.pos   = Int(rb4x.pos[I])
+    dst.bits  = rb4x.bits[I]
+    dst.nbits = Int(rb4x.nbits[I])
+    return dst
+end
+
+# ============================================================
+# Scratch pool for _decode_4streams! (huffman.jl)
+#   Bundles every ReverseBitReader/ReverseBitReaderX that function needs so
+#   DecompressState can hold and reuse them across calls instead of
+#   allocating a fresh set (3 X-readers + 8 single readers) per literals
+#   section.
+# ============================================================
+
+mutable struct Huffman4StreamScratch{T}
+    rb4x  ::ReverseBitReaderX{4, T}
+    rbA   ::ReverseBitReaderX{2, T}
+    rbB   ::ReverseBitReaderX{2, T}
+    s1    ::ReverseBitReader{T}
+    s2    ::ReverseBitReader{T}
+    s3    ::ReverseBitReader{T}
+    s4    ::ReverseBitReader{T}
+    ra_ia ::ReverseBitReader{T}
+    ra_ib ::ReverseBitReader{T}
+    rb_2b ::ReverseBitReader{T}
+    rb_ic2::ReverseBitReader{T}
+end
+
+# Placeholder-initialize a scratch pool from a dummy data slice. The dummy
+# 1-byte stream (0x01, i.e. sentinel-only, zero payload bits) is a
+# valid-but-empty reverse bitstream, just enough to satisfy the reader
+# constructors; every field is overwritten by `reinit!`/`_extract_stream!`
+# before real use.
+function Huffman4StreamScratch(dummy::T) where T <: AbstractVector{UInt8}
+    Huffman4StreamScratch{T}(
+        ReverseBitReaderX(dummy, dummy, dummy, dummy),
+        ReverseBitReaderX(dummy, dummy),
+        ReverseBitReaderX(dummy, dummy),
+        ReverseBitReader(dummy), ReverseBitReader(dummy),
+        ReverseBitReader(dummy), ReverseBitReader(dummy),
+        ReverseBitReader(dummy), ReverseBitReader(dummy),
+        ReverseBitReader(dummy), ReverseBitReader(dummy),
+    )
 end

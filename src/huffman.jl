@@ -217,7 +217,8 @@ end
 # the result in `literals`. This code is tuned to promote LLVM SIMD instructions; changes
 # in it or the functions it calls could break this. Use caution.
 function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
-                            literals::Vector{UInt8}, regen_size::Int) where L
+                            literals::Vector{UInt8}, regen_size::Int,
+                            scratch::Huffman4StreamScratch) where L
     # Read stream-start indexes from the 6-byte jump table (RFC 8878 §3.1.1.3.1.6).
     # The caller guarantees length(data) ≥ 10 (jump table + four non-empty
     # streams); the stream boundaries themselves are attacker-controlled and
@@ -237,7 +238,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     safeends = (ends[1] - 2safe_n, ends[2] - 2safe_n, ends[3] - 2safe_n, ends[4] - 2safe_n)
 
     # Phase 1: SIMD parallel processing of the four streams until at least one is exhausted (within safe window)
-    rb4x = ReverseBitReaderX(
+    rb4x = reinit!(scratch.rb4x,
         @view(data[s1_start:s2_start-1]),
         @view(data[s2_start:s3_start-1]),
         @view(data[s3_start:s4_start-1]),
@@ -259,13 +260,13 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
          safeends[3] - oi[3], safeends[4] - oi[4])
     ia, ib, ic, id = sortperm([r[1], r[2], r[3], r[4]], rev=true)
 
-    s1 = _extract_stream(rb4x, Val(1))
-    s2 = _extract_stream(rb4x, Val(2))
-    s3 = _extract_stream(rb4x, Val(3))
-    s4 = _extract_stream(rb4x, Val(4))
+    s1 = _extract_stream!(scratch.s1, rb4x, Val(1))
+    s2 = _extract_stream!(scratch.s2, rb4x, Val(2))
+    s3 = _extract_stream!(scratch.s3, rb4x, Val(3))
+    s4 = _extract_stream!(scratch.s4, rb4x, Val(4))
     sv = (s1, s2, s3, s4)
 
-    rbA = ReverseBitReaderX(sv[ia], sv[ib])
+    rbA = reinit!(scratch.rbA, sv[ia], sv[ib])
     oi_A = Vec{2, Int}((oi[ia], oi[ib]))
     se_A = Vec{2, Int}((safeends[ia], safeends[ib]))
     while all(oi_A ≤ se_A)
@@ -275,8 +276,8 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
             oi_A += nread
         end
     end
-    ra_ia = _extract_stream(rbA, Val(1))
-    ra_ib = _extract_stream(rbA, Val(2))
+    ra_ia = _extract_stream!(scratch.ra_ia, rbA, Val(1))
+    ra_ib = _extract_stream!(scratch.ra_ib, rbA, Val(2))
 
     # Phase 2B: SIMD parallel processing of the survivor with the last unexhausted stream
     ia_alive = oi_A[1] ≤ se_A[1]
@@ -284,7 +285,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     oi_2a  = ia_alive ? Int(oi_A[1]) : Int(oi_A[2])
     se_2a  = ia_alive ? safeends[ia] : safeends[ib]
 
-    rbB = ReverseBitReaderX(re_2a, sv[ic])
+    rbB = reinit!(scratch.rbB, re_2a, sv[ic])
     oi_B = Vec{2, Int}((oi_2a, oi[ic]))
     se_B = Vec{2, Int}((se_2a, safeends[ic]))
     while all(oi_B ≤ se_B)
@@ -294,8 +295,8 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
             oi_B += nread
         end
     end
-    rb_2b  = _extract_stream(rbB, Val(1))   # survivor-of-2a reader, updated
-    rb_ic2 = _extract_stream(rbB, Val(2))   # ic reader, updated
+    rb_2b  = _extract_stream!(scratch.rb_2b, rbB, Val(1))    # survivor-of-2a reader, updated
+    rb_ic2 = _extract_stream!(scratch.rb_ic2, rbB, Val(2))   # ic reader, updated
 
     # Phase 2C: Process remaining unexhausted stream
     ie_alive = oi_B[1] ≤ se_B[1]
