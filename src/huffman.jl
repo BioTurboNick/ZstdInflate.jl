@@ -213,6 +213,22 @@ end
 @noinline _throw_invalid_stream_sizes() =
     throw(ArgumentError("zstd: invalid literals stream sizes"))
 
+# Permutation of (1,2,3,4) descending by r[i], i.e. r[i[1]] ≥ r[i[2]] ≥ r[i[3]] ≥ r[i[4]].
+# Equivalent to sortperm(collect(r); rev=true) for exactly 4 elements, via the
+# standard optimal 5-comparator sorting network -- no array, no allocation.
+# Only feeds a load-balancing heuristic (which stream pair phase 2A tackles
+# first), not decode correctness, so exact tie-break behavior doesn't need to
+# match sortperm's.
+@inline function _sortperm4_desc(r::NTuple{4, Int})
+    i1, i2, i3, i4 = 1, 2, 3, 4
+    r[i1] < r[i2] && ((i1, i2) = (i2, i1))
+    r[i3] < r[i4] && ((i3, i4) = (i4, i3))
+    r[i1] < r[i3] && ((i1, i3) = (i3, i1))
+    r[i2] < r[i4] && ((i2, i4) = (i4, i2))
+    r[i2] < r[i3] && ((i2, i3) = (i3, i2))
+    return (i1, i2, i3, i4)
+end
+
 # Decode the four Huffman streams stored in `data` using the lookup table `ht` and store
 # the result in `literals`. This code is tuned to promote LLVM SIMD instructions; changes
 # in it or the functions it calls could break this. Use caution.
@@ -258,7 +274,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     # Phase 2A: SIMD parallel processing of the top pair of streams with the most work remaining
     r = (safeends[1] - oi[1], safeends[2] - oi[2],
          safeends[3] - oi[3], safeends[4] - oi[4])
-    ia, ib, ic, id = sortperm([r[1], r[2], r[3], r[4]], rev=true)
+    ia, ib, ic, id = _sortperm4_desc(r)
 
     s1 = _extract_stream!(scratch.s1, rb4x, Val(1))
     s2 = _extract_stream!(scratch.s2, rb4x, Val(2))
