@@ -44,6 +44,7 @@ mutable struct DecompressState
     huf_rank_count ::Vector{Int}
     huf_rank_start ::Vector{Int}
     huf_weights    ::Vector{UInt8}
+    huf_nbits_sym1 ::Vector{UInt8}   # build_huffman_table!'s pass-1 stream_nbits snapshot
     # Reusable FSE table backing arrays — one slot per table (LL, ML, OF).
     # Slots cannot be shared because all three tables are live simultaneously
     # during sequence decoding.
@@ -65,6 +66,7 @@ mutable struct DecompressState
 end
 
 const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
+const _HUF_MAX_TABLE = 1 << HUFTABLE_LOG_MAX  # largest possible Huffman decode table (2048 entries)
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
 # Placeholder data for scratch readers, overwritten by `reinit!` before real
@@ -89,6 +91,7 @@ DecompressState() = DecompressState(
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     UInt8[],
+    Vector{UInt8}(undef, _HUF_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
@@ -104,6 +107,7 @@ DecompressState(dict::ZstdDict) =
         zeros(Int, HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
         UInt8[],
+        Vector{UInt8}(undef, _HUF_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
@@ -608,7 +612,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::Decompr
             ht = state.huffman
             huf_start = payload_start
         else # Compressed
-            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start))
+            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start, state.huf_nbits_sym1))
             state.huffman = ht
             huf_start = payload_start + hdr_len
         end
