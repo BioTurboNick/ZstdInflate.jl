@@ -67,6 +67,7 @@ end
 
 const _FSE_MAX_TABLE = 512   # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
 const _HUF_MAX_TABLE = 1 << HUFTABLE_LOG_MAX  # largest possible Huffman decode table (2048 entries)
+const _HUF_MAX_SYMBOLS = 256  # one weight per possible byte value
 const ZSTD_BLOCKSIZE_MAX = 131072  # maximum decompressed size of any single block (RFC 8878)
 
 # Placeholder data for scratch readers, overwritten by `reinit!` before real
@@ -90,7 +91,7 @@ DecompressState() = DecompressState(
     UInt8[],
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     zeros(Int, HUFTABLE_LOG_MAX + 1),
-    UInt8[],
+    sizehint!(UInt8[], _HUF_MAX_SYMBOLS),
     Vector{UInt8}(undef, _HUF_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
     FSEDistTableSlot(_FSE_MAX_TABLE),
@@ -106,7 +107,7 @@ DecompressState(dict::ZstdDict) =
         UInt8[],
         zeros(Int, HUFTABLE_LOG_MAX),
         zeros(Int, HUFTABLE_LOG_MAX),
-        UInt8[],
+        sizehint!(UInt8[], _HUF_MAX_SYMBOLS),
         Vector{UInt8}(undef, _HUF_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
