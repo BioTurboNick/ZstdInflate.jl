@@ -113,7 +113,8 @@ end
 # ============================================================
 
 function read_huffman_description(data::AbstractVector{UInt8};
-                                   scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing)
+                                   scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing,
+                                   rb_scratch::Union{Nothing, ReverseBitReader} = nothing)
     length(data) ≥ 1 ||
         throw(ArgumentError("zstd: truncated Huffman table description"))
     headerByte = Int(data[1]) # RFC 8878 §4.2.1.1
@@ -124,7 +125,7 @@ function read_huffman_description(data::AbstractVector{UInt8};
         length(data) ≥ nbytes + 1 ||
             throw(ArgumentError("zstd: truncated Huffman table description"))
         br = ForwardBitReader(@view data[2:nbytes + 1])
-        _, table_log = _read_fse_weights!(weights, br, nbytes)
+        _, table_log = _read_fse_weights!(weights, br, nbytes, rb_scratch)
     else
         nsyms = headerByte - 127
         nbytes = (nsyms + 1) >> 1
@@ -154,7 +155,8 @@ function _read_direct_weights!(weights::Vector{UInt8}, data::AbstractVector{UInt
 end
 
 # RFC 8878 §4.2.1.2
-function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_limit::Int)
+function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_limit::Int,
+                             rb_scratch::Union{Nothing, ReverseBitReader} = nothing)
     al, dist = read_fse_dist!(br, HUFTABLE_LOG_MAX)
     t = build_fse_table(dist, al)
 
@@ -163,7 +165,8 @@ function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_l
     n_remain > 0 ||
         throw(ArgumentError("zstd: no data for Huffman weight FSE stream"))
 
-    rb = ReverseBitReader(@view br.data[pos_after:pos_after + n_remain - 1])
+    view = @view br.data[pos_after:pos_after + n_remain - 1]
+    rb = rb_scratch !== nothing ? reinit!(rb_scratch, view) : ReverseBitReader(view)
 
     state1 = dist_table_init!(rb, t)
     state2 = dist_table_init!(rb, t)
