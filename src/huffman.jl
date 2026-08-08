@@ -46,14 +46,17 @@ function build_huffman_table!(weights::Vector{UInt8}, max_bits::Int; kwargs...)
     return build_huffman_table!(v, weights; kwargs...)
 end
 
-function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}, weights::Vector{UInt8}; scratch_buffers::Union{Nothing, NTuple{2, AbstractVector{Int}}} = nothing) where L
+function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}, weights::Vector{UInt8};
+                               scratch_buffers::Union{Nothing, Tuple{AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing) where L
     # Pass 1: Populate single-symbol entries for all symbols
-    if isa(scratch_buffers, NTuple{2, AbstractVector{Int}})
+    if isa(scratch_buffers, Tuple{AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}})
         rank_count = resize!(fill!(scratch_buffers[1], 0x00), L)
         next_rank_start = resize!(fill!(scratch_buffers[2], 0x00), L)
+        nbits_sym1s = resize!(scratch_buffers[3], length(decode_table))
     else
         rank_count = zeros(Int, L)
         next_rank_start = zeros(Int, L)
+        nbits_sym1s = Vector{UInt8}(undef, length(decode_table))
     end
     for w ∈ weights
         w > 0 || continue
@@ -80,7 +83,14 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
     end
 
     # Pass 2: Add second symbols where there is room in the entry (i.e., nbits1 + nbits2 ≤ max_bits)
-    nbits_sym1s = [decode_table[i].stream_nbits for i ∈ eachindex(decode_table)]
+    # nbits_sym1s snapshots each entry's pass-1 stream_nbits before this pass
+    # starts mutating decode_table -- some entries get looked up (as `j`) both
+    # before and after their own turn in this loop, so a live read from
+    # decode_table itself would sometimes see an already-mutated 2-symbol
+    # entry's combined nbits instead of its original single-symbol value.
+    for i in eachindex(decode_table)
+        nbits_sym1s[i] = decode_table[i].stream_nbits
+    end
     for (i, entry) ∈ enumerate(decode_table)
         code = i - 1
         nbits_remaining = L - entry.stream_nbits
@@ -102,7 +112,8 @@ end
 #   Reference: RFC 8878 §4.2.1
 # ============================================================
 
-function read_huffman_description(data::AbstractVector{UInt8}; scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}}} = nothing)
+function read_huffman_description(data::AbstractVector{UInt8};
+                                   scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing)
     length(data) ≥ 1 ||
         throw(ArgumentError("zstd: truncated Huffman table description"))
     headerByte = Int(data[1]) # RFC 8878 §4.2.1.1
@@ -122,7 +133,7 @@ function read_huffman_description(data::AbstractVector{UInt8}; scratch_buffers::
         weightdata = @view data[2:nbytes + 1]
         _, table_log = _read_direct_weights!(weights, weightdata, nsyms)
     end
-    scratch_buffers !== nothing && (scratch_buffers = scratch_buffers[2:3])
+    scratch_buffers !== nothing && (scratch_buffers = scratch_buffers[2:4])
     ht = build_huffman_table!(weights, table_log; scratch_buffers)
     return ht, nbytes + 1
 end
