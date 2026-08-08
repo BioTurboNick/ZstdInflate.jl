@@ -44,7 +44,7 @@ const LITERALS_LENGTH_DEFAULT_DIST = Int16[
      2,  2,  2,  2,  2,  2,  2,  2,  2,  3,  2,  1,  1,  1,  1,  1,
     -1, -1, -1, -1
 ]
-const DEFAULT_LITERALS_LENGTH_TABLE = build_fse_table(LITERALS_LENGTH_DEFAULT_DIST, LITERALS_LENGTH_ACCURACY_LOG)
+const DEFAULT_LITERALS_LENGTH_TABLE = build_fse_table(LITERALS_LENGTH_DEFAULT_DIST, LITERALS_LENGTH_ACCURACY_LOG, SeqLL())
 
 const MATCH_LENGTH_ACCURACY_LOG = 6
 const MATCH_LENGTH_DEFAULT_DIST = Int16[
@@ -53,14 +53,14 @@ const MATCH_LENGTH_DEFAULT_DIST = Int16[
      1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1, -1, -1,
     -1, -1, -1, -1, -1
 ]
-const DEFAULT_MATCH_LENGTH_TABLE = build_fse_table(MATCH_LENGTH_DEFAULT_DIST, MATCH_LENGTH_ACCURACY_LOG)
+const DEFAULT_MATCH_LENGTH_TABLE = build_fse_table(MATCH_LENGTH_DEFAULT_DIST, MATCH_LENGTH_ACCURACY_LOG, SeqML())
 
 const OFFSET_ACCURACY_LOG = 5
 const OFFSET_DEFAULT_DIST = Int16[
     1,  1,  1,  1,  1,  1,  2,  2,  2,  1,  1,  1,  1,  1,  1,  1,
     1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1
 ]
-const DEFAULT_OFFSET_TABLE = build_fse_table(OFFSET_DEFAULT_DIST, OFFSET_ACCURACY_LOG)
+const DEFAULT_OFFSET_TABLE = build_fse_table(OFFSET_DEFAULT_DIST, OFFSET_ACCURACY_LOG, SeqOF())
 
 
 # Initial repeat offsets (RFC 8878 §3.1.1.5)

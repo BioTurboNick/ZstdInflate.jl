@@ -59,17 +59,17 @@ function Base.parse(::Type{ZstdDict}, data::Vector{UInt8}; raw_content::Bool = f
     of_al, of_dist = read_fse_dist!(br, MAX_OFFSET_CODE)
     of_al ≤ 8 && length(of_dist) ≤ MAX_OFFSET_CODE + 1 ||
         throw(ArgumentError("zstd: invalid offset code table in dictionary"))
-    of_tab = build_fse_table(of_dist, of_al)
+    of_tab = build_fse_table(of_dist, of_al, SeqOF())
 
     ml_al, ml_dist = read_fse_dist!(br, MAX_MATCH_LENGTH)
     ml_al ≤ 9 && length(ml_dist) ≤ MAX_MATCH_LENGTH + 1 ||
         throw(ArgumentError("zstd: invalid match length table in dictionary"))
-    ml_tab = build_fse_table(ml_dist, ml_al)
+    ml_tab = build_fse_table(ml_dist, ml_al, SeqML())
 
     ll_al, ll_dist = read_fse_dist!(br, MAX_LITERALS_LENGTH)
     ll_al ≤ 9 && length(ll_dist) ≤ MAX_LITERALS_LENGTH + 1 ||
         throw(ArgumentError("zstd: invalid literals length table in dictionary"))
-    ll_tab = build_fse_table(ll_dist, ll_al)
+    ll_tab = build_fse_table(ll_dist, ll_al, SeqLL())
 
     pos = pos + byte_pos(br) - 1
     length(data) ≥ pos + 11 ||
