@@ -1,6 +1,10 @@
 # Finite State Entropy (FSE) decode table
 #   Reference: RFC 8878 §4.1
-struct FSEDistTable
+# Mutable so the hot path (build_fse_table!, decompress.jl) can update
+# `accuracy_log` on a persistent, slot-owned instance instead of allocating a
+# fresh wrapper every FSE_Compressed-mode block — the backing arrays
+# themselves were already reused via resize! below.
+mutable struct FSEDistTable
     accuracy_log::Int
     symbols  ::Vector{UInt8}
     nb_bits  ::Vector{UInt8}
@@ -12,12 +16,14 @@ struct RLEDistTable
     symbol::UInt8
 end
 
-# Build an FSE decode table from a normalized probability distribution.
-# norm[i+1] is the probability of symbol i; -1 means "probability 1/tableSize".
-# Hot-path: caller supplies pre-allocated backing arrays; they are resized and filled in-place.
-function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
-                          syms::Vector{UInt8}, nb::Vector{UInt8},
-                          base::Vector{UInt32}, occ::Vector{Int})
+# Fill pre-allocated backing arrays for an FSE decode table from a normalized
+# probability distribution. norm[i+1] is the probability of symbol i; -1
+# means "probability 1/tableSize". Shared by the raw-array hot path below and
+# the slot-owning `build_fse_table!` (decompress.jl, defined after
+# FSEDistTableSlot).
+function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
+                           syms::Vector{UInt8}, nb::Vector{UInt8},
+                           base::Vector{UInt32}, occ::Vector{Int})
     table_size = 1 << accuracy_log
     resize!(syms, table_size)
     resize!(nb, table_size)
@@ -58,7 +64,18 @@ function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
         nb[i] = UInt8(n)
         base[i] = UInt32((ci << n) - table_size)
     end
+    return nothing
+end
 
+# Hot-path: caller supplies pre-allocated backing arrays; they are resized
+# and filled in-place, but this still allocates a fresh `FSEDistTable`
+# wrapper each call. Kept for the cold path below; the truly hot call site
+# (decompress.jl's read_distribution_table!) uses `build_fse_table!` instead,
+# which reuses the wrapper too.
+function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
+                          syms::Vector{UInt8}, nb::Vector{UInt8},
+                          base::Vector{UInt32}, occ::Vector{Int})
+    _fill_fse_table!(norm, accuracy_log, syms, nb, base, occ)
     return FSEDistTable(accuracy_log, syms, nb, base)
 end
 
