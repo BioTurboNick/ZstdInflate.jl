@@ -303,6 +303,47 @@ end
 
     # Dictionary decompression through the incremental stream interface
     @test read(InflateZstdStream(IOBuffer(vcat(fa, fb)); dict=d)) == vcat(data, big_data)
+
+    # A ZstdDict is shared, read-only state as far as decoding is concerned.
+    # Streaming compaction used to drop an unreachable dictionary by emptying
+    # the very array the ZstdDict owns, which quietly emptied it for every
+    # other user of that dictionary. Forcing compaction needs a window small
+    # enough that output ages out of it, so compress with both a dictionary and
+    # an explicit windowLog.
+    function compress_with_dict_win(data::Vector{UInt8}, dict::Vector{UInt8};
+                                     level=3, windowlog=10)
+        cctx = LibZstd.ZSTD_createCCtx()
+        try
+            LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_compressionLevel, level)
+            LibZstd.ZSTD_CCtx_setParameter(cctx, LibZstd.ZSTD_c_windowLog, windowlog)
+            LibZstd.ZSTD_CCtx_loadDictionary(cctx, dict, length(dict))
+            out = Vector{UInt8}(undef, LibZstd.ZSTD_compressBound(length(data)))
+            csize = LibZstd.ZSTD_compress2(cctx, out, length(out), data, length(data))
+            LibZstd.ZSTD_isError(csize) == 0 || error("compression failed")
+            resize!(out, csize)
+            return out
+        finally
+            LibZstd.ZSTD_freeCCtx(cctx)
+        end
+    end
+
+    dict_len_before = length(d.content)
+    long_data = repeat(Vector{UInt8}("The quick brown fox. "), 40_000)
+    cw = compress_with_dict_win(long_data, dict_buf)
+    s = InflateZstdStream(IOBuffer(cw); dict=d)
+    acc = UInt8[]
+    chunk = Vector{UInt8}(undef, 8192)
+    while !eof(s)
+        n = readbytes!(s, chunk, 8192)
+        append!(acc, @view chunk[1:n])
+    end
+    @test acc == long_data
+    @test length(s.state.dict_content) == 0   # the stream did drop the dictionary
+    @test length(d.content) == dict_len_before # ...without touching the ZstdDict
+
+    # And the dictionary still works afterwards, for every entry point.
+    @test inflate_zstd(compress_with_dict(data, dict_buf); dict=d) == data
+    @test read(InflateZstdStream(IOBuffer(vcat(fa, fb)); dict=d)) == vcat(data, big_data)
 end
 
 # ------------------------------------------------------------------

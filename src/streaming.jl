@@ -258,10 +258,15 @@ function _compact!(s::InflateZstdStream)
     if s.frame_start < 0
         # In-frame history older than the window has been dropped; conformant
         # matches can no longer reach the frame start, so the dictionary is
-        # unreachable too. Clearing it makes the dict_pos ≥ 1 guard in
+        # unreachable too. Dropping it makes the dict_pos ≥ 1 guard in
         # _run_sequences! reject any (malformed) offset that tries.
+        #
+        # Rebind rather than `empty!`: the state points straight at the
+        # ZstdDict's own content array, which the caller may still be using for
+        # other streams. Truncating it in place would empty their dictionary
+        # too.
         s.frame_start = 0
-        empty!(s.state.dict_content)
+        s.state.dict_content = EMPTY_DICT_CONTENT
     end
     return
 end

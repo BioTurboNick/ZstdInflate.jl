@@ -50,8 +50,14 @@ function build_huffman_table!(decode_table::AbstractVector{HuffmanTableEntry{L}}
                                scratch_buffers::Union{Nothing, Tuple{AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing) where L
     # Pass 1: Populate single-symbol entries for all symbols
     if isa(scratch_buffers, Tuple{AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}})
-        rank_count = resize!(fill!(scratch_buffers[1], 0x00), L)
-        next_rank_start = resize!(fill!(scratch_buffers[2], 0x00), L)
+        # Resize before zeroing, not after: `fill!` only covers the length the
+        # buffer already has, so growing afterwards leaves the new tail
+        # uninitialised and `rank_count[w] += 1` accumulates onto garbage. That
+        # happens whenever a later table has a larger log than an earlier one
+        # through the same scratch, which reusing a DecompressState across
+        # frames and streams makes considerably more likely.
+        rank_count = fill!(resize!(scratch_buffers[1], L), 0)
+        next_rank_start = fill!(resize!(scratch_buffers[2], L), 0)
         nbits_sym1s = resize!(scratch_buffers[3], length(decode_table))
     else
         rank_count = zeros(Int, L)
