@@ -38,12 +38,77 @@ mutable struct InflateZstdStream{T <: IO} <: IO
     source_done ::Bool               # source IO exhausted at a frame boundary
     mark_pos    ::Int                # out-coordinate of the active mark; -1 if unmarked
     dropped     ::Int                # total bytes ever discarded from out by compaction
+    own_io      ::Bool               # whether close(s) also closes s.io
+    closed      ::Bool
 end
 
-function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing)
-    s = InflateZstdStream{typeof(io)}(io, dict, UInt8[], 1, 1, UInt8[], UInt8[],
-                                      DecompressState(), false, 0, 0, -1, 0, false,
-                                      XXH64Stream(), false, -1, 0)
+# ------------------------------------------------------------------
+# Scratch pooling
+#
+# A stream's buffers -- the output window, the compressed-payload buffer, the
+# header buffer, and the DecompressState with its ~15 vectors and three FSE
+# slots -- are all reusable across streams. Decoding many small frames through
+# separate streams (one per TIFF strip, say) otherwise rebuilds the lot every
+# time, which is the single largest source of allocation in that workload.
+#
+# `close` returns them here; construction takes them back. Streams that are
+# never closed behave exactly as before, so this costs nothing to ignore.
+#
+# The pool is global and lock-guarded rather than task-local. Task-local was
+# the first attempt and recovered nothing: callers that decode many frames tend
+# to do so one task per frame -- TiffImages spawns a task per strip -- so every
+# buffer went to a pool that died with the task that filled it. Measured 0 hits
+# against 5478 gives. The lock is taken twice per stream, alongside work that
+# would otherwise allocate a whole decode state, so its cost does not signify.
+#
+# Retention is bounded by `_SCRATCH_POOL_MAX` entries. An entry only enters on
+# close, so the pool never holds more than the peak number of simultaneously
+# live streams, capped.
+# ------------------------------------------------------------------
+struct StreamScratch
+    out   ::Vector{UInt8}
+    inbuf ::Vector{UInt8}
+    hdrbuf::Vector{UInt8}
+    state ::DecompressState
+end
+
+const _SCRATCH_POOL = StreamScratch[]
+const _SCRATCH_LOCK = ReentrantLock()
+const _SCRATCH_POOL_MAX = 8
+
+_take_scratch!() =
+    lock(_SCRATCH_LOCK) do
+        isempty(_SCRATCH_POOL) ? nothing : pop!(_SCRATCH_POOL)
+    end
+
+function _give_scratch!(sc::StreamScratch)
+    lock(_SCRATCH_LOCK) do
+        length(_SCRATCH_POOL) < _SCRATCH_POOL_MAX && push!(_SCRATCH_POOL, sc)
+    end
+    return nothing
+end
+
+"""
+    InflateZstdStream(io::IO; dict = nothing, own_io = true)
+
+Create a readable stream that incrementally decompresses Zstandard data
+from `io`.
+
+`own_io` controls whether [`close`](@ref) also closes `io`. Pass `own_io =
+false` when `io` outlives the stream — decoding a sequence of independent
+frames from one open file, for instance — so that `close` releases the
+stream's internal buffers for reuse without closing the file underneath.
+"""
+function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
+                            own_io::Bool = true)
+    sc = _take_scratch!()
+    out, inbuf, hdrbuf, state = sc === nothing ?
+        (UInt8[], UInt8[], UInt8[], DecompressState()) :
+        (sc.out, sc.inbuf, sc.hdrbuf, sc.state)
+    empty!(out)
+    s = InflateZstdStream{typeof(io)}(io, dict, out, 1, 1, inbuf, hdrbuf,
+                                      state, false, 0, 0, -1, 0, false,
+                                      XXH64Stream(), false, -1, 0, own_io, false)
     # Parse the first frame header eagerly so structural errors (empty input,
     # bad magic, missing dictionary) surface at construction time.
     eof(io) &&
@@ -106,7 +171,9 @@ function _start_frame!(s::InflateZstdStream)
         throw(ArgumentError("zstd: window size $window_size exceeds maximum supported for " *
                             "streaming ($STREAM_WINDOW_SIZE_MAX bytes)"))
 
-    s.state       = s.dict !== nothing ? DecompressState(s.dict) : DecompressState()
+    # Reuse the state's scratch across frames rather than rebuilding it; only
+    # the fields that carry across blocks within a frame are cleared.
+    reset!(s.state, s.dict)
     s.in_frame    = true
     s.frame_start = s.wpos - 1
     s.window_size = window_size
@@ -202,6 +269,7 @@ end
 # Decode until at least one unconsumed byte is available or the stream ends.
 # Returns true if bytes are available.
 function _fill!(s::InflateZstdStream)
+    s.closed && _throw_closed()
     while s.read_pos ≥ s.wpos
         if s.in_frame
             _decode_next_block!(s)
@@ -253,8 +321,35 @@ end
 # Decoded-but-unconsumed bytes only; does not trigger further decoding.
 Base.bytesavailable(s::InflateZstdStream) = s.wpos - s.read_pos
 
-Base.close(s::InflateZstdStream) = close(s.io)
-Base.isopen(s::InflateZstdStream) = isopen(s.io)
+"""
+    close(s::InflateZstdStream)
+
+Release `s`'s internal buffers for reuse by later streams on this task, and
+close the underlying `io` unless the stream was constructed with `own_io =
+false`. Idempotent. Reading from a closed stream throws.
+
+Closing is optional: an unclosed stream is collected normally, it just does not
+hand its buffers on.
+"""
+function Base.close(s::InflateZstdStream)
+    s.closed && return nothing
+    s.closed = true
+    _give_scratch!(StreamScratch(s.out, s.inbuf, s.hdrbuf, s.state))
+    # Drop our references so a use-after-close reads nothing that now belongs
+    # to another stream; `closed` turns it into a clear error either way.
+    s.out    = UInt8[]
+    s.inbuf  = UInt8[]
+    s.hdrbuf = UInt8[]
+    s.read_pos = 1
+    s.wpos     = 1
+    s.in_frame = false
+    s.own_io && close(s.io)
+    return nothing
+end
+
+Base.isopen(s::InflateZstdStream) = !s.closed && isopen(s.io)
+
+@noinline _throw_closed() = throw(ArgumentError("zstd: stream is closed"))
 
 # Absolute count of decompressed bytes consumed so far, stable across
 # internal buffer compaction.

@@ -638,6 +638,61 @@ end
 end
 
 # ------------------------------------------------------------------
+# close / scratch pooling
+# ------------------------------------------------------------------
+@testset "Stream close and buffer reuse" begin
+    Random.seed!(15)
+    payloads = [rand(UInt8, 30_000), rand(UInt8, 5_000) .& 0x0f,
+                Vector{UInt8}(long_string), rand(UInt8, 120_000) .& 0x3f]
+
+    # Buffers recycled through the pool must not leak state between streams:
+    # decode the same set repeatedly, always closing, and compare every result.
+    for _ in 1:6, data in payloads
+        s = InflateZstdStream(IOBuffer(compress(data)))
+        try
+            @test read(s) == data
+        finally
+            close(s)
+        end
+    end
+
+    # Interleaved lifetimes: an inner stream borrows and returns a buffer while
+    # an outer one is still live, so a shared buffer would corrupt the outer.
+    a = InflateZstdStream(IOBuffer(compress(payloads[1])))
+    head = read(a, 1000)
+    b = InflateZstdStream(IOBuffer(compress(payloads[4])))
+    @test read(b) == payloads[4]
+    close(b)
+    @test vcat(head, read(a)) == payloads[1]
+    close(a)
+
+    # close is idempotent, and reading afterwards is a clean error rather than
+    # a read of memory now owned by somebody else.
+    s = InflateZstdStream(IOBuffer(compress(payloads[2])))
+    close(s)
+    close(s)
+    @test !isopen(s)
+    @test_throws ArgumentError read(s)
+
+    # own_io governs whether the underlying IO is closed too.
+    io = IOBuffer(compress(payloads[2]))
+    s = InflateZstdStream(io)
+    close(s)
+    @test !isopen(io)
+
+    io = IOBuffer(compress(payloads[2]))
+    s = InflateZstdStream(io; own_io = false)
+    close(s)
+    @test isopen(io)
+
+    # A frame decoded through a recycled DecompressState must not inherit the
+    # previous frame's repeat offsets or entropy tables. Concatenated frames
+    # exercise the same reset path within one stream.
+    multi = vcat((compress(p) for p in payloads)...)
+    @test read(InflateZstdStream(IOBuffer(multi))) == vcat(payloads...)
+end
+
+# ------------------------------------------------------------------
 # mark/reset/unmark/position/seekstart (TranscodingStreams parity)
 # ------------------------------------------------------------------
 @testset "Stream mark/reset/seekstart" begin

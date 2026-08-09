@@ -82,6 +82,12 @@ const _GROWTH_RATIO_CLAMP = 8
 # use. Must be a valid (non-empty, sentinel-terminated) reverse bitstream.
 _dummy_rbr_view() = @view UInt8[0x01][1:1]
 
+# Stand-in for "no dictionary content". Shared because it stays empty: nothing
+# ever writes into a dictless state's dict_content, and `reset!` must not reach
+# for `empty!` there -- the state it is clearing may still be pointing at a
+# ZstdDict's own array, which is not ours to truncate.
+const EMPTY_DICT_CONTENT = UInt8[]
+
 # fse_occ/fse_norm are shared scratch for read_distribution_table! (LL/OF/ML,
 # built sequentially, see DecompressState's field comment). For any input
 # that doesn't get rejected by read_distribution_table!'s own
@@ -127,6 +133,33 @@ DecompressState(dict::ZstdDict) =
         Huffman4StreamScratch(_dummy_rbr_view()),
         ForwardBitReader(_dummy_rbr_view()))
 
+
+# Return a DecompressState to its start-of-frame condition without rebuilding
+# it. Only the fields that carry meaning from one block to the next within a
+# frame need clearing; everything else is scratch whose user reinitialises it
+# before reading, and that scratch is the bulk of the object -- roughly fifteen
+# vectors plus three FSE slots. Streaming decode of many small frames used to
+# allocate all of it per frame.
+function reset!(state::DecompressState, dict::Union{ZstdDict, Nothing})
+    if dict === nothing
+        state.rep          = INIT_REPEAT_OFFSETS
+        state.huffman      = nothing
+        state.ll_tab       = nothing
+        state.ml_tab       = nothing
+        state.of_tab       = nothing
+        state.dict_content = EMPTY_DICT_CONTENT
+    else
+        # Matches DecompressState(dict): the dictionary's own arrays are
+        # referenced, not copied.
+        state.rep          = dict.rep
+        state.huffman      = dict.huffman
+        state.ll_tab       = dict.ll_tab
+        state.ml_tab       = dict.ml_tab
+        state.of_tab       = dict.of_tab
+        state.dict_content = dict.content
+    end
+    return state
+end
 
 """
     inflate_zstd(data::Vector{UInt8}; dict = nothing, nthreads = Threads.nthreads()) -> Vector{UInt8}
