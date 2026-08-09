@@ -95,9 +95,13 @@ const EMPTY_DICT_CONTENT = UInt8[]
 # (53) entries -- the largest of the three real max_sym+1 values (LL: 36,
 # OF: 32, ML: 53). Pre-sizing to that bound means the push! loop in
 # read_fse_dist! never has to grow the buffer for any input that will
-# actually succeed; a fresh DecompressState is constructed per frame, so
-# without this every LL/OF/ML call on every frame would otherwise re-grow
-# from empty via several reallocations to reach the same ~53 elements.
+# actually succeed.
+#
+# This mattered more when a DecompressState was built per frame. Both the
+# streaming decoder and the serial bulk loop now reuse one across frames via
+# `reset!`, so the buffers reach their size once and stay there and the hint
+# only saves the first frame of a state's life. It still earns its keep on the
+# parallel bulk path, which does construct a state per frame.
 _new_fse_scratch() = (sizehint!(Int[], MAX_MATCH_LENGTH + 1), sizehint!(Int16[], MAX_MATCH_LENGTH + 1))
 
 DecompressState() = DecompressState(
@@ -216,12 +220,15 @@ function inflate_zstd(data::Vector{UInt8}; dict::Union{ZstdDict,Nothing} = nothi
     pos = 1
     out = UInt8[]
     sizehint!(out, length(data))
+    # One state for every frame in the input. `reset!` inside _decompress_frame!
+    # applies the dictionary, so this does not need the dictionary constructor.
+    frame_state = DecompressState()
     while pos ≤ length(data)
         magic = _read_magic(data, pos)
         if _is_skippable(magic)
             pos = _skip_frame(data, pos)
         elseif magic == ZSTD_MAGIC
-            pos = _decompress_frame!(data, pos, out, d)
+            pos = _decompress_frame!(data, pos, out, d, frame_state)
         else
             throw(ArgumentError("zstd: invalid magic number 0x$(string(magic, base=16))"))
         end
@@ -450,7 +457,8 @@ end
 
 # RFC 8878 §3.1.1
 function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
-                            dict::Union{ZstdDict, Nothing} = nothing)
+                            dict::Union{ZstdDict, Nothing} = nothing,
+                            scratch::Union{DecompressState, Nothing} = nothing)
     # Magic number (4 bytes, little-endian)
     magic = _read_magic(data, pos)
     magic == ZSTD_MAGIC ||
@@ -460,7 +468,13 @@ function _decompress_frame!(data::Vector{UInt8}, pos::Int, out::Vector{UInt8},
     # Frame Header Descriptor (FHD)
     window_size, frame_content_size, content_checksum_flag, pos = _read_frame_header(data, pos, dict)
 
-    state = dict !== nothing ? DecompressState(dict) : DecompressState()
+    # A caller decoding several frames in sequence hands the same state back
+    # each time; `reset!` clears the per-frame fields and keeps the scratch.
+    # Building one per frame put two thirds of this path's allocation events
+    # into state construction on a 100-frame input.
+    state = scratch === nothing ?
+        (dict !== nothing ? DecompressState(dict) : DecompressState()) :
+        reset!(scratch, dict)
     frame_start = length(out)
     # When FCS is known, resize to the exact frame size upfront so that all
     # per-block writes go directly into pre-allocated space — no per-block
