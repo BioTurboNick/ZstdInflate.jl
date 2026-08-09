@@ -120,8 +120,8 @@ DecompressState(dict::ZstdDict) =
     DecompressState(
         dict.rep, dict.huffman, dict.ll_tab, dict.ml_tab, dict.of_tab, dict.content,
         UInt8[],
-        zeros(Int, HUFTABLE_LOG_MAX),
-        zeros(Int, HUFTABLE_LOG_MAX),
+        zeros(Int, HUFTABLE_LOG_MAX + 1),
+        zeros(Int, HUFTABLE_LOG_MAX + 1),
         sizehint!(UInt8[], _HUF_MAX_SYMBOLS),
         Vector{UInt8}(undef, _HUF_MAX_TABLE),
         FSEDistTableSlot(_FSE_MAX_TABLE),
