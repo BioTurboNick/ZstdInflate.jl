@@ -277,6 +277,74 @@ end
                                Vec{2, Int64}, Vec{2, UInt64}}) =
     ~((UInt64(1) << ((8 - nread) * 8)) - UInt64(1))
 
+# ============================================================
+# Sentinel-bit bit-position encoding
+#
+# Borrowed from libzstd, which uses it in both huf_decompress_amd64.S and the
+# plain-C fast loop it falls back to. Its own description:
+#
+#   "bits[] is the bit container. It is read from the MSB down to the LSB. It
+#    is shifted left as it is read, and zeros are shifted in. After the lowest
+#    valid bit a 1 is set, so that CountTrailingZeros(bits[]) can be used to
+#    count how many bits we've consumed."
+#
+# The point is register pressure. Tracking a separate `nbits` per stream costs
+# one live register per stream and one `sub` per symbol; encoding the same
+# information as the position of a sentinel bit *inside* the container costs
+# neither, and is recovered with a single `tzcnt` once per refill rather than
+# once per symbol.
+#
+# It also makes the per-symbol shift count free of masking: with `nbits` gone,
+# the consumed-bit count is only ever fed to `_shl`, which masks to 6 bits, so
+# adjacent packed fields in the table entry can be left in the high bits
+# instead of being masked off.
+#
+# Invariants, with `s = trailing_zeros(bits)`:
+#   * valid bits remaining = 63 - s   (bit 63 is the next bit to deliver)
+#   * consuming n bits is `bits <<= n`, which moves the sentinel up by n
+#   * at most 56 bits may be consumed between refills, so the sentinel can
+#     never be shifted out of the container
+
+# Sentinel form tracks a different byte cursor from the conventional readers.
+# `pos` there is the highest byte *not yet loaded*; `P` here is the byte
+# *containing the next bit to deliver*, which is what the refill steps back
+# from. `_sent_byte_pos` converts one to the other: the lowest buffered bit is
+# the LSB of byte pos+1, so the next bit to deliver sits (nbits - 1) bits above
+# it.
+@inline _sent_byte_pos(nbits::Int, pos::Int) = pos + 1 + ((nbits - 1) >> 3)
+
+# Enter sentinel form. Requires nbits ≥ 1 and `_sent_byte_pos(nbits, pos) ≥ 8`;
+# callers check both. The container is re-read from memory rather than derived
+# from the conventional one, which keeps the bit accounting in one place.
+@inline function _sent_enter(data::AbstractVector{UInt8}, nbits::Int, pos::Int)
+    P = _sent_byte_pos(nbits, pos)
+    return (_le64(data, P - 7) | UInt64(1)) << (7 - ((nbits - 1) & 7)), P
+end
+
+# Leave sentinel form, returning a conventional (bits, nbits, pos) triple that
+# buffers only what is left of the byte holding the next bit. The caller's own
+# refill tops it back up. Re-deriving from memory like this sidesteps the fact
+# that a sentinel container's valid region generally does not end on a byte
+# boundary, which the conventional encoding cannot represent.
+@inline function _sent_leave(data::AbstractVector{UInt8}, bits::UInt64, P::Int)
+    consumed = trailing_zeros(bits)
+    Pc = P - (consumed >> 3)
+    r  = consumed & 7
+    v  = UInt64(@inbounds(data[Pc]) & (0xff >> r))
+    return v << (56 + r), 8 - r, Pc - 1
+end
+
+# Refill in sentinel form: the sentinel's position gives both how many whole
+# bytes to step back and how many leftover bits of the boundary byte to
+# discard, so the container is replaced outright rather than merged into.
+# Requires `P ≥ 15`: the step back is at most 7 bytes and the load then needs 8
+# bytes at or below the new position.
+@inline function _sent_refill(data::AbstractVector{UInt8}, bits::UInt64, P::Int)
+    consumed = trailing_zeros(bits)
+    P -= consumed >> 3
+    return (_le64(data, P - 7) | UInt64(1)) << (consumed & 7), P
+end
+
 function refill_unchecked!(rb::ReverseBitReaderX{X}) where X
     # Any stream within 8 bytes of its start must take the scalar path
     if any(Tuple(rb.pos) .< 8)

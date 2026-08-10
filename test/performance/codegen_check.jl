@@ -23,14 +23,21 @@ using InteractiveUtils
 # compare against the baseline noted below (re-measure and update the
 # baseline after an intentional change).
 #
-# Baseline (measured 2026-04-14, see git history for the machine/Julia
-# version): instrs=1986, calls=108, spills=102.
+# Baseline (measured 2026-08-08, sentinel bit-position encoding; see git
+# history for the machine/Julia
+# version): instrs=1926, calls=30, spills=88.
+#
+# The signature below must be fully concrete. An abstract `HuffmanTable{11}`
+# (or a missing scratch argument) matches no specialisation, `code_native`
+# emits nothing, and the check silently degrades to the error below.
 # ----------------------------------------------------------------
 
-DataView = typeof(@view(UInt8[1][1:1]))
+DataView = ZstdInflate.RBRView
+HufTable = ZstdInflate.HuffmanTable{11, Vector{ZstdInflate.HuffmanTableEntry{11}}}
+Scratch  = ZstdInflate.Huffman4StreamScratch{DataView}
 buf = IOBuffer()
 code_native(buf, ZstdInflate._decode_4streams!,
-    (DataView, ZstdInflate.HuffmanTable{11}, Vector{UInt8}, Int),
+    (DataView, HufTable, Vector{UInt8}, Int, Scratch),
     syntax=:intel, debuginfo=:none)
 asm = String(take!(buf))
 
@@ -46,6 +53,6 @@ n_calls  = count(l -> occursin(r"\bcall\b", l), instr_lines)
 n_spills = count(l -> occursin("-byte Spill", l), instr_lines)
 
 println("_decode_4streams! codegen on this machine:")
-println("  instructions: $n_instrs  (baseline 1986)")
-println("  calls:        $n_calls  (baseline 108)")
-println("  spills:       $n_spills  (baseline 102)")
+println("  instructions: $n_instrs  (baseline 1926)")
+println("  calls:        $n_calls  (baseline 30)")
+println("  spills:       $n_spills  (baseline 88)")

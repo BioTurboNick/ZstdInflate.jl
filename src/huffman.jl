@@ -245,6 +245,118 @@ end
     return (i1, i2, i3, i4)
 end
 
+# Decode four Huffman streams in lockstep until one of them reaches its safe end.
+#
+# All reader state is copied into local scalars for the duration of the loop and
+# written back to `rb` once, on exit. That is the whole point of this function:
+# `rb` is a field of the long-lived scratch pool, so while `bits`/`nbits`/`pos`
+# live in that heap object LLVM must assume every `unsafe_store!` into `out` may
+# alias them, and it reloads all twelve fields -- plus `out`'s data pointer, once
+# per store -- on every symbol. Locals are provably distinct from `out`, so the
+# state stays in registers and the loop drops to its real work.
+#
+# Scalar here is not a lost vectorisation. The four streams are independent, but
+# the table lookup is a gather that has to land in GPRs regardless, so holding
+# the output offsets in a `Vec{4,Int}` bought one `vpaddq` in exchange for
+# extracting and reinserting all four lanes every iteration.
+@inline function _decode_phase1!(rb::ReverseBitReaderX{4, T}, ht::HuffmanTable{L},
+                                  out::Vector{UInt8}, oi::NTuple{4, Int},
+                                  safeends::NTuple{4, Int}) where {L, T}
+    # 56 rather than 57: the sentinel encoding leaves 63 - (consumed & 7) valid
+    # bits after a refill, i.e. at least 56, and consuming more than that would
+    # shift the sentinel out of the container. Only L = 1 and L = 3 lose an
+    # iteration; every other table log divides the same either way.
+    safe_n = 56 ÷ L
+    d1, d2, d3, d4 = rb.data
+    n1, n2, n3, n4 = Int(rb.nbits[1]), Int(rb.nbits[2]), Int(rb.nbits[3]), Int(rb.nbits[4])
+    p1, p2, p3, p4 = Int(rb.pos[1]), Int(rb.pos[2]), Int(rb.pos[3]), Int(rb.pos[4])
+    o1, o2, o3, o4 = oi
+    e1, e2, e3, e4 = safeends
+
+    # Sentinel form loads a whole 8-byte window below the byte holding the next
+    # bit, and the refill steps back up to 7 further bytes first, so a stream
+    # needs 15 bytes in hand. Anything shorter -- or already near its front --
+    # skips phase 1 outright and is finished by the tail phases, which use the
+    # conventional readers. `rb` is untouched on that path.
+    P1 = _sent_byte_pos(n1, p1); P2 = _sent_byte_pos(n2, p2)
+    P3 = _sent_byte_pos(n3, p3); P4 = _sent_byte_pos(n4, p4)
+    (n1 ≥ 1 && n2 ≥ 1 && n3 ≥ 1 && n4 ≥ 1 &&
+     P1 ≥ 15 && P2 ≥ 15 && P3 ≥ 15 && P4 ≥ 15) || return oi
+
+    b1, P1 = _sent_enter(d1, n1, p1); b2, P2 = _sent_enter(d2, n2, p2)
+    b3, P3 = _sent_enter(d3, n3, p3); b4, P4 = _sent_enter(d4, n4, p4)
+    tbl = ht.decode_table
+    GC.@preserve out tbl begin
+        outp = pointer(out)
+        # Walk `out` with one raw pointer per stream rather than an index per
+        # stream plus a shared base. Same information, one fewer live value, and
+        # the store becomes a bare `[q]` instead of `[base + idx - 1]` -- which
+        # matters because at four indices the base spilled and was reloaded once
+        # per store.
+        q1 = outp + (o1 - 1); q2 = outp + (o2 - 1)
+        q3 = outp + (o3 - 1); q4 = outp + (o4 - 1)
+        qe1 = outp + (e1 - 1); qe2 = outp + (e2 - 1)
+        qe3 = outp + (e3 - 1); qe4 = outp + (e4 - 1)
+        # A `HuffmanTableEntry` is exactly four bytes -- (sym1, sym2), stream_nbits,
+        # nsymbols -- but read as fields LLVM emits three separate loads per entry
+        # (a word and two bytes), twelve per iteration across the four streams,
+        # which saturates the load ports. Fetching each entry as one little-endian
+        # `UInt32` and splitting it with shifts trades two loads for two ALU ops.
+        tblp = Ptr{UInt32}(pointer(tbl))
+        # libzstd's `olimit` trick (huf_decompress_amd64.S): instead of testing
+        # eight conditions before every refill, work out how many whole rounds
+        # are safe for all four streams and then run that many unchecked. Per
+        # round a stream advances its output by at most 2*safe_n bytes (safe_n
+        # lookups, at most two symbols each) and steps its input position back by
+        # at most 7 (the refill consumes at most safe_n*L + 7 bits, and 63 >> 3
+        # is 7). Both divisors are compile-time constants, so these are
+        # reciprocal multiplies, and the round loop itself carries no branch.
+        #
+        # Rounding down can stop up to one round earlier than the per-iteration
+        # test would have; the tail phases pick up the difference.
+        step_out = 2 * safe_n
+        while true
+            nrounds = min((qe1 - q1) ÷ step_out, (qe2 - q2) ÷ step_out,
+                          (qe3 - q3) ÷ step_out, (qe4 - q4) ÷ step_out,
+                          (P1 - 15) ÷ 7, (P2 - 15) ÷ 7,
+                          (P3 - 15) ÷ 7, (P4 - 15) ÷ 7)
+            nrounds ≤ 0 && break
+            for _ in 1:nrounds
+                b1, P1 = _sent_refill(d1, b1, P1)
+                b2, P2 = _sent_refill(d2, b2, P2)
+                b3, P3 = _sent_refill(d3, b3, P3)
+                b4, P4 = _sent_refill(d4, b4, P4)
+                for _ in 1:safe_n
+                    t1 = ltoh(unsafe_load(tblp, _shr(b1, 64 - L) % Int + 1))
+                    t2 = ltoh(unsafe_load(tblp, _shr(b2, 64 - L) % Int + 1))
+                    t3 = ltoh(unsafe_load(tblp, _shr(b3, 64 - L) % Int + 1))
+                    t4 = ltoh(unsafe_load(tblp, _shr(b4, 64 - L) % Int + 1))
+                    unsafe_store!(Ptr{UInt16}(q1), htol(t1 % UInt16))
+                    unsafe_store!(Ptr{UInt16}(q2), htol(t2 % UInt16))
+                    unsafe_store!(Ptr{UInt16}(q3), htol(t3 % UInt16))
+                    unsafe_store!(Ptr{UInt16}(q4), htol(t4 % UInt16))
+                    # The shift count is only ever consumed by `_shl`, which masks
+                    # to 6 bits, so the nsymbols byte riding along above
+                    # stream_nbits is harmless and needs no masking off.
+                    b1 = _shl(b1, Int(t1 >> 16)); q1 += Int(t1 >> 24)
+                    b2 = _shl(b2, Int(t2 >> 16)); q2 += Int(t2 >> 24)
+                    b3 = _shl(b3, Int(t3 >> 16)); q3 += Int(t3 >> 24)
+                    b4 = _shl(b4, Int(t4 >> 16)); q4 += Int(t4 >> 24)
+                end
+            end
+        end
+        o1 = Int(q1 - outp) + 1; o2 = Int(q2 - outp) + 1
+        o3 = Int(q3 - outp) + 1; o4 = Int(q4 - outp) + 1
+        # Hand back conventional state for the tail phases.
+        b1, n1, p1 = _sent_leave(d1, b1, P1); b2, n2, p2 = _sent_leave(d2, b2, P2)
+        b3, n3, p3 = _sent_leave(d3, b3, P3); b4, n4, p4 = _sent_leave(d4, b4, P4)
+    end
+    rb.bits  = (b1, b2, b3, b4)
+    rb.nbits = (Int64(n1), Int64(n2), Int64(n3), Int64(n4))
+    rb.pos   = (Int64(p1), Int64(p2), Int64(p3), Int64(p4))
+    return (o1, o2, o3, o4)
+end
+
 # Decode the four Huffman streams stored in `data` using the lookup table `ht` and store
 # the result in `literals`. This code is tuned to promote LLVM SIMD instructions; changes
 # in it or the functions it calls could break this. Use caution.
@@ -276,16 +388,7 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
         @view(data[s3_start:s4_start-1]),
         @view(data[s4_start:s4_end]),
     )
-    oi_vec = Vec{4, Int}(oi)
-    safeends_vec = Vec{4, Int}(safeends)
-    while all(oi_vec ≤ safeends_vec)
-        refill_unchecked!(rb4x)
-        for _ in 1:safe_n
-            nread = decode4x2!(rb4x, ht, literals, oi_vec)
-            oi_vec += nread
-        end
-    end
-    oi = Tuple(oi_vec)  # spill Vec back to scalar for remaining phases
+    oi = _decode_phase1!(rb4x, ht, literals, oi, safeends)
 
     # Phase 2A: SIMD parallel processing of the top pair of streams with the most work remaining
     r = (safeends[1] - oi[1], safeends[2] - oi[2],
@@ -359,26 +462,6 @@ function _decode_4streams!(data::AbstractVector{UInt8}, ht::HuffmanTable{L},
     let p = oi[4]; while p ≤ ends[perm[4]]; p += decode1x2_tail!(rbs[4], ht, literals, p); end; end
 
     return
-end
-
-# Read 1-2 symbols from 4 streams and return the number of symbols read
-# Always writes 2 symbols even if only the first is valid; up to the caller to provide room
-@inline function decode4x2!(rb::ReverseBitReaderX{4}, ht::HuffmanTable{L}, out::Vector{UInt8}, oi::Vec{4, Int}) where L
-    i = peek(rb, Val(L))
-    @inbounds entry = (
-        ht[i[1] % Int + 1],
-        ht[i[2] % Int + 1],
-        ht[i[3] % Int + 1],
-        ht[i[4] % Int + 1]
-    )
-    GC.@preserve out begin
-        unsafe_store!.(Ptr{NTuple{2, UInt8}}.(pointer.(Ref(out), Tuple(oi))), htol.(getfield.(entry, :symbols)))
-    end
-    nbits_consumed = (Int(entry[1].stream_nbits), Int(entry[2].stream_nbits),
-                      Int(entry[3].stream_nbits), Int(entry[4].stream_nbits))
-    skip(rb, nbits_consumed)
-    return Vec{4, Int64}((Int64(entry[1].nsymbols), Int64(entry[2].nsymbols),
-                          Int64(entry[3].nsymbols), Int64(entry[4].nsymbols)))
 end
 
 # Read 1-2 symbols from 2 streams and return the number of symbols read
