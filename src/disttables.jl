@@ -1,19 +1,10 @@
 # Finite State Entropy (FSE) decode table
 #   Reference: RFC 8878 §4.1
-# `mutable` here is for reference semantics, not mutation — hence the `const`
-# field. DecompressState holds the live table in a
-# Union{FSEDistTable,RLEDistTable,Nothing}; a table containing a Vector is not
-# isbits, so as an immutable struct every assignment into that field would box
-# it (measured: +453 allocations on a 10 MB repetitive decode). As a mutable
-# struct it is already a reference, so the assignment is a pointer store.
-#
-# Nothing needs mutating: `_fill_fse_table!` resizes and refills `entries` in
-# place, which never changes the vector's identity, so one instance serves every
-# block of a frame.
-#
-# The accuracy log is not stored. `_fill_fse_table!` always sizes `entries` to
-# exactly 1 << accuracy_log, so the log is recoverable as the size's trailing
-# zero count — see `dist_table_init!`, its only reader.
+
+# `mutable` here is for reference semantics, not mutation.
+# DecompressState holds the live table in a Union{FSEDistTable,RLEDistTable,Nothing};
+# a table containing a Vector is not isbits, so as an immutable struct every assignment
+# into that field would box it.
 #
 # One packed 8-byte entry per state, the same layout as libzstd's
 # ZSTD_seqSymbol:
@@ -23,16 +14,9 @@
 #   bits 24..31  nb_add      — extra value bits to read for this symbol
 #   bits 32..63  base_value  — value baseline for this symbol
 #
-# The last two are the point. Decoding a sequence needs a symbol's baseline and
-# extra-bit count, and those used to be a second lookup indexed by the symbol
-# the FSE table had just produced -- a dependent
-# entry -> code -> LITERALS_LENGTH_BASELINE[code] hop, two load latencies deep,
-# feeding `total_n` which gates everything else in the sequence. Baking them in
-# at table-build time makes a state lookup a single load.
-#
-# Consequently the symbol itself is no longer stored: for sequence tables it
-# was only ever a stepping stone to those two values, and for the Huffman
-# weight table (which has no baselines) it is stored in `base_value`.
+# This design forces a single load in the hot path where registers are strained
+# regardless of which portions of the entry are needed, and avoids the need for
+# a symbol-dependent second load.
 mutable struct FSEDistTable
     const entries::Vector{UInt64}
 end
@@ -46,8 +30,9 @@ end
 @inline _fse_add(e::UInt64)  = Int((e >> 24) & 0xff)
 @inline _fse_base(e::UInt64) = Int(e >> 32)
 
-# Run-length encoding table: a single implicit state, so it just carries the
-# one packed entry (next_state and nb_bits zero, since it never transitions).
+# Run-length encoding table: a single implicit state, so the table is just one entry.
+# The entry is packed the same way as an FSE table's entry, but the next_state and nb_bits
+# fields are unused (always 0).
 struct RLEDistTable
     entry::UInt64
 end
@@ -77,6 +62,8 @@ struct RawSym end   # Huffman weights: the "value" is the symbol itself
 @noinline _throw_fse_symbol(s, m) =
     throw(ArgumentError("zstd: FSE symbol $s exceeds maximum $m for this table"))
 
+# range-checks the symbol against the kind before baking its baseline and extra-bit
+# count into the entry.
 @inline _rle_table(kind, sym::Int) =
     (sym ≤ _sym_max(kind) || _throw_fse_symbol(sym, _sym_max(kind));
      RLEDistTable(_fse_pack(UInt16(0), UInt8(0), _sym_value(kind, sym)[2],
@@ -258,7 +245,7 @@ end
 
 # Update without checking for underflow (allows overflow detection after).
 @inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSEDistTable, state::Int)
-    e    = dist_table_entry(t, state)
+    e = dist_table_entry(t, state)
     bits = Int(_read_bits_unchecked!(rb, _fse_nb(e)))
     return _fse_next(e) + bits
 end
