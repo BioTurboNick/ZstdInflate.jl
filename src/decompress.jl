@@ -1,29 +1,17 @@
-# Owns the backing entry array for one FSE decode table (LL, OF, or ML), plus a
-# persistent `FSEDistTable` wrapper aliasing that same array. `table`'s array
-# field never changes identity after construction (resize! in
-# `_fill_fse_table!` mutates the vector in place); only its `accuracy_log`
-# needs updating per call, in `build_fse_table!` below — so reusing `table`
-# across blocks needs no resynchronization beyond that.
-struct FSEDistTableSlot
-    entries::Vector{UInt64}
-    table  ::FSEDistTable
-end
-
-function FSEDistTableSlot(n::Int)
-    entries = Vector{UInt64}(undef, n)
-    FSEDistTableSlot(entries, FSEDistTable(0, entries))
-end
-
-# Hot path: mutate the slot's persistent FSEDistTable in place instead of
-# allocating a fresh wrapper every FSE_Compressed-mode block. The backing
-# array is already reused (resize! in `_fill_fse_table!`); this reuses the
-# small wrapper object too.
+# Hot path: refill a persistent FSEDistTable's array in place rather than
+# allocating a table per FSE_Compressed-mode block. Nothing about the table
+# object itself changes — `resize!` inside `_fill_fse_table!` keeps the vector's
+# identity and the accuracy log is read back from its size — so one instance
+# serves every block, and it needs no owning wrapper type of its own.
 function build_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
-                           slot::FSEDistTableSlot, occ::Vector{Int}, kind)
-    _fill_fse_table!(norm, accuracy_log, slot.entries, occ, kind)
-    slot.table.accuracy_log = accuracy_log
-    return slot.table
+                           table::FSEDistTable, occ::Vector{Int}, kind)
+    _fill_fse_table!(norm, accuracy_log, table.entries, occ, kind)
+    return table
 end
+
+# Storage for one reusable table, pre-sized to the largest accuracy log the
+# format allows so a block's build never has to grow it.
+_new_fse_table(n::Int) = FSEDistTable(Vector{UInt64}(undef, n))
 
 mutable struct DecompressState
     rep         ::NTuple{3,Int}
@@ -39,12 +27,15 @@ mutable struct DecompressState
     huf_rank_start ::Vector{Int}
     huf_weights    ::Vector{UInt8}
     huf_nbits_sym1 ::Vector{UInt8}   # build_huffman_table!'s pass-1 stream_nbits snapshot
-    # Reusable FSE table backing arrays — one slot per table (LL, ML, OF).
-    # Slots cannot be shared because all three tables are live simultaneously
-    # during sequence decoding.
-    ll_slot ::FSEDistTableSlot
-    ml_slot ::FSEDistTableSlot
-    of_slot ::FSEDistTableSlot
+    # Reusable FSE decode tables, one per sequence field. They cannot be shared
+    # because all three are live simultaneously during sequence decoding. These
+    # are the storage that FSE_Compressed-mode blocks are built into; the
+    # ll_tab/ml_tab/of_tab fields above say which table is actually in use for
+    # the current block, which may instead be a predefined one, an RLE table, or
+    # the previous block's.
+    ll_slot ::FSEDistTable
+    ml_slot ::FSEDistTable
+    of_slot ::FSEDistTable
     # Shared FSE build scratch — safe to share because LL/ML/OF are built sequentially
     fse_occ  ::Vector{Int}
     fse_norm ::Vector{Int16}
@@ -111,9 +102,9 @@ DecompressState() = DecompressState(
     zeros(Int, HUFTABLE_LOG_MAX + 1),
     sizehint!(UInt8[], _HUF_MAX_SYMBOLS),
     Vector{UInt8}(undef, _HUF_MAX_TABLE),
-    FSEDistTableSlot(_FSE_MAX_TABLE),
-    FSEDistTableSlot(_FSE_MAX_TABLE),
-    FSEDistTableSlot(_FSE_MAX_TABLE),
+    _new_fse_table(_FSE_MAX_TABLE),
+    _new_fse_table(_FSE_MAX_TABLE),
+    _new_fse_table(_FSE_MAX_TABLE),
     _new_fse_scratch()...,
     ReverseBitReader(_dummy_rbr_view()),
     ReverseBitReader(_dummy_rbr_view()),
@@ -128,9 +119,9 @@ DecompressState(dict::ZstdDict) =
         zeros(Int, HUFTABLE_LOG_MAX + 1),
         sizehint!(UInt8[], _HUF_MAX_SYMBOLS),
         Vector{UInt8}(undef, _HUF_MAX_TABLE),
-        FSEDistTableSlot(_FSE_MAX_TABLE),
-        FSEDistTableSlot(_FSE_MAX_TABLE),
-        FSEDistTableSlot(_FSE_MAX_TABLE),
+        _new_fse_table(_FSE_MAX_TABLE),
+        _new_fse_table(_FSE_MAX_TABLE),
+        _new_fse_table(_FSE_MAX_TABLE),
         _new_fse_scratch()...,
         ReverseBitReader(_dummy_rbr_view()),
         ReverseBitReader(_dummy_rbr_view()),
@@ -1050,7 +1041,7 @@ end
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          prev::Union{FSEDistTable, RLEDistTable, Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
-                         slot::FSEDistTableSlot, occ::Vector{Int},
+                         slot::FSEDistTable, occ::Vector{Int},
                          norm::Vector{Int16}, kind)
     if mode == 0 # Predefined_Mode
         return default
@@ -1073,7 +1064,7 @@ end
 function read_distribution_table!(br::ForwardBitReader, default::FSEDistTable,
                          prev::Union{FSEDistTable,RLEDistTable,Nothing},
                          mode::Int, max_sym::Int, max_al::Int,
-                         slot::FSEDistTableSlot, state::DecompressState, kind)
+                         slot::FSEDistTable, state::DecompressState, kind)
     return read_distribution_table!(br, default, prev, mode, max_sym, max_al,
                            slot, state.fse_occ, state.fse_norm, kind)
 end
