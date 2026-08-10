@@ -1,9 +1,19 @@
 # Finite State Entropy (FSE) decode table
 #   Reference: RFC 8878 §4.1
-# Mutable so the hot path (build_fse_table!, decompress.jl) can update
-# `accuracy_log` on a persistent, slot-owned instance instead of allocating a
-# fresh wrapper every FSE_Compressed-mode block — the backing array itself was
-# already reused via resize! below.
+# `mutable` here is for reference semantics, not mutation — hence the `const`
+# field. DecompressState holds the live table in a
+# Union{FSEDistTable,RLEDistTable,Nothing}; a table containing a Vector is not
+# isbits, so as an immutable struct every assignment into that field would box
+# it (measured: +453 allocations on a 10 MB repetitive decode). As a mutable
+# struct it is already a reference, so the assignment is a pointer store.
+#
+# Nothing needs mutating: `_fill_fse_table!` resizes and refills `entries` in
+# place, which never changes the vector's identity, so one instance serves every
+# block of a frame.
+#
+# The accuracy log is not stored. `_fill_fse_table!` always sizes `entries` to
+# exactly 1 << accuracy_log, so the log is recoverable as the size's trailing
+# zero count — see `dist_table_init!`, its only reader.
 #
 # One packed 8-byte entry per state, the same layout as libzstd's
 # ZSTD_seqSymbol:
@@ -24,8 +34,7 @@
 # was only ever a stepping stone to those two values, and for the Huffman
 # weight table (which has no baselines) it is stored in `base_value`.
 mutable struct FSEDistTable
-    accuracy_log::Int
-    entries::Vector{UInt64}
+    const entries::Vector{UInt64}
 end
 
 @inline _fse_pack(next_state::UInt16, nb_bits::UInt8, nb_add::UInt8, base_value::UInt32) =
@@ -76,8 +85,8 @@ struct RawSym end   # Huffman weights: the "value" is the symbol itself
 # Fill pre-allocated backing arrays for an FSE decode table from a normalized
 # probability distribution. norm[i+1] is the probability of symbol i; -1
 # means "probability 1/tableSize". Shared by the raw-array hot path below and
-# the slot-owning `build_fse_table!` (decompress.jl, defined after
-# FSEDistTableSlot).
+# `build_fse_table!` (decompress.jl, which fills a persistent table's array
+# in place).
 function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
                            entries::Vector{UInt64}, occ::Vector{Int}, kind)
     table_size = 1 << accuracy_log
@@ -138,7 +147,7 @@ end
 function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
                           entries::Vector{UInt64}, occ::Vector{Int}, kind)
     _fill_fse_table!(norm, accuracy_log, entries, occ, kind)
-    return FSEDistTable(accuracy_log, entries)
+    return FSEDistTable(entries)
 end
 
 # Cold-path: allocates its own backing arrays (used by __init__, parse_dictionary, etc.)
@@ -225,8 +234,12 @@ end
 
 # ------- Dist Table state machine helpers -------
 
+# The state is the first `accuracy_log` bits of the stream. `entries` is always
+# sized to exactly 1 << accuracy_log, so the log comes from its size rather than
+# a stored field; this is the only place that needs it, three times per block,
+# right next to a bitstream read.
 @inline dist_table_init!(rb::ReverseBitReader, t::FSEDistTable) =
-    Int(read(rb, t.accuracy_log))
+    Int(read(rb, trailing_zeros(length(t.entries))))
 
 # Fetch the whole packed entry for a state. Deliberately bounds-checked: the
 # state comes from bitstream data, and this one check is what makes every field
