@@ -1,8 +1,9 @@
 # Magic numbers
 
-const ZSTD_MAGIC = 0xFD2FB528                 # (RFC 8878 §3.1.1; identifies the start of a Zstd frame)
-const ZSTD_SKIPPABLE_FRAME_MAGIC = 0x184D2A50 # (RFC 8878 §3.1.2; last hex digit may be any value; identifies the start of a skippable frame)
-const ZSTD_DICT_MAGIC = 0xEC30A437            # (RFC 8878 §5; identifies the start of a Zstd dictionary)
+const ZSTD_MAGIC = 0xFD2FB528                 # RFC 8878 §3.1.1; identifies the start of a Zstd frame
+const ZSTD_SKIPPABLE_FRAME_MAGIC = 0x184D2A50 # RFC 8878 §3.1.2; last hex digit may be any value; identifies the start of a skippable frame
+const ZSTD_DICT_MAGIC = 0xEC30A437            # RFC 8878 §5; identifies the start of a Zstd dictionary
+const ZSTD_BLOCKSIZE_MAX = 131072             # RFC 8878 §3.1.1.2.3; maximum decompressed size of any single block (128 KiB)
 
 
 # Sequence Codes for Lengths and Offsets (RFC 8878 §3.1.1.3.2.1.1)
@@ -86,3 +87,16 @@ const WINDOW_SIZE_MAX = Int64(typemax(Int))
 # a potential malformed file. The spec recommends at least 8 MiB, and 128 MiB matches libzstd's
 # default limit; intentional choice would be required to exceed it.
 const STREAM_WINDOW_SIZE_MAX = Int64(1) << 27 # 128 MiB
+
+const _FSE_MAX_TABLE = 512 # 1 << max accuracy_log (9 for LL/ML, 8 for OF)
+const _HUF_MAX_TABLE = 1 << HUFTABLE_LOG_MAX # largest possible Huffman decode table (2048 entries)
+const _HUF_MAX_SYMBOLS = 256 # one weight per possible byte value
+
+# Ceiling on the compression ratio used to size the output buffer when a frame
+# declares no Frame_Content_Size (see _decompress_frame!). Bounds how far a
+# misleading prefix can inflate the reservation; ratios above it just grow the
+# buffer again, as before.
+const _GROWTH_RATIO_CLAMP = 8
+
+# Stand-in for "no dictionary content". Shared because it stays empty.
+const EMPTY_DICT_CONTENT = UInt8[]
