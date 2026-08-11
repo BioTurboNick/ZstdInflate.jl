@@ -45,7 +45,7 @@ end
 #
 #   medium (100 KB) — ~1.6 copies (~61 KB unique + ~39 KB repeat). The Huffman
 #                     decoder handles the full unique first pass (~61% of output),
-#                     then sequence execution handles the repeat. This maximises
+#                     then sequence execution handles the repeat. This maximizes
 #                     the Huffman-decode fraction and is our worst relative case.
 #
 #   large  (10 MB)  — ~162 copies. Compressed size is only ~17 KB (≈ one copy +

@@ -82,7 +82,7 @@ DecompressState(dict::Union{Nothing, ZstdDict} = nothing) =
 
 # Return a DecompressState to its start-of-frame condition without rebuilding
 # it. Only the fields that carry meaning from one block to the next within a
-# frame need clearing; everything else is scratch whose user reinitialises it
+# frame need clearing; everything else is scratch whose user reinitializes it
 # before reading, and that scratch is the bulk of the object.
 function reset!(state::DecompressState, dict::Union{ZstdDict, Nothing})
     if dict === nothing

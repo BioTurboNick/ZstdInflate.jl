@@ -476,7 +476,7 @@ end
 end
 
 # ------------------------------------------------------------------
-# Typed binary arrays (Float32/Float64/Int32 serialised as raw bytes)
+# Typed binary arrays (Float32/Float64/Int32 serialized as raw bytes)
 # ------------------------------------------------------------------
 @testset "Typed binary arrays" begin
     Random.seed!(200)
