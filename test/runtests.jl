@@ -58,7 +58,9 @@ long_string   = join(fill(medium_string, 100), short_string)
     for s in [empty_string, short_string, medium_string, long_string]
         data = Vector{UInt8}(s)
         @test inflate_zstd(compress(data)) == data
-        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do s
+            read(s)
+        end == data
     end
 end
 
@@ -70,7 +72,9 @@ end
     for n in [0, 1, 10, 100, 1_000, 10_000, 100_000]
         data = rand(UInt8, n)
         @test inflate_zstd(compress(data)) == data
-        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do s
+            read(s)
+        end == data
     end
 end
 
@@ -82,7 +86,9 @@ end
     for n in [0, 1, 10, 100, 1_000, 10_000, 100_000]
         data = rand(UInt8, n) .& 0x0f
         @test inflate_zstd(compress(data)) == data
-        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do s
+            read(s)
+        end == data
     end
 end
 
@@ -186,10 +192,11 @@ end
 @testset "Streaming readline" begin
     s = "first line\nsecond line\n"
     data = Vector{UInt8}(s)
-    stream = InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))
-    @test readline(stream; keep=true) == "first line\n"
-    @test readline(stream; keep=true) == "second line\n"
-    @test eof(stream)
+    open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do stream
+        @test readline(stream; keep=true) == "first line\n"
+        @test readline(stream; keep=true) == "second line\n"
+        @test eof(stream)
+    end
 end
 
 # ------------------------------------------------------------------
@@ -302,7 +309,9 @@ end
     @test inflate_zstd(vcat(fb, fa); dict=d) == vcat(big_data, data)
 
     # Dictionary decompression through the incremental stream interface
-    @test read(InflateZstdStream(IOBuffer(vcat(fa, fb)); dict=d)) == vcat(data, big_data)
+    @test open(InflateZstdStream, IOBuffer(vcat(fa, fb)); dict=d) do s
+        read(s)
+    end == vcat(data, big_data)
 
     # A ZstdDict is shared, read-only state as far as decoding is concerned.
     # Streaming compaction used to drop an unreachable dictionary by emptying
@@ -340,10 +349,13 @@ end
     @test acc == long_data
     @test length(s.state.dict_content) == 0   # the stream did drop the dictionary
     @test length(d.content) == dict_len_before # ...without touching the ZstdDict
+    close(s)   # inspects `s.state`, so not a do-block
 
     # And the dictionary still works afterwards, for every entry point.
     @test inflate_zstd(compress_with_dict(data, dict_buf); dict=d) == data
-    @test read(InflateZstdStream(IOBuffer(vcat(fa, fb)); dict=d)) == vcat(data, big_data)
+    @test open(InflateZstdStream, IOBuffer(vcat(fa, fb)); dict=d) do s
+        read(s)
+    end == vcat(data, big_data)
 end
 
 # ------------------------------------------------------------------
@@ -457,7 +469,9 @@ end
     ]
         data = Vector{UInt8}(s)
         @test inflate_zstd(compress(data)) == data
-        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do s
+            read(s)
+        end == data
     end
 end
 
@@ -469,7 +483,9 @@ end
     for T in [Int32, Float32, Float64]
         data = collect(reinterpret(UInt8, rand(T, 500)))
         @test inflate_zstd(compress(data)) == data
-        @test read(InflateZstdStream(ZstdCompressorStream(IOBuffer(data)))) == data
+        @test open(InflateZstdStream, ZstdCompressorStream(IOBuffer(data))) do s
+            read(s)
+        end == data
     end
 end
 
@@ -504,7 +520,9 @@ end
     for nibble in UInt8[0x52, 0x57, 0x5A, 0x5F]
         skip = vcat(UInt8[nibble, 0x2A, 0x4D, 0x18, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB])
         @test inflate_zstd(vcat(skip, frame)) == UInt8[99]
-        @test read(InflateZstdStream(IOBuffer(vcat(skip, frame)))) == UInt8[99]
+        @test open(InflateZstdStream, IOBuffer(vcat(skip, frame))) do s
+            read(s)
+        end == UInt8[99]
     end
 end
 
@@ -615,7 +633,9 @@ end
     end
 
     # AC4.2: InflateZstdStream over a multi-frame source produces correct output
-    @test read(InflateZstdStream(IOBuffer(two_frames))) == expected_two
+    @test open(InflateZstdStream, IOBuffer(two_frames)) do s
+        read(s)
+    end == expected_two
 end
 
 # ------------------------------------------------------------------
@@ -626,14 +646,15 @@ end
     Random.seed!(11)
     for data in [Vector{UInt8}(long_string), rand(UInt8, 100_000),
                  rand(UInt8, 200_000) .& 0x1f, repeat(UInt8[1, 2, 3, 4, 5, 6, 7, 8], 20_000)]
-        s = InflateZstdStream(IOBuffer(compress(data)))
-        acc = UInt8[]
-        chunk = Vector{UInt8}(undef, 4096)
-        while !eof(s)
-            n = readbytes!(s, chunk, 4096)
-            append!(acc, @view chunk[1:n])
-        end
-        @test acc == data
+        @test open(InflateZstdStream, IOBuffer(compress(data))) do s
+            acc = UInt8[]
+            chunk = Vector{UInt8}(undef, 4096)
+            while !eof(s)
+                n = readbytes!(s, chunk, 4096)
+                append!(acc, @view chunk[1:n])
+            end
+            acc
+        end == data
     end
 
     # Bounded memory: with a small window (2^10), retained output must stay
@@ -641,14 +662,16 @@ end
     Random.seed!(12)
     data = rand(UInt8, 4_000_000) .& 0x07
     c = compress_opts(data; windowlog=10)
-    s = InflateZstdStream(IOBuffer(c))
-    acc = UInt8[]
-    chunk = Vector{UInt8}(undef, 8192)
-    max_retained = 0
-    while !eof(s)
-        n = readbytes!(s, chunk, 8192)
-        append!(acc, @view chunk[1:n])
-        max_retained = max(max_retained, length(s.out))
+    acc, max_retained = open(InflateZstdStream, IOBuffer(c)) do s
+        acc = UInt8[]
+        chunk = Vector{UInt8}(undef, 8192)
+        max_retained = 0
+        while !eof(s)
+            n = readbytes!(s, chunk, 8192)
+            append!(acc, @view chunk[1:n])
+            max_retained = max(max_retained, length(s.out))
+        end
+        (acc, max_retained)
     end
     @test acc == data
     @test max_retained < 1_000_000   # window (1 KiB) + block (128 KiB) + compaction hysteresis
@@ -656,9 +679,13 @@ end
     # Content checksum verified incrementally
     data = rand(UInt8, 300_000)
     good = compress_opts(data; checksum=true)
-    @test read(InflateZstdStream(IOBuffer(good))) == data
+    @test open(InflateZstdStream, IOBuffer(good)) do s
+        read(s)
+    end == data
     bad = copy(good); bad[end] ⊻= 0xFF
-    @test_throws ArgumentError read(InflateZstdStream(IOBuffer(bad)))
+    @test_throws ArgumentError open(InflateZstdStream, IOBuffer(bad)) do s
+        read(s)
+    end
 
     # Construction errors surface eagerly
     @test_throws ArgumentError InflateZstdStream(IOBuffer(UInt8[]))
@@ -666,16 +693,22 @@ end
 
     # Trailing garbage after a frame is rejected when reached
     frame = compress(UInt8[1, 2, 3])
-    s = InflateZstdStream(IOBuffer(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD])))
-    @test_throws ArgumentError read(s)
+    @test_throws ArgumentError open(InflateZstdStream,
+                                    IOBuffer(vcat(frame, UInt8[0xAA, 0xBB, 0xCC, 0xDD]))) do s
+        read(s)
+    end
 
     # Skippable-only source yields empty output without error
     skip_only = UInt8[0x50, 0x2A, 0x4D, 0x18, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB]
-    @test read(InflateZstdStream(IOBuffer(vcat(skip_only, compress(UInt8[7])))))== UInt8[7]
+    @test open(InflateZstdStream, IOBuffer(vcat(skip_only, compress(UInt8[7])))) do s
+        read(s)
+    end == UInt8[7]
 
     # FCS-absent frames stream correctly
     data = rand(UInt8, 50_000) .& 0x3f
-    @test read(InflateZstdStream(IOBuffer(compress_no_fcs(data)))) == data
+    @test open(InflateZstdStream, IOBuffer(compress_no_fcs(data))) do s
+        read(s)
+    end == data
 end
 
 # ------------------------------------------------------------------
@@ -689,12 +722,9 @@ end
     # Buffers recycled through the pool must not leak state between streams:
     # decode the same set repeatedly, always closing, and compare every result.
     for _ in 1:6, data in payloads
-        s = InflateZstdStream(IOBuffer(compress(data)))
-        try
-            @test read(s) == data
-        finally
-            close(s)
-        end
+        @test open(InflateZstdStream, IOBuffer(compress(data))) do s
+            read(s)
+        end == data
     end
 
     # Interleaved lifetimes: an inner stream borrows and returns a buffer while
@@ -730,7 +760,9 @@ end
     # previous frame's repeat offsets or entropy tables. Concatenated frames
     # exercise the same reset path within one stream.
     multi = vcat((compress(p) for p in payloads)...)
-    @test read(InflateZstdStream(IOBuffer(multi))) == vcat(payloads...)
+    @test open(InflateZstdStream, IOBuffer(multi)) do s
+        read(s)
+    end == vcat(payloads...)
 end
 
 # ------------------------------------------------------------------
@@ -807,6 +839,21 @@ end
         @test_throws ArgumentError open(identity, InflateZstdStream, bad)
         @test (rm(bad); true)          # would fail if the handle leaked
     end
+
+    # A construction that fails does so *after* borrowing a set from the pool,
+    # since the first frame header is parsed eagerly. That set must come back:
+    # otherwise every rejected file leaks both the buffers and an in-flight
+    # count, and since the count bounds the pool, a program that probes files it
+    # turns out not to want would push the bound up until trimming never fires.
+    ZstdInflate.empty_scratch_pool!()
+    ZstdInflate._SCRATCH_INFLIGHT[] = 0
+    ZstdInflate._SCRATCH_PEAK[]     = 0
+    for _ in 1:50
+        @test_throws ArgumentError InflateZstdStream(IOBuffer(UInt8[0xDE, 0xAD, 0xBE, 0xEF, 0x00]))
+    end
+    @test ZstdInflate._SCRATCH_INFLIGHT[] == 0
+    @test ZstdInflate._SCRATCH_PEAK[] ≤ 1
+    @test length(ZstdInflate._SCRATCH_POOL) ≤ 2   # recycled, not accumulated
 end
 
 # ------------------------------------------------------------------
@@ -818,12 +865,15 @@ end
     small = compress(rand(UInt8, 4_000) .& 0x0f)
     big   = compress(rand(UInt8, 900_000) .& 0x03)
 
-    decode(c) = (s = InflateZstdStream(IOBuffer(c)); try read(s) finally close(s) end)
+    decode(c) = open(InflateZstdStream, IOBuffer(c)) do s
+        read(s)
+    end
 
-    # Earlier testsets construct streams without closing them, which is allowed
-    # and leaves the in-flight count reading high (it is decremented on close).
-    # Reset it, and the peak with it, so the trim bound starts from a known state.
-    Z._SCRATCH_INFLIGHT[] = 0
+    # Every stream the suite opens above is closed, so nothing should still be
+    # checked out by the time we get here. This is the assertion that keeps it
+    # that way: a stream left open anywhere earlier shows up as a non-zero count
+    # and inflates the trim bound for everything that follows.
+    @test Z._SCRATCH_INFLIGHT[] == 0
     Z.empty_scratch_pool!()
 
     # A serial caller is at peak concurrency 1. The floor of 1 in the trim bound
@@ -894,7 +944,9 @@ end
     end
 
     # Decoding is unaffected by any of it.
-    @test decode(small) == read(InflateZstdStream(IOBuffer(small)))
+    @test decode(small) == open(InflateZstdStream, IOBuffer(small)) do s
+        read(s)
+    end
 end
 
 # ------------------------------------------------------------------
@@ -935,6 +987,7 @@ end
     # Full roundtrip after interleaved mark/reset still matches original data
     rest = read(s)
     @test vcat(a, c, rest) == data
+    close(s)
 
     # Marking pins memory: retained buffer must not shrink while marked, even
     # past a small window, then must shrink again after unmark + compaction.
@@ -954,6 +1007,7 @@ end
         readbytes!(s2, chunk, 8192)
     end
     @test length(s2.out) < 500_000     # compaction resumes once unmarked
+    close(s2)
 
     # seekstart rewinds and replays identically
     s3 = InflateZstdStream(IOBuffer(compress(data)))
@@ -963,6 +1017,7 @@ end
     @test position(s3) == 0
     second_pass = read(s3)
     @test second_pass == data
+    close(s3)
 end
 
 # ------------------------------------------------------------------
@@ -1129,7 +1184,9 @@ end
     # dictionary ID, no content size, so the byte after it is the descriptor. Kept
     # under STREAM_WINDOW_SIZE_MAX so InflateZstdStream construction itself succeeds.
     for wd in UInt8[0x00, 0x0f, 0x38, 0x40, 0x58, 0x59, 0x7f]
-        @test InflateZstdStream(IOBuffer(hdr(wd))).window_size == wsize(wd)
+        @test open(InflateZstdStream, IOBuffer(hdr(wd))) do s
+            s.window_size
+        end == wsize(wd)
         @test wsize(wd) ≤ ZstdInflate.STREAM_WINDOW_SIZE_MAX
     end
 
@@ -1164,7 +1221,11 @@ end
     Random.seed!(7)
     data = repeat(rand(UInt8, 200_000), 6)
     c = compress_opts(data; windowlog=18)
-    @test InflateZstdStream(IOBuffer(c)).window_size == 1 << 18
-    @test read(InflateZstdStream(IOBuffer(c))) == data
+    @test open(InflateZstdStream, IOBuffer(c)) do s
+        s.window_size
+    end == 1 << 18
+    @test open(InflateZstdStream, IOBuffer(c)) do s
+        read(s)
+    end == data
     @test inflate_zstd(c) == data
 end

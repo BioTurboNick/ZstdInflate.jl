@@ -235,11 +235,22 @@ function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
     s = InflateZstdStream{typeof(io)}(io, dict, out, 1, 1, inbuf, hdrbuf,
                                       state, false, 0, 0, -1, 0, false,
                                       XXH64Stream(), false, -1, 0, own_io, false)
-    # Parse the first frame header eagerly so structural errors (empty input,
-    # bad magic, missing dictionary) surface at construction time.
-    eof(io) &&
-        throw(ArgumentError("zstd: empty input"))
-    _start_frame!(s)
+    try
+        # Parse the first frame header eagerly so structural errors (empty
+        # input, bad magic, missing dictionary) surface at construction time.
+        eof(io) &&
+            throw(ArgumentError("zstd: empty input"))
+        _start_frame!(s)
+    catch
+        # We borrowed a set before we could know the input was bad. Hand it
+        # back: otherwise every rejected file leaks both the buffers and an
+        # in-flight count, and the count is what bounds the pool — a program
+        # that probes files it turns out not to want would push that bound up
+        # monotonically until trimming never fires again. `_start_frame!` resets
+        # the state on every frame, so a half-started one is fine to reuse.
+        _give_scratch!(StreamScratch(s.out, s.inbuf, s.hdrbuf, s.state))
+        rethrow()
+    end
     return s
 end
 
