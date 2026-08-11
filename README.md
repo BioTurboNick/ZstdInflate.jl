@@ -34,8 +34,7 @@ data = inflate_zstd(compressed; nthreads=4)
 ### Streaming decompression
 
 ```julia
-open(filename) do io
-    stream = InflateZstdStream(io)
+open(InflateZstdStream, "file.zst") do stream
     for line in eachline(stream)
         # ...
     end
@@ -44,7 +43,29 @@ end
 
 `InflateZstdStream` wraps any readable `IO` object and exposes the
 decompressed bytes through the standard `IO` reading interface (`read`,
-`readline`, `eof`, ...). Decompression is incremental: compressed bytes are
+`readline`, `eof`, ...).
+
+`open(InflateZstdStream, src)` accepts either a path or any readable `IO`.
+`close` hands the stream's internal buffers to a shared pool for later streams
+to reuse, which is what makes decoding many frames cheap, so prefer the
+`do`-block form above — it closes for you, including when the block throws.
+Constructing a stream directly is fine too; an unclosed stream is collected
+normally, it just rebuilds its buffers from scratch. Pass `own_io = false`
+when the `IO` outlives the stream, so that closing releases the buffers
+without closing the file underneath:
+
+```julia
+open(path) do io                       # one file, many independent frames
+    while !eof(io)
+        frame = open(InflateZstdStream, io; own_io = false) do stream
+            read(stream)
+        end
+        # ...
+    end
+end
+```
+
+Decompression is incremental: compressed bytes are
 read from the source one block at a time as output is consumed, and
 decompressed output is discarded once it has been read and has aged past
 the frame's back-reference window. Memory use is bounded by the frame's
@@ -64,8 +85,9 @@ data   = inflate_zstd(compressed; dict=dict)
 text   = inflate_zstd("file.zst"; dict=dict)
 
 open("file.zst") do io
-    stream = InflateZstdStream(io; dict=dict)
-    data = read(stream)
+    data = open(InflateZstdStream, io; dict=dict, own_io=false) do stream
+        read(stream)
+    end
 end
 ```
 

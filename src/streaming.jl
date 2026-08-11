@@ -222,6 +222,8 @@ from `io`.
 false` when `io` outlives the stream — decoding a sequence of independent
 frames from one open file, for instance — so that `close` releases the
 stream's internal buffers for reuse without closing the file underneath.
+
+See `open(InflateZstdStream, io)` for a form that closes the stream for you.
 """
 function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
                             own_io::Bool = true)
@@ -240,6 +242,46 @@ function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
     _start_frame!(s)
     return s
 end
+
+"""
+    open(InflateZstdStream, src; dict = nothing, own_io = true)
+    open(f::Function, InflateZstdStream, src; kwargs...)
+
+Open a stream decompressing Zstandard data from `src`, which may be a readable
+`IO` or a path to a `.zst` file. The first form is equivalent to the
+[`InflateZstdStream`](@ref) constructor; the second applies `f` to the stream,
+closes it whether `f` returns or throws, and returns `f`'s value:
+
+```julia
+data = open(InflateZstdStream, "file.zst") do s
+    read(s)
+end
+```
+
+Since [`close`](@ref) is what hands the stream's buffers back for reuse by
+later streams, this is the cheapest way to decode a sequence of frames. When
+`src` is an `IO` that outlives the stream — reading several independent frames
+from one open file — pass `own_io = false` so that closing the stream releases
+its buffers without closing `src`. When `src` is a path the stream owns the
+file it opened, and closing the stream closes it.
+"""
+Base.open(::Type{InflateZstdStream}, io::IO; kwargs...) =
+    InflateZstdStream(io; kwargs...)
+
+function Base.open(::Type{InflateZstdStream}, path::AbstractString; kwargs...)
+    io = open(path)
+    try
+        return InflateZstdStream(io; kwargs...)
+    catch
+        # The constructor parses the first frame header, so it can throw on a
+        # file we just opened; don't leak the handle on the way out.
+        close(io)
+        rethrow()
+    end
+end
+
+# The `do` forms come from Base's own `open(f::Function, args...)`, which wraps
+# the calls above in exactly the try/finally-close this needs.
 
 # Read exactly n bytes from io into buf (resized to n).
 function _read_exact!(io::IO, buf::Vector{UInt8}, n::Int, what::String)
@@ -460,8 +502,9 @@ Idempotent. Reading from a closed stream throws.
 Closing is optional but worth doing when decoding many frames: an unclosed
 stream is collected normally, it just rebuilds its buffers from scratch instead
 of taking a set from the pool, and it leaves the pool's trim bound believing one
-more stream is still running than really is. Use
-[`ZstdInflate.empty_scratch_pool!`](@ref) to release the pool outright.
+more stream is still running than really is. `open(InflateZstdStream, io) do s
+... end` closes for you. Use [`ZstdInflate.empty_scratch_pool!`](@ref) to
+release the pool outright.
 """
 function Base.close(s::InflateZstdStream)
     s.closed && return nothing
