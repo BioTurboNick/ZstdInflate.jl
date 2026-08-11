@@ -734,6 +734,82 @@ end
 end
 
 # ------------------------------------------------------------------
+# open(InflateZstdStream, io) and its do-block form
+# ------------------------------------------------------------------
+@testset "open(InflateZstdStream, io)" begin
+    Random.seed!(17)
+    payload = rand(UInt8, 60_000) .& 0x1f
+    comp    = compress(payload)
+
+    # Without a function it is the constructor, and the caller still closes.
+    s = open(InflateZstdStream, IOBuffer(comp))
+    @test s isa InflateZstdStream
+    @test read(s) == payload
+    close(s)
+
+    # The do form returns f's value and closes the stream.
+    local inner
+    got = open(InflateZstdStream, IOBuffer(comp)) do st
+        inner = st
+        read(st)
+    end
+    @test got == payload
+    @test !isopen(inner)
+    @test_throws ArgumentError read(inner)
+
+    # It closes on a throw too, which is the whole point of using it.
+    local escaped
+    @test_throws ErrorException open(InflateZstdStream, IOBuffer(comp)) do st
+        escaped = st
+        read(st, 10)
+        error("boom")
+    end
+    @test !isopen(escaped)
+
+    # Keywords reach the constructor, including own_io.
+    io = IOBuffer(comp)
+    open(InflateZstdStream, io; own_io = false) do st
+        read(st)
+    end
+    @test isopen(io)                    # left open for the caller
+
+    io2 = IOBuffer(comp)
+    open(InflateZstdStream, io2) do st
+        read(st)
+    end
+    @test !isopen(io2)                  # own_io defaults to true
+
+    # Closing inside the block must not make Base's outer close throw.
+    @test open(InflateZstdStream, IOBuffer(comp)) do st
+        v = read(st)
+        close(st)
+        v
+    end == payload
+
+    # Path form: the stream owns the file it opened.
+    mktempdir() do dir
+        path = joinpath(dir, "payload.zst")
+        write(path, comp)
+        @test open(InflateZstdStream, path) do st
+            read(st)
+        end == payload
+
+        s2 = open(InflateZstdStream, path)
+        @test read(s2) == payload
+        close(s2)
+
+        # A file that isn't zstd throws from the constructor, which happens
+        # after we opened the handle -- it must not be left dangling, or the
+        # temp dir cannot be removed on Windows.
+        bad = joinpath(dir, "bad.zst")
+        write(bad, rand(UInt8, 64))
+        @test_throws ArgumentError open(InflateZstdStream, bad)
+        @test_throws ArgumentError open(identity, InflateZstdStream, bad)
+        @test (rm(bad); true)          # would fail if the handle leaked
+    end
+end
+
+# ------------------------------------------------------------------
 # Scratch pool lifecycle: trim bound, largest-first eviction, idle decay
 # ------------------------------------------------------------------
 @testset "Scratch pool lifecycle" begin
