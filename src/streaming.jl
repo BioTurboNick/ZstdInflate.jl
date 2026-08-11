@@ -55,17 +55,20 @@ end
 #
 # The pool is global and lock-guarded because streams may be on different tasks or threads.
 #
-# The pool is uncapped because it is self-limiting. A set is only created when a
-# stream starts and finds the pool empty, so the number in existence can never
-# exceed the most streams that have ever been live at once; anything a caller
-# gets back from the pool is a set it had already paid for at its own high-water
-# mark. Measured: with concurrency ramped between 2 and 24 workers over a dozen
-# rounds, the pool converged to 14 entries and stopped growing.
+# There is no fixed cap. The pool is self-limiting in *count*: a set is only
+# created when a stream starts and finds the pool empty, so the number in
+# existence cannot exceed the most streams ever live at once, and whatever a
+# caller gets back is memory it already paid for at its own high-water mark.
+# A fixed cap of 8 was tried and removed: it never bound on a realistic workload
+# (peak occupancy decoding a 5478-strip TIFF is 3, at any thread count) while
+# above eight live streams it discarded four sets and re-allocated four per
+# round.
 #
-# An earlier fixed cap of 8 was worse than useless — it never bound on realistic
-# workloads (peak occupancy decoding a 5478-strip TIFF is 3, at any thread
-# count), while above eight live streams it discarded four sets and re-allocated
-# four every round.
+# What is *not* self-limiting is retained size. Julia cannot shrink a Vector's
+# capacity, so a set whose output buffer grew for one large frame keeps it: 24
+# workers on 10 MB frames leave 12 entries holding 70 MB, and 800 subsequent
+# 4 KB frames reclaim none of it. Hence the two mechanisms below — a trim bound
+# that follows the caller's concurrency, and idle decay.
 # ------------------------------------------------------------------
 struct StreamScratch
     out   ::Vector{UInt8}
@@ -77,16 +80,136 @@ end
 const _SCRATCH_POOL = StreamScratch[]
 const _SCRATCH_LOCK = ReentrantLock()
 
+# Sets currently checked out: incremented when one is handed to a stream (pooled
+# or freshly built), decremented when one comes back.
+#
+# A stream that is never closed never returns its set, so this over-counts by the
+# number of abandoned streams and the pool merely trims less. Closing is the
+# caller's business (see `close`); the cost of not doing it is retained memory,
+# not incorrectness.
+const _SCRATCH_INFLIGHT = Ref(0)
+
+# High-water mark of `_SCRATCH_INFLIGHT` since the last decay tick, and what the
+# trim bound below actually follows.
+#
+# The instantaneous count is the wrong bound even though it is the obvious one:
+# sets come back precisely when a worker finishes, so every trim decision is
+# sampled at the trough of the caller's concurrency, not its plateau. With N
+# workers cycling through short frames the count dips to 1 between handoffs, the
+# bound collapses to 2, and the pool discards sets the other N-1 workers are
+# about to ask for. Measured on a 32-strip TIFF at 6 threads that churn cost
+# 0.9 GB of extra allocation — the pool was thrashing, not trimming.
+#
+# Taking the peak over a tick-length window instead means a burst is bounded by
+# how wide it actually got, and the decay below is what walks the bound back down
+# once the burst is over.
+const _SCRATCH_PEAK = Ref(0)
+
+# Idle decay. Created on first return rather than at load: a Timer holds a libuv
+# handle, so it cannot live in a `const` (it does not survive precompilation),
+# and putting one in `__init__` would impose a periodic wakeup on every process
+# that loads this package, including those that never decode. It stops itself
+# once the pool is empty, so an idle process stops waking up altogether.
+const _SCRATCH_TIMER    = Ref{Union{Timer, Nothing}}(nothing)
+const _SCRATCH_TOUCHED  = Ref(false)
+const _SCRATCH_INTERVAL = Ref(1.0)   # seconds between decay ticks
+
+# Index of the entry holding the largest output buffer, which is the one worth
+# dropping first — size, not count, is what the pool over-retains.
+#
+# `length` stands in for capacity: Julia offers no portable way to read a
+# Vector's capacity (the Memory-based route is 1.11+, and this package supports
+# 1.10). Since a stream's output buffer only grows, its length on return is a
+# reasonable proxy for how much that set is holding.
+function _largest_scratch()
+    best, bestlen = firstindex(_SCRATCH_POOL), -1
+    for (i, sc) in enumerate(_SCRATCH_POOL)
+        n = length(sc.out)
+        n > bestlen && ((best, bestlen) = (i, n))
+    end
+    return best
+end
+
+# Drop at most one entry per call, largest first, while above twice the recent
+# peak concurrency. One at a time rather than truncating to the bound: a burst
+# draining to idle would otherwise throw away everything it is about to want
+# again. The floor of 1 keeps a serial caller — whose peak is 1 — from emptying
+# the pool it just filled.
+function _trim_scratch!()
+    length(_SCRATCH_POOL) > 2 * max(_SCRATCH_PEAK[], 1) || return false
+    deleteat!(_SCRATCH_POOL, _largest_scratch())
+    return true
+end
+
+# Caller must hold _SCRATCH_LOCK.
+function _start_scratch_decay!()
+    _SCRATCH_TIMER[] === nothing || return nothing
+    _SCRATCH_TIMER[] = Timer(_SCRATCH_INTERVAL[]; interval = _SCRATCH_INTERVAL[]) do t
+        lock(_SCRATCH_LOCK) do
+            # Walk the peak back towards what is actually in flight, halving the
+            # excess each tick. Halving rather than resetting to the current
+            # count keeps a workload that pauses between bursts from having its
+            # bound yanked out from under it during the gap.
+            live = _SCRATCH_INFLIGHT[]
+            _SCRATCH_PEAK[] = live + (_SCRATCH_PEAK[] - live) ÷ 2
+
+            if _SCRATCH_TOUCHED[]
+                _SCRATCH_TOUCHED[] = false      # in use; only the bound moves
+            elseif !isempty(_SCRATCH_POOL)
+                deleteat!(_SCRATCH_POOL, _largest_scratch())
+            end
+            if isempty(_SCRATCH_POOL)
+                close(t)
+                _SCRATCH_TIMER[] = nothing
+            end
+        end
+    end
+    return nothing
+end
+
 _take_scratch!() =
     lock(_SCRATCH_LOCK) do
+        _SCRATCH_INFLIGHT[] += 1
+        _SCRATCH_PEAK[]     = max(_SCRATCH_PEAK[], _SCRATCH_INFLIGHT[])
+        _SCRATCH_TOUCHED[]  = true
         isempty(_SCRATCH_POOL) ? nothing : pop!(_SCRATCH_POOL)
     end
 
 function _give_scratch!(sc::StreamScratch)
     lock(_SCRATCH_LOCK) do
+        _SCRATCH_INFLIGHT[] = max(_SCRATCH_INFLIGHT[] - 1, 0)
+        _SCRATCH_TOUCHED[]  = true
         push!(_SCRATCH_POOL, sc)
+        _trim_scratch!()
+        _start_scratch_decay!()
     end
     return nothing
+end
+
+"""
+    ZstdInflate.empty_scratch_pool!() -> Int
+
+Release every buffer set currently held for reuse by [`InflateZstdStream`], and
+return how many were released.
+
+Closed streams hand their internal buffers to a shared pool, which is what makes
+decoding many small frames cheap. The pool trims itself towards the number of
+streams in flight and decays away once idle, so calling this is optional; it
+exists for callers that want the memory back at a particular moment.
+"""
+function empty_scratch_pool!()
+    lock(_SCRATCH_LOCK) do
+        n = length(_SCRATCH_POOL)
+        empty!(_SCRATCH_POOL)
+        # Don't leave a stale burst width behind to inflate the bound afterwards.
+        _SCRATCH_PEAK[] = _SCRATCH_INFLIGHT[]
+        t = _SCRATCH_TIMER[]
+        if t !== nothing
+            close(t)
+            _SCRATCH_TIMER[] = nothing
+        end
+        return n
+    end
 end
 
 """
@@ -330,12 +453,15 @@ Base.bytesavailable(s::InflateZstdStream) = s.wpos - s.read_pos
 """
     close(s::InflateZstdStream)
 
-Release `s`'s internal buffers for reuse by later streams on this task, and
-close the underlying `io` unless the stream was constructed with `own_io =
-false`. Idempotent. Reading from a closed stream throws.
+Release `s`'s internal buffers for reuse by later streams, and close the
+underlying `io` unless the stream was constructed with `own_io = false`.
+Idempotent. Reading from a closed stream throws.
 
-Closing is optional: an unclosed stream is collected normally, it just does not
-hand its buffers on.
+Closing is optional but worth doing when decoding many frames: an unclosed
+stream is collected normally, it just rebuilds its buffers from scratch instead
+of taking a set from the pool, and it leaves the pool's trim bound believing one
+more stream is still running than really is. Use
+[`ZstdInflate.empty_scratch_pool!`](@ref) to release the pool outright.
 """
 function Base.close(s::InflateZstdStream)
     s.closed && return nothing

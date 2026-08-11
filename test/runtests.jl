@@ -734,6 +734,94 @@ end
 end
 
 # ------------------------------------------------------------------
+# Scratch pool lifecycle: trim bound, largest-first eviction, idle decay
+# ------------------------------------------------------------------
+@testset "Scratch pool lifecycle" begin
+    Z = ZstdInflate
+    Random.seed!(16)
+    small = compress(rand(UInt8, 4_000) .& 0x0f)
+    big   = compress(rand(UInt8, 900_000) .& 0x03)
+
+    decode(c) = (s = InflateZstdStream(IOBuffer(c)); try read(s) finally close(s) end)
+
+    # Earlier testsets construct streams without closing them, which is allowed
+    # and leaves the in-flight count reading high (it is decremented on close).
+    # Reset it, and the peak with it, so the trim bound starts from a known state.
+    Z._SCRATCH_INFLIGHT[] = 0
+    Z.empty_scratch_pool!()
+
+    # A serial caller is at peak concurrency 1. The floor of 1 in the trim bound
+    # must stop it from emptying the pool it just filled, or the pool would never
+    # help single-threaded callers at all.
+    for _ in 1:5; decode(small); end
+    @test length(Z._SCRATCH_POOL) ≥ 1
+    @test Z._SCRATCH_INFLIGHT[] == 0
+
+    # Trim bound follows the peak, so serial work stays within 2 sets.
+    @test length(Z._SCRATCH_POOL) ≤ 2
+
+    # Largest-first eviction: with one oversized set and several small ones in
+    # the pool, trimming must drop the oversized one rather than whichever came
+    # back last — size, not count, is what the pool over-retains.
+    Z.empty_scratch_pool!()
+    decode(big)
+    @test length(Z._SCRATCH_POOL) == 1
+    biggest = length(Z._SCRATCH_POOL[1].out)
+    for _ in 1:10; decode(small); end
+    @test all(length(sc.out) < biggest for sc in Z._SCRATCH_POOL)
+
+    # A concurrent burst is allowed a wider bound than a serial caller, and that
+    # width must survive the burst draining: the in-flight count dips between
+    # handoffs, and trimming on the dip is what made the pool thrash rather than
+    # trim. Overlapping streams explicitly rather than spawning tasks, so this
+    # holds at any --threads setting.
+    Z.empty_scratch_pool!()
+    streams = [InflateZstdStream(IOBuffer(small)) for _ in 1:6]
+    for s in streams; read(s); end
+    @test Z._SCRATCH_INFLIGHT[] == 6
+    @test Z._SCRATCH_PEAK[] ≥ 6                  # burst width was observed
+    for s in streams; close(s); end
+    @test length(Z._SCRATCH_POOL) == 6           # all kept: bound is 2 * 6
+
+    # empty_scratch_pool! releases everything and reports the count.
+    Z.empty_scratch_pool!()
+    for _ in 1:3; decode(small); end
+    n = length(Z._SCRATCH_POOL)
+    @test Z.empty_scratch_pool!() == n
+    @test isempty(Z._SCRATCH_POOL)
+    @test Z._SCRATCH_TIMER[] === nothing
+
+    # Idle decay drains the pool, walks the peak back down, and then retires the
+    # timer. Shorten the interval so the test need not wait on the production
+    # cadence.
+    old = Z._SCRATCH_INTERVAL[]
+    try
+        Z._SCRATCH_INTERVAL[] = 0.02
+        Z.empty_scratch_pool!()
+        Threads.@sync for _ in 1:4
+            Threads.@spawn decode(small)
+        end
+        @test !isempty(Z._SCRATCH_POOL)
+        t0 = time()
+        while (!isempty(Z._SCRATCH_POOL) || Z._SCRATCH_TIMER[] !== nothing) && time() - t0 < 10
+            sleep(0.05)
+        end
+        @test isempty(Z._SCRATCH_POOL)
+        @test Z._SCRATCH_TIMER[] === nothing   # self-stopped once drained
+        @test Z._SCRATCH_PEAK[] == 0           # burst width decayed away
+        # ...and a later return restarts it.
+        decode(small)
+        @test Z._SCRATCH_TIMER[] !== nothing
+    finally
+        Z._SCRATCH_INTERVAL[] = old
+        Z.empty_scratch_pool!()
+    end
+
+    # Decoding is unaffected by any of it.
+    @test decode(small) == read(InflateZstdStream(IOBuffer(small)))
+end
+
+# ------------------------------------------------------------------
 # mark/reset/unmark/position/seekstart (TranscodingStreams parity)
 # ------------------------------------------------------------------
 @testset "Stream mark/reset/seekstart" begin
