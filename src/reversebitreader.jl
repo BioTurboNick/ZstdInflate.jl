@@ -4,10 +4,8 @@
 # ============================================================
 
 # Concrete type of every `@view data[a:b]` slice these readers are built
-# from (frame bytes are always a plain Vector{UInt8}, and nested views over a
-# UnitRange flatten to this same type rather than nesting SubArrays). Scratch
-# fields reused across calls (DecompressState) need a concrete, matching
-# type parameter to reinitialize in place without reallocating.
+# from. Scratch fields reused across calls (DecompressState) need a concrete,
+#  matching type parameter to reinitialize in place without reallocating.
 const RBRView = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int64}}, true}
 
 mutable struct ReverseBitReader{T <: AbstractVector{UInt8}}
@@ -18,8 +16,7 @@ mutable struct ReverseBitReader{T <: AbstractVector{UInt8}}
 end
 
 # Parse the sentinel bit at the end of a reverse bitstream, returning the
-# pre-initial-refill (pos, bits, nbits). Shared by the allocating constructor
-# and `reinit!` below.
+# pre-initial-refill (pos, bits, nbits).
 @inline function _rbr_sentinel(data::AbstractVector{UInt8})
     isempty(data) &&
         throw(ArgumentError("zstd: empty reverse bitstream"))
@@ -36,12 +33,7 @@ end
     return length(data) - 1, bits, nbits
 end
 
-# Full initial state (post-first-refill) for a fresh reverse bitstream, with
-# no reader object involved. `_refill_stream` already unifies the fast
-# (pos ≥ 8), padded (pos < 8), and bytewise (length(data) ≤ 8) cases that
-# `refill!`/`_refill_bytewise!` otherwise dispatch between, so this is a
-# drop-in replacement for "construct + do the initial refill" that never
-# needs a temporary reader to get there.
+# Full initial state (post-first-refill) for a fresh reverse bitstream.
 @inline function _rbr_init_state(data::AbstractVector{UInt8})
     pos, bits, nbits = _rbr_sentinel(data)
     bits, nbits, pos = _refill_stream(data, bits, nbits, pos)
@@ -54,8 +46,7 @@ function ReverseBitReader(data::T) where T <: AbstractVector{UInt8}
     return ReverseBitReader{T}(data, pos, bits, nbits)
 end
 
-# Reinitialize an existing reader for a new bitstream in place, instead of
-# allocating a fresh one. `data` must share `rb`'s existing type parameter.
+# Reinitialize an existing reader for a new bitstream in place.
 function reinit!(rb::ReverseBitReader{T}, data::T) where T <: AbstractVector{UInt8}
     pos, bits, nbits = _rbr_init_state(data)
     rb.data = data
@@ -192,8 +183,7 @@ mutable struct ReverseBitReaderX{X, T <: AbstractVector{UInt8}}
     pos  ::NTuple{X, Int64}
 end
 
-# Construct from four data slices. Uses `_rbr_init_state` directly rather than
-# building and discarding four temporary `ReverseBitReader`s.
+# Construct from four data slices.
 function ReverseBitReaderX(d1::T, d2::T, d3::T, d4::T) where T <: AbstractVector{UInt8}
     p1, b1, n1 = _rbr_init_state(d1)
     p2, b2, n2 = _rbr_init_state(d2)
@@ -252,30 +242,16 @@ function reinit!(rb::ReverseBitReaderX{2, T}, rb1::ReverseBitReader{T}, rb2::Rev
     return rb
 end
 
-# Refill all four streams.
+# Mask selecting the top `nread` bytes of a freshly loaded 8-byte word — the
+# bytes a refill is actually going to take — and zero when nread is 0, so that
+# OR-ing it in becomes a no-op.
 #
-# Fast path (all pos ≥ 8): the four 8-byte loads are scalar (different addresses),
-# but the OR into bits is done with Vec{4,UInt64} ops.
-#
-# When pos ≥ 8, nread = (64 - nbits) >> 3 ≤ 8 ≤ pos, so min(nread, navail) = nread.
-#
-# When nbits ≥ 57, nread = 0. The readmask formula
-#   ~((UInt64(1) << ((8 - nread) * 8)) - 1)
-# uses plain Julia `<<` (not `_shl`), which returns 0 for shift ≥ 64. So:
-#   nread = 0  →  shift = 64  →  1 << 64 = 0  →  ~(0 - 1) = ~typemax = 0
-# Readmask = 0 makes the OR a no-op, and nread = 0 makes the nbits/pos deltas zero.
-# No explicit branch on nbits < 57 is needed.
-#
-# Slow path (any pos < 8): scalar fallback via _refill_stream.
-# Compute a mask with the top 8*nread bits set (0 when nread=0).
-# Scalar path: _shl(typemax, 64-nread*8) is wrong for nread=0 (64 & 63 = 0 → typemax),
-# so use ifelse to zero it out branchlessly (CMOV, no branch).
-# Vec path: vpsllvq returns 0 for shift=64 natively, so the formula is always correct.
+# The `ifelse` exists for that zero case. `_shl` masks its shift count to six
+# bits, which is what makes it fast, but nread = 0 asks for a shift of 64, and
+# 64 & 63 == 0 would leave every bit set rather than none. Selecting 0 up front
+# is branchless (a CMOV) and keeps the masked shift everywhere else.
 @inline _readmask(nread::Int) =
     ifelse(nread > 0, _shl(typemax(UInt64), 64 - nread * 8), UInt64(0))
-@inline _readmask(nread::Union{Vec{4, Int64}, Vec{4, UInt64},
-                               Vec{2, Int64}, Vec{2, UInt64}}) =
-    ~((UInt64(1) << ((8 - nread) * 8)) - UInt64(1))
 
 # ============================================================
 # Sentinel-bit bit-position encoding
@@ -345,6 +321,24 @@ end
     return (_le64(data, P - 7) | UInt64(1)) << (consumed & 7), P
 end
 
+# Refill every stream of a grouped reader (X is 2 or 4).
+#
+# Fast path, when no stream is near the front of its data: the X 8-byte loads
+# are necessarily separate (different addresses), but the arithmetic merging
+# them is written as tuple broadcast, which LLVM vectorises in part.
+#
+# Two edge cases are handled without a branch of their own:
+#
+#   * `nread = (64 - nbits) >> 3` is at most 8, and the fast path already
+#     requires 8 bytes in hand, so it can never exceed what is available —
+#     which is why there is no `min` against `pos` here, unlike
+#     `_refill_stream`.
+#
+#   * A stream already holding ≥ 57 bits gets nread = 0, whereupon `_readmask`
+#     is 0 and the nbits/pos deltas are 0, so it is simply left alone.
+#
+# Slow path, when any stream is within 8 bytes of its start: defer to the scalar
+# `_refill_stream`, which handles the short-stream and zero-padded cases.
 function refill_unchecked!(rb::ReverseBitReaderX{X}) where X
     # Any stream within 8 bytes of its start must take the scalar path
     if any(Tuple(rb.pos) .< 8)
@@ -396,11 +390,8 @@ end
 # ============================================================
 # Scratch pool for _decode_4streams! (huffman.jl)
 #   Bundles every ReverseBitReader/ReverseBitReaderX that function needs so
-#   DecompressState can hold and reuse them across calls instead of
-#   allocating a fresh set (3 X-readers + 8 single readers) per literals
-#   section.
+#   DecompressState can hold and reuse them across calls.
 # ============================================================
-
 mutable struct Huffman4StreamScratch{T}
     rb4x  ::ReverseBitReaderX{4, T}
     rbA   ::ReverseBitReaderX{2, T}
@@ -415,11 +406,8 @@ mutable struct Huffman4StreamScratch{T}
     rb_ic2::ReverseBitReader{T}
 end
 
-# Placeholder-initialize a scratch pool from a dummy data slice. The dummy
-# 1-byte stream (0x01, i.e. sentinel-only, zero payload bits) is a
-# valid-but-empty reverse bitstream, just enough to satisfy the reader
-# constructors; every field is overwritten by `reinit!`/`_extract_stream!`
-# before real use.
+# Placeholder-initialize a scratch pool from a dummy data slice, which is
+# replaced in place by the caller before any actual decoding.
 function Huffman4StreamScratch(dummy::T) where T <: AbstractVector{UInt8}
     Huffman4StreamScratch{T}(
         ReverseBitReaderX(dummy, dummy, dummy, dummy),

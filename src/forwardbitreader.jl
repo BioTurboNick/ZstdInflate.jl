@@ -14,9 +14,7 @@ function ForwardBitReader(data::T) where T <: AbstractVector{UInt8}
     ForwardBitReader{T}(data, 1, UInt64(0), 0)
 end
 
-# Reinitialize an existing reader for a new bitstream in place, instead of
-# allocating a fresh one. Unlike ReverseBitReader, there's no sentinel byte
-# or initial refill to compute -- just reset the four fields directly.
+# Reinitialize an existing reader for a new bitstream in place
 function reinit!(br::ForwardBitReader{T}, data::T) where T <: AbstractVector{UInt8}
     br.data = data
     br.pos = 1

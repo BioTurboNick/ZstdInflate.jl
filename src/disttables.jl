@@ -37,10 +37,7 @@ struct RLEDistTable
     entry::UInt64
 end
 
-# What a table's symbols mean, so the builder can bake each symbol's value
-# baseline and extra-bit count into its entry. `_sym_max` is the largest symbol
-# the mapping is defined for; checking it here is what lets the sequence hot
-# path index nothing but the table itself.
+# Use the type system to distinguish the three sequence tables for helper functions.
 struct SeqLL end
 struct SeqML end
 struct SeqOF end
@@ -71,9 +68,7 @@ struct RawSym end   # Huffman weights: the "value" is the symbol itself
 
 # Fill pre-allocated backing arrays for an FSE decode table from a normalized
 # probability distribution. norm[i+1] is the probability of symbol i; -1
-# means "probability 1/tableSize". Shared by both `build_fse_table!` methods:
-# the raw-array one below, and the one in decompress.jl that fills a persistent
-# table's array in place.
+# means "probability 1/tableSize".
 function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
                            entries::Vector{UInt64}, occ::Vector{Int}, kind)
     table_size = 1 << accuracy_log
@@ -82,8 +77,8 @@ function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
     fill!(occ, 0)
 
     # Every symbol must be one the kind's value mapping is defined for. The
-    # callers all bound `length(norm)` already, but checking here is what makes
-    # the `@inbounds` in `_sym_value` safe on its own terms.
+    # callers all bound `length(norm)` already, but checking here makes
+    # the `@inbounds` in `_sym_value` safe.
     length(norm) ≤ _sym_max(kind) + 1 ||
         _throw_fse_symbol(length(norm) - 1, _sym_max(kind))
 
@@ -126,23 +121,17 @@ function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
     return nothing
 end
 
-# Caller supplies the backing arrays; `entries` and `occ` are both resized and
-# overwritten. Still allocates a fresh `FSEDistTable` wrapper each call, so the
-# hot call site (decompress.jl's read_distribution_table!) uses the
-# FSEDistTable method of `build_fse_table!` instead, which reuses that too.
 function build_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
-                           entries::Vector{UInt64}, occ::Vector{Int}, kind)
+                          entries::Vector{UInt64}, occ::Vector{Int}, kind)
     _fill_fse_table!(norm, accuracy_log, entries, occ, kind)
     return FSEDistTable(entries)
 end
 
-# Cold-path: allocates its own backing arrays, so it mutates nothing the caller
-# can see (used by __init__, parse_dictionary, etc.)
 function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int, kind)
     table_size = 1 << accuracy_log
     return build_fse_table!(norm, accuracy_log,
-                            Vector{UInt64}(undef, table_size),
-                            Vector{Int}(undef, length(norm)), kind)
+                           Vector{UInt64}(undef, table_size),
+                           Vector{Int}(undef, length(norm)), kind)
 end
 
 # Read an FSE normalized distribution from the forward bitstream.
@@ -221,17 +210,14 @@ end
 
 # ------- Dist Table state machine helpers -------
 
-# The state is the first `accuracy_log` bits of the stream. `entries` is always
-# sized to exactly 1 << accuracy_log, so the log comes from its size rather than
-# a stored field; this is the only place that needs it, three times per block,
-# right next to a bitstream read.
+# The state is the first `accuracy_log` bits of the stream. `entries` is
+# sized to 1 << accuracy_log, so the log comes from its size rather than
+# a stored field
 @inline dist_table_init!(rb::ReverseBitReader, t::FSEDistTable) =
     Int(read(rb, trailing_zeros(length(t.entries))))
 
-# Fetch the whole packed entry for a state. Deliberately bounds-checked: the
-# state comes from bitstream data, and this one check is what makes every field
-# read below safe, since those are pure bit extraction on an already-loaded
-# value.
+# Fetch the packed entry for a state. Deliberately bounds-checked to make
+# the following reads safe.
 @inline dist_table_entry(t::FSEDistTable, state::Int) = t.entries[state + 1]
 
 # RLE tables have table log 0, so state init consumes 0 bits (the reference
@@ -239,8 +225,7 @@ end
 @inline dist_table_init!(::ReverseBitReader, ::RLEDistTable) = 0
 @inline dist_table_entry(t::RLEDistTable, ::Int) = t.entry
 
-# For the Huffman weight table (built with `RawSym`) the symbol is what got
-# baked into `base_value`.
+# For the Huffman weight table (built with `RawSym`) the symbol is baked into `base_value`.
 @inline dist_table_peek(t::FSEDistTable, state::Int) = _fse_base(dist_table_entry(t, state))
 
 # Update without checking for underflow (allows overflow detection after).
