@@ -553,7 +553,7 @@ function _decompress_block!(data::Vector{UInt8}, pos::Int, block_size::Int, stat
     limit = pos + block_size - 1
     limit ≤ length(data) ||
         throw(ArgumentError("zstd: truncated compressed block"))
-    literals, lit_consumed = read_literals(data, pos, limit, state)
+    literals, lit_consumed = read_literals!(data, pos, limit, state)
     seq_pos = pos + lit_consumed
     nextwpos = wpos
     if seq_pos ≤ limit
@@ -578,7 +578,7 @@ end
 # Reference: RFC 8878 §3.1.1.3.1
 # `limit` is the last byte of the enclosing block; the literals section must
 # fit entirely within it.
-function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::DecompressState)
+function read_literals!(data::Vector{UInt8}, pos::Int, limit::Int, state::DecompressState)
     br = reinit!(state.fbr, @view data[pos:end])
     litblock_type = read(br, 2)
     size_format = peek(br, 2)
@@ -645,7 +645,7 @@ function read_literals(data::Vector{UInt8}, pos::Int, limit::Int, state::Decompr
             # Safe to reuse rb_lit1 here: it's only touched later in this same
             # function, in the num_streams == 1 decode branch, well after the
             # Huffman table (and this reader's brief use inside it) is done.
-            ht, hdr_len = read_huffman_description((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start, state.huf_nbits_sym1), rb_scratch = state.rb_lit1, fbr_scratch = state.fbr)
+            ht, hdr_len = read_huffman_description!((@view data[payload_start:payload_end]); scratch_buffers = (state.huf_weights, state.huf_rank_count, state.huf_rank_start, state.huf_nbits_sym1), rb_scratch = state.rb_lit1, fbr_scratch = state.fbr)
             state.huffman = ht
             huf_start = payload_start + hdr_len
         end

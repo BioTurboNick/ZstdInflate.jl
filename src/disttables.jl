@@ -71,9 +71,9 @@ struct RawSym end   # Huffman weights: the "value" is the symbol itself
 
 # Fill pre-allocated backing arrays for an FSE decode table from a normalized
 # probability distribution. norm[i+1] is the probability of symbol i; -1
-# means "probability 1/tableSize". Shared by the raw-array hot path below and
-# `build_fse_table!` (decompress.jl, which fills a persistent table's array
-# in place).
+# means "probability 1/tableSize". Shared by both `build_fse_table!` methods:
+# the raw-array one below, and the one in decompress.jl that fills a persistent
+# table's array in place.
 function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
                            entries::Vector{UInt64}, occ::Vector{Int}, kind)
     table_size = 1 << accuracy_log
@@ -126,23 +126,23 @@ function _fill_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
     return nothing
 end
 
-# Hot-path: caller supplies pre-allocated backing arrays; they are resized
-# and filled in-place, but this still allocates a fresh `FSEDistTable`
-# wrapper each call. Kept for the cold path below; the truly hot call site
-# (decompress.jl's read_distribution_table!) uses `build_fse_table!` instead,
-# which reuses the wrapper too.
-function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int,
-                          entries::Vector{UInt64}, occ::Vector{Int}, kind)
+# Caller supplies the backing arrays; `entries` and `occ` are both resized and
+# overwritten. Still allocates a fresh `FSEDistTable` wrapper each call, so the
+# hot call site (decompress.jl's read_distribution_table!) uses the
+# FSEDistTable method of `build_fse_table!` instead, which reuses that too.
+function build_fse_table!(norm::AbstractVector{<:Integer}, accuracy_log::Int,
+                           entries::Vector{UInt64}, occ::Vector{Int}, kind)
     _fill_fse_table!(norm, accuracy_log, entries, occ, kind)
     return FSEDistTable(entries)
 end
 
-# Cold-path: allocates its own backing arrays (used by __init__, parse_dictionary, etc.)
+# Cold-path: allocates its own backing arrays, so it mutates nothing the caller
+# can see (used by __init__, parse_dictionary, etc.)
 function build_fse_table(norm::AbstractVector{<:Integer}, accuracy_log::Int, kind)
     table_size = 1 << accuracy_log
-    return build_fse_table(norm, accuracy_log,
-                           Vector{UInt64}(undef, table_size),
-                           Vector{Int}(undef, length(norm)), kind)
+    return build_fse_table!(norm, accuracy_log,
+                            Vector{UInt64}(undef, table_size),
+                            Vector{Int}(undef, length(norm)), kind)
 end
 
 # Read an FSE normalized distribution from the forward bitstream.
@@ -244,7 +244,7 @@ end
 @inline dist_table_peek(t::FSEDistTable, state::Int) = _fse_base(dist_table_entry(t, state))
 
 # Update without checking for underflow (allows overflow detection after).
-@inline function _fse_update_unchecked(rb::ReverseBitReader, t::FSEDistTable, state::Int)
+@inline function _fse_update_unchecked!(rb::ReverseBitReader, t::FSEDistTable, state::Int)
     e = dist_table_entry(t, state)
     bits = Int(_read_bits_unchecked!(rb, _fse_nb(e)))
     return _fse_next(e) + bits

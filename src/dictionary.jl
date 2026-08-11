@@ -47,7 +47,7 @@ function Base.parse(::Type{ZstdDict}, data::Vector{UInt8}; raw_content::Bool = f
     pos = 9
 
     # 1. Huffman table for literals
-    ht, hdr_len = read_huffman_description(@view data[9:end])
+    ht, hdr_len = read_huffman_description!(@view data[9:end])
     pos += hdr_len
 
     # 2.–4. FSE tables for offsets, match lengths, and literals lengths.
