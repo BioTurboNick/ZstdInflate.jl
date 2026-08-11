@@ -51,19 +51,21 @@ end
 # separate streams (one per TIFF strip, say) otherwise rebuilds the lot every
 # time, which is the single largest source of allocation in that workload.
 #
-# `close` returns them here; construction takes them back. Streams that are
-# never closed behave exactly as before, so this costs nothing to ignore.
+# `close` returns them here; construction takes them back.
 #
-# The pool is global and lock-guarded rather than task-local. Task-local was
-# the first attempt and recovered nothing: callers that decode many frames tend
-# to do so one task per frame -- TiffImages spawns a task per strip -- so every
-# buffer went to a pool that died with the task that filled it. Measured 0 hits
-# against 5478 gives. The lock is taken twice per stream, alongside work that
-# would otherwise allocate a whole decode state, so its cost does not signify.
+# The pool is global and lock-guarded because streams may be on different tasks or threads.
 #
-# Retention is bounded by `_SCRATCH_POOL_MAX` entries. An entry only enters on
-# close, so the pool never holds more than the peak number of simultaneously
-# live streams, capped.
+# The pool is uncapped because it is self-limiting. A set is only created when a
+# stream starts and finds the pool empty, so the number in existence can never
+# exceed the most streams that have ever been live at once; anything a caller
+# gets back from the pool is a set it had already paid for at its own high-water
+# mark. Measured: with concurrency ramped between 2 and 24 workers over a dozen
+# rounds, the pool converged to 14 entries and stopped growing.
+#
+# An earlier fixed cap of 8 was worse than useless — it never bound on realistic
+# workloads (peak occupancy decoding a 5478-strip TIFF is 3, at any thread
+# count), while above eight live streams it discarded four sets and re-allocated
+# four every round.
 # ------------------------------------------------------------------
 struct StreamScratch
     out   ::Vector{UInt8}
@@ -74,7 +76,6 @@ end
 
 const _SCRATCH_POOL = StreamScratch[]
 const _SCRATCH_LOCK = ReentrantLock()
-const _SCRATCH_POOL_MAX = 8
 
 _take_scratch!() =
     lock(_SCRATCH_LOCK) do
@@ -83,7 +84,7 @@ _take_scratch!() =
 
 function _give_scratch!(sc::StreamScratch)
     lock(_SCRATCH_LOCK) do
-        length(_SCRATCH_POOL) < _SCRATCH_POOL_MAX && push!(_SCRATCH_POOL, sc)
+        push!(_SCRATCH_POOL, sc)
     end
     return nothing
 end
