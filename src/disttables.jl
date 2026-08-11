@@ -143,7 +143,7 @@ function read_fse_dist!(br::ForwardBitReader, norm::Vector{Int16})
     table_size   = 1 << accuracy_log
 
     empty!(norm)
-    remaining = table_size + 1   # reference zstd initialises to tableSize+1
+    remaining = table_size + 1   # reference zstd initializes to tableSize+1
     threshold = table_size
     nbits     = accuracy_log + 1
 

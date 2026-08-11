@@ -28,7 +28,7 @@ using InteractiveUtils
 # version): instrs=1926, calls=30, spills=88.
 #
 # The signature below must be fully concrete. An abstract `HuffmanTable{11}`
-# (or a missing scratch argument) matches no specialisation, `code_native`
+# (or a missing scratch argument) matches no specialization, `code_native`
 # emits nothing, and the check silently degrades to the error below.
 # ----------------------------------------------------------------
 
@@ -41,7 +41,7 @@ code_native(buf, ZstdInflate._decode_4streams!,
     syntax=:intel, debuginfo=:none)
 asm = String(take!(buf))
 
-isempty(asm) && error("specialisation not found — signature may have changed")
+isempty(asm) && error("specialization not found — signature may have changed")
 
 lines = split(asm, '\n')
 instr_lines = filter(

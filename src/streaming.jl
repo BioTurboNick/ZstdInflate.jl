@@ -86,7 +86,7 @@ const _SCRATCH_TIMER    = Ref{Union{Timer, Nothing}}(nothing)
 const _SCRATCH_TOUCHED  = Ref(false)
 const _SCRATCH_INTERVAL = Ref(1.0)   # seconds between decay ticks
 
-# Index of the entry holding the largest output buffer. Maximising over indices
+# Index of the entry holding the largest output buffer. Maximizing over indices
 # rather than over the entries themselves: `argmax(f, pool)` returns the entry.
 _largest_scratch() = argmax(i -> length(_SCRATCH_POOL[i].out), eachindex(_SCRATCH_POOL))
 
@@ -270,7 +270,7 @@ function _discard!(io::IO, scratch::Vector{UInt8}, n::Int)
 end
 
 # Advance past skippable frames and begin the next zstd frame, parsing its
-# header and initialising per-frame state. Returns false if the source ended
+# header and initializing per-frame state. Returns false if the source ended
 # cleanly at a frame boundary.
 function _start_frame!(s::InflateZstdStream)
     while true
