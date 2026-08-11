@@ -53,22 +53,11 @@ end
 #
 # `close` returns them here; construction takes them back.
 #
-# The pool is global and lock-guarded because streams may be on different tasks or threads.
+# The pool is global and lock-guarded because streams may be on different tasks
+# or threads.
 #
-# There is no fixed cap. The pool is self-limiting in *count*: a set is only
-# created when a stream starts and finds the pool empty, so the number in
-# existence cannot exceed the most streams ever live at once, and whatever a
-# caller gets back is memory it already paid for at its own high-water mark.
-# A fixed cap of 8 was tried and removed: it never bound on a realistic workload
-# (peak occupancy decoding a 5478-strip TIFF is 3, at any thread count) while
-# above eight live streams it discarded four sets and re-allocated four per
-# round.
-#
-# What is *not* self-limiting is retained size. Julia cannot shrink a Vector's
-# capacity, so a set whose output buffer grew for one large frame keeps it: 24
-# workers on 10 MB frames leave 12 entries holding 70 MB, and 800 subsequent
-# 4 KB frames reclaim none of it. Hence the two mechanisms below — a trim bound
-# that follows the caller's concurrency, and idle decay.
+# Pools are periodically trimmed when load decreases or becomes idle, preferentially
+# dropping the largest output buffer first. The pool is not
 # ------------------------------------------------------------------
 struct StreamScratch
     out   ::Vector{UInt8}
@@ -80,55 +69,26 @@ end
 const _SCRATCH_POOL = StreamScratch[]
 const _SCRATCH_LOCK = ReentrantLock()
 
-# Sets currently checked out: incremented when one is handed to a stream (pooled
-# or freshly built), decremented when one comes back.
-#
-# A stream that is never closed never returns its set, so this over-counts by the
-# number of abandoned streams and the pool merely trims less. Closing is the
-# caller's business (see `close`); the cost of not doing it is retained memory,
-# not incorrectness.
+# Sets currently checked out
 const _SCRATCH_INFLIGHT = Ref(0)
 
 # High-water mark of `_SCRATCH_INFLIGHT` since the last decay tick, and what the
 # trim bound below actually follows.
-#
-# The instantaneous count is the wrong bound even though it is the obvious one:
-# sets come back precisely when a worker finishes, so every trim decision is
-# sampled at the trough of the caller's concurrency, not its plateau. With N
-# workers cycling through short frames the count dips to 1 between handoffs, the
-# bound collapses to 2, and the pool discards sets the other N-1 workers are
-# about to ask for. Measured on a 32-strip TIFF at 6 threads that churn cost
-# 0.9 GB of extra allocation — the pool was thrashing, not trimming.
 #
 # Taking the peak over a tick-length window instead means a burst is bounded by
 # how wide it actually got, and the decay below is what walks the bound back down
 # once the burst is over.
 const _SCRATCH_PEAK = Ref(0)
 
-# Idle decay. Created on first return rather than at load: a Timer holds a libuv
-# handle, so it cannot live in a `const` (it does not survive precompilation),
-# and putting one in `__init__` would impose a periodic wakeup on every process
-# that loads this package, including those that never decode. It stops itself
-# once the pool is empty, so an idle process stops waking up altogether.
+# Idle decay. Created on first return. A Timer holds a libuv handle, so it cannot
+# live in a `const`. It stops itself once the pool is empty.
 const _SCRATCH_TIMER    = Ref{Union{Timer, Nothing}}(nothing)
 const _SCRATCH_TOUCHED  = Ref(false)
 const _SCRATCH_INTERVAL = Ref(1.0)   # seconds between decay ticks
 
-# Index of the entry holding the largest output buffer, which is the one worth
-# dropping first — size, not count, is what the pool over-retains.
-#
-# `length` stands in for capacity: Julia offers no portable way to read a
-# Vector's capacity (the Memory-based route is 1.11+, and this package supports
-# 1.10). Since a stream's output buffer only grows, its length on return is a
-# reasonable proxy for how much that set is holding.
-function _largest_scratch()
-    best, bestlen = firstindex(_SCRATCH_POOL), -1
-    for (i, sc) in enumerate(_SCRATCH_POOL)
-        n = length(sc.out)
-        n > bestlen && ((best, bestlen) = (i, n))
-    end
-    return best
-end
+# Index of the entry holding the largest output buffer. Maximising over indices
+# rather than over the entries themselves: `argmax(f, pool)` returns the entry.
+_largest_scratch() = argmax(i -> length(_SCRATCH_POOL[i].out), eachindex(_SCRATCH_POOL))
 
 # Drop at most one entry per call, largest first, while above twice the recent
 # peak concurrency. One at a time rather than truncating to the bound: a burst
@@ -242,12 +202,6 @@ function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
             throw(ArgumentError("zstd: empty input"))
         _start_frame!(s)
     catch
-        # We borrowed a set before we could know the input was bad. Hand it
-        # back: otherwise every rejected file leaks both the buffers and an
-        # in-flight count, and the count is what bounds the pool — a program
-        # that probes files it turns out not to want would push that bound up
-        # monotonically until trimming never fires again. `_start_frame!` resets
-        # the state on every frame, so a half-started one is fine to reuse.
         _give_scratch!(StreamScratch(s.out, s.inbuf, s.hdrbuf, s.state))
         rethrow()
     end
@@ -385,14 +339,7 @@ function _decode_next_block!(s::InflateZstdStream)
     payload_len > 0 && _read_exact!(s.io, s.inbuf, payload_len, "block payload")
 
     # When the frame declares its size, tell the block-decode functions the
-    # true remaining bound instead of leaving them to assume "up to one more
-    # full block" every time. Without this, read_sequences!'s own reservation
-    # math (wpos + ZSTD_BLOCKSIZE_MAX) routinely overshoots what _start_frame!
-    # already correctly reserved from fcs, forcing a spurious regrow on
-    # nearly every block. It also makes the "block output exceeds declared
-    # frame content size" check in _apply_block! actually enforce per-block
-    # under streaming, rather than only being caught after the fact once the
-    # last block's frame_len mismatch is checked below.
+    # true remaining bound.
     out_limit = s.fcs ≥ 0 ? s.frame_start + s.fcs : typemax(Int) - WILDCOPY_SLACK
 
     wpos0 = s.wpos
@@ -438,10 +385,8 @@ function _compact!(s::InflateZstdStream)
         # unreachable too. Dropping it makes the dict_pos ≥ 1 guard in
         # _run_sequences! reject any (malformed) offset that tries.
         #
-        # Rebind rather than `empty!`: the state points straight at the
-        # ZstdDict's own content array, which the caller may still be using for
-        # other streams. Truncating it in place would empty their dictionary
-        # too.
+        # Rebind rather than `empty!` to avoid interferring with others
+        # still using the dictionary.
         s.frame_start = 0
         s.state.dict_content = EMPTY_DICT_CONTENT
     end
@@ -510,12 +455,7 @@ Release `s`'s internal buffers for reuse by later streams, and close the
 underlying `io` unless the stream was constructed with `own_io = false`.
 Idempotent. Reading from a closed stream throws.
 
-Closing is optional but worth doing when decoding many frames: an unclosed
-stream is collected normally, it just rebuilds its buffers from scratch instead
-of taking a set from the pool, and it leaves the pool's trim bound believing one
-more stream is still running than really is. `open(InflateZstdStream, io) do s
-... end` closes for you. Use [`ZstdInflate.empty_scratch_pool!`](@ref) to
-release the pool outright.
+Use [`ZstdInflate.empty_scratch_pool!`](@ref) to release the pool outright.
 """
 function Base.close(s::InflateZstdStream)
     s.closed && return nothing
