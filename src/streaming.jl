@@ -173,20 +173,23 @@ function empty_scratch_pool!()
 end
 
 """
-    InflateZstdStream(io::IO; dict = nothing, own_io = true)
+    InflateZstdStream(io::IO; dict = nothing, own_io = false)
 
 Create a readable stream that incrementally decompresses Zstandard data
 from `io`.
 
-`own_io` controls whether [`close`](@ref) also closes `io`. Pass `own_io =
-false` when `io` outlives the stream — decoding a sequence of independent
-frames from one open file, for instance — so that `close` releases the
-stream's internal buffers for reuse without closing the file underneath.
+`own_io` controls whether [`close`](@ref) also closes `io`. It defaults to
+`false`: the stream did not open `io`, so closing the stream releases only the
+stream's own buffers and leaves `io` to whoever opened it. Pass `own_io = true`
+to hand `io`'s lifetime to the stream, so that one `close` disposes of both.
 
-See `open(InflateZstdStream, io)` for a form that closes the stream for you.
+Same meaning and same default as `own` in `Base.fdio`.
+
+See `open(InflateZstdStream, src)` for a form that closes the stream for you,
+and which owns the file when given a path.
 """
 function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
-                            own_io::Bool = true)
+                            own_io::Bool = false)
     sc = _take_scratch!()
     out, inbuf, hdrbuf, state = sc === nothing ?
         (UInt8[], UInt8[], UInt8[], DecompressState()) :
@@ -209,7 +212,7 @@ function InflateZstdStream(io::IO; dict::Union{ZstdDict, Nothing} = nothing,
 end
 
 """
-    open(InflateZstdStream, src; dict = nothing, own_io = true)
+    open(InflateZstdStream, src; dict = nothing, own_io = false)
     open(f::Function, InflateZstdStream, src; kwargs...)
 
 Open a stream decompressing Zstandard data from `src`, which may be a readable
@@ -224,19 +227,26 @@ end
 ```
 
 Since [`close`](@ref) is what hands the stream's buffers back for reuse by
-later streams, this is the cheapest way to decode a sequence of frames. When
-`src` is an `IO` that outlives the stream — reading several independent frames
-from one open file — pass `own_io = false` so that closing the stream releases
-its buffers without closing `src`. When `src` is a path the stream owns the
-file it opened, and closing the stream closes it.
+later streams, this is the cheapest way to decode a sequence of frames.
+
+Given a path, the stream owns the file it opened and closing the stream closes
+it; `own_io = false` is refused there, since nothing else holds that handle.
+Given an `IO`, ownership stays with the caller unless `own_io = true` says
+otherwise.
 """
 Base.open(::Type{InflateZstdStream}, io::IO; kwargs...) =
     InflateZstdStream(io; kwargs...)
 
-function Base.open(::Type{InflateZstdStream}, path::AbstractString; kwargs...)
+function Base.open(::Type{InflateZstdStream}, path::AbstractString;
+                    own_io::Bool = true, kwargs...)
+    # The default flips here, and cannot be overridden: we open the handle, so
+    # the caller has no other reference to close it with.
+    own_io ||
+        throw(ArgumentError("zstd: own_io = false would leak the file opened " *
+                            "for \"$path\"; open the IO yourself to keep it"))
     io = open(path)
     try
-        return InflateZstdStream(io; kwargs...)
+        return InflateZstdStream(io; own_io = true, kwargs...)
     catch
         # The constructor parses the first frame header, so it can throw on a
         # file we just opened; don't leak the handle on the way out.
@@ -451,11 +461,17 @@ Base.bytesavailable(s::InflateZstdStream) = s.wpos - s.read_pos
 """
     close(s::InflateZstdStream)
 
-Release `s`'s internal buffers for reuse by later streams, and close the
-underlying `io` unless the stream was constructed with `own_io = false`.
+Release `s`'s internal buffers for reuse by later streams. The underlying `io`
+is closed too only if `s` owns it — that is, if it was constructed with `own_io
+= true`, or by `open(InflateZstdStream, path)`, which opens the file itself.
 Idempotent. Reading from a closed stream throws.
 
-Use [`ZstdInflate.empty_scratch_pool!`](@ref) to release the pool outright.
+Closing is optional but worth doing when decoding many frames: an unclosed
+stream is collected normally, it just rebuilds its buffers from scratch instead
+of taking a set from the pool, and it leaves the pool's trim bound believing one
+more stream is still running than really is. `open(InflateZstdStream, src) do s
+... end` closes for you. Use [`ZstdInflate.empty_scratch_pool!`](@ref) to
+release the pool outright.
 """
 function Base.close(s::InflateZstdStream)
     s.closed && return nothing

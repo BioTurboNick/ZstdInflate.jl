@@ -50,20 +50,26 @@ decompressed bytes through the standard `IO` reading interface (`read`,
 to reuse, which is what makes decoding many frames cheap, so prefer the
 `do`-block form above — it closes for you, including when the block throws.
 Constructing a stream directly is fine too; an unclosed stream is collected
-normally, it just rebuilds its buffers from scratch. Pass `own_io = false`
-when the `IO` outlives the stream, so that closing releases the buffers
-without closing the file underneath:
+normally, it just rebuilds its buffers from scratch.
+
+Closing a stream does not close an `IO` you passed in — the stream did not open
+it, so it does not dispose of it (`own_io = false`, matching `own` in
+`Base.fdio`). That makes it safe to run many streams over one open file:
 
 ```julia
 open(path) do io                       # one file, many independent frames
     while !eof(io)
-        frame = open(InflateZstdStream, io; own_io = false) do stream
+        frame = open(InflateZstdStream, io) do stream
             read(stream)
         end
         # ...
     end
 end
 ```
+
+Pass `own_io = true` to hand the `IO`'s lifetime to the stream, so that one
+`close` disposes of both. Given a *path*, the stream opens the file and always
+owns it, since nothing else holds that handle.
 
 Decompression is incremental: compressed bytes are
 read from the source one block at a time as output is consumed, and
@@ -85,7 +91,7 @@ data   = inflate_zstd(compressed; dict=dict)
 text   = inflate_zstd("file.zst"; dict=dict)
 
 open("file.zst") do io
-    data = open(InflateZstdStream, io; dict=dict, own_io=false) do stream
+    data = open(InflateZstdStream, io; dict=dict) do stream
         read(stream)
     end
 end

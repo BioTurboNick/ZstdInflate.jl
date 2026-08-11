@@ -745,16 +745,17 @@ end
     @test !isopen(s)
     @test_throws ArgumentError read(s)
 
-    # own_io governs whether the underlying IO is closed too.
+    # own_io governs whether the underlying IO is closed too. It defaults to
+    # false: the stream did not open the IO, so it does not dispose of it.
     io = IOBuffer(compress(payloads[2]))
     s = InflateZstdStream(io)
     close(s)
-    @test !isopen(io)
+    @test isopen(io)
 
     io = IOBuffer(compress(payloads[2]))
-    s = InflateZstdStream(io; own_io = false)
+    s = InflateZstdStream(io; own_io = true)
     close(s)
-    @test isopen(io)
+    @test !isopen(io)
 
     # A frame decoded through a recycled DecompressState must not inherit the
     # previous frame's repeat offsets or entropy tables. Concatenated frames
@@ -800,16 +801,16 @@ end
 
     # Keywords reach the constructor, including own_io.
     io = IOBuffer(comp)
-    open(InflateZstdStream, io; own_io = false) do st
+    open(InflateZstdStream, io) do st
         read(st)
     end
-    @test isopen(io)                    # left open for the caller
+    @test isopen(io)                    # own_io defaults to false: caller's IO
 
     io2 = IOBuffer(comp)
-    open(InflateZstdStream, io2) do st
+    open(InflateZstdStream, io2; own_io = true) do st
         read(st)
     end
-    @test !isopen(io2)                  # own_io defaults to true
+    @test !isopen(io2)                  # ownership handed over explicitly
 
     # Closing inside the block must not make Base's outer close throw.
     @test open(InflateZstdStream, IOBuffer(comp)) do st
@@ -818,17 +819,29 @@ end
         v
     end == payload
 
-    # Path form: the stream owns the file it opened.
+    # Path form: the stream owns the file it opened, whatever the IO default is.
     mktempdir() do dir
         path = joinpath(dir, "payload.zst")
         write(path, comp)
         @test open(InflateZstdStream, path) do st
             read(st)
         end == payload
+        # Windows refuses to unlink a file with a live handle, so this is what
+        # proves the path form closed it rather than leaving it to the GC.
+        @test (rm(path); true)
 
+        write(path, comp)
         s2 = open(InflateZstdStream, path)
+        @test s2.own_io                # owns it despite own_io defaulting false
         @test read(s2) == payload
         close(s2)
+        @test (rm(path); true)
+
+        # ...and ownership cannot be declined there, since the caller holds no
+        # other reference to the handle and could only leak it.
+        write(path, comp)
+        @test_throws ArgumentError open(InflateZstdStream, path; own_io = false)
+        @test (rm(path); true)         # nothing was opened, so nothing leaked
 
         # A file that isn't zstd throws from the constructor, which happens
         # after we opened the handle -- it must not be left dangling, or the
