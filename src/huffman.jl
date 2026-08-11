@@ -118,7 +118,7 @@ end
 #   Reference: RFC 8878 §4.2.1
 # ============================================================
 
-function read_huffman_description(data::AbstractVector{UInt8};
+function read_huffman_description!(data::AbstractVector{UInt8};
                                    scratch_buffers::Union{Nothing, Tuple{AbstractVector{UInt8}, AbstractVector{Int}, AbstractVector{Int}, AbstractVector{UInt8}}} = nothing,
                                    rb_scratch::Union{Nothing, ReverseBitReader} = nothing,
                                    fbr_scratch::Union{Nothing, ForwardBitReader} = nothing)
@@ -182,7 +182,7 @@ function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_l
     empty!(weights)
     while true
         sym1 = dist_table_peek(t, state1)
-        state1 = _fse_update_unchecked(rb, t, state1)
+        state1 = _fse_update_unchecked!(rb, t, state1)
         push!(weights, UInt8(sym1))
         if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(dist_table_peek(t, state2)))
@@ -190,7 +190,7 @@ function _read_fse_weights!(weights::Vector{UInt8}, br::ForwardBitReader, byte_l
         end
 
         sym2 = dist_table_peek(t, state2)
-        state2 = _fse_update_unchecked(rb, t, state2)
+        state2 = _fse_update_unchecked!(rb, t, state2)
         push!(weights, UInt8(sym2))
         if _rbr_overflowed(rb) || length(weights) ≥ 255
             push!(weights, UInt8(dist_table_peek(t, state1)))
